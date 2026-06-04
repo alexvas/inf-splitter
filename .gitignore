@@ -25,3 +25,5 @@ lcov.info
 
 # Local API keys (copy from secrets.example/)
 secrets/
+certs/ca-bundle.crt
+.claude

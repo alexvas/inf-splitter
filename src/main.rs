@@ -15,6 +15,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         listen = %config.listen_addr,
+        upstream_timeout_secs = config.upstream_timeout.as_secs(),
+        max_request_body = config.max_request_body,
         models = ?config.sorted_model_ids(),
         "starting inf-splitter"
     );

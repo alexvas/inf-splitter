@@ -55,8 +55,8 @@ models = "local-openai-model"
         .clone()
         .expect("openai upstream must receive a request");
 
-    let upstream_req: ChatCompletionRequest =
-        serde_json::from_value(upstream_body).expect("upstream body must be OpenAI chat completion");
+    let upstream_req: ChatCompletionRequest = serde_json::from_value(upstream_body)
+        .expect("upstream body must be OpenAI chat completion");
     assert_eq!(
         match &upstream_req.messages[0].content {
             Some(ChatContent::Text(text)) => text.clone(),

@@ -50,7 +50,9 @@ pub async fn spawn_upstream(
     response: serde_json::Value,
 ) -> SocketAddr {
     let state = CaptureState { captured, response };
-    let app = Router::new().route(path, post(capture_and_respond)).with_state(state);
+    let app = Router::new()
+        .route(path, post(capture_and_respond))
+        .with_state(state);
     bind_and_serve(app).await.0
 }
 

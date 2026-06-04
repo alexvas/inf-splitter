@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -54,14 +55,21 @@ struct ProviderSection {
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub omit_stream_options: bool,
+    pub upstream_timeout: Duration,
+    pub max_request_body: usize,
     sections: HashMap<String, ProviderSection>,
     model_routes: HashMap<String, String>,
     default_section: Option<String>,
 }
 
+const DEFAULT_UPSTREAM_TIMEOUT: &str = "5m";
+const DEFAULT_MAX_REQUEST_BODY: &str = "2m";
+
 #[derive(Debug, Deserialize)]
 struct FileConfig {
     port: Option<u16>,
+    upstream_timeout: Option<String>,
+    max_request_body: Option<String>,
     #[serde(flatten)]
     providers: HashMap<String, ProviderConfigRaw>,
 }
@@ -101,7 +109,9 @@ pub enum ConfigError {
     },
     #[error("multiple default provider sections: {first} and {second}")]
     MultipleDefaults { first: String, second: String },
-    #[error("no provider section defines models = \"default\" and model {0} is not listed elsewhere")]
+    #[error(
+        "no provider section defines models = \"default\" and model {0} is not listed elsewhere"
+    )]
     UnroutableModel(String),
     #[error("secret not found for {0}: set env var or secrets/{0} file")]
     SecretNotFound(String),
@@ -109,6 +119,10 @@ pub enum ConfigError {
     NoProviders,
     #[error("invalid listen port: {0}")]
     Port(String),
+    #[error("invalid duration {value}: {message}")]
+    InvalidDuration { value: String, message: String },
+    #[error("invalid byte size {value}: {message}")]
+    InvalidByteSize { value: String, message: String },
 }
 
 impl Config {
@@ -137,13 +151,27 @@ impl Config {
 
         let listen_addr = resolve_listen_addr(file.port)?;
         let omit_stream_options = env_truthy("OMIT_STREAM_OPTIONS");
+        let upstream_timeout = parse_duration_field(
+            file.upstream_timeout
+                .as_deref()
+                .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT),
+        )?;
+        let max_request_body = parse_byte_size_field(
+            file.max_request_body
+                .as_deref()
+                .unwrap_or(DEFAULT_MAX_REQUEST_BODY),
+        )?;
 
         let mut sections = HashMap::new();
         let mut model_routes = HashMap::new();
         let mut default_section: Option<String> = None;
 
         for (name, raw_section) in file.providers {
-            let endpoint = raw_section.endpoint.trim().trim_end_matches('/').to_string();
+            let endpoint = raw_section
+                .endpoint
+                .trim()
+                .trim_end_matches('/')
+                .to_string();
             if endpoint.is_empty() {
                 return Err(ConfigError::Provider {
                     name,
@@ -151,12 +179,11 @@ impl Config {
                 });
             }
 
-            let protocol = Protocol::parse(&raw_section.protocol).map_err(|err| {
-                ConfigError::Provider {
+            let protocol =
+                Protocol::parse(&raw_section.protocol).map_err(|err| ConfigError::Provider {
                     name: name.clone(),
                     message: err.to_string(),
-                }
-            })?;
+                })?;
 
             let api_key = match raw_section.api_key {
                 Some(value) => Some(resolve_secret(&value)?),
@@ -200,6 +227,8 @@ impl Config {
         Ok(Self {
             listen_addr,
             omit_stream_options,
+            upstream_timeout,
+            max_request_body,
             sections,
             model_routes,
             default_section,
@@ -241,11 +270,89 @@ impl Config {
         Self {
             listen_addr: "0.0.0.0:3000".parse().expect("test listen addr"),
             omit_stream_options: true,
+            upstream_timeout: parse_duration(DEFAULT_UPSTREAM_TIMEOUT).expect("default timeout"),
+            max_request_body: parse_byte_size(DEFAULT_MAX_REQUEST_BODY)
+                .expect("default body limit"),
             sections: HashMap::new(),
             model_routes,
             default_section: None,
         }
     }
+}
+
+pub fn parse_duration(raw: &str) -> Result<Duration, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if let Some(secs) = raw.strip_suffix('s') {
+        if secs.is_empty() {
+            return Err("expected integer before 's'".to_string());
+        }
+        let n: u64 = secs
+            .parse()
+            .map_err(|_| "expected integer before 's'".to_string())?;
+        return Ok(Duration::from_secs(n));
+    }
+    if let Some(mins) = raw.strip_suffix('m') {
+        if mins.is_empty() {
+            return Err("expected integer before 'm'".to_string());
+        }
+        let n: u64 = mins
+            .parse()
+            .map_err(|_| "expected integer before 'm'".to_string())?;
+        return Ok(Duration::from_secs(
+            n.checked_mul(60)
+                .ok_or_else(|| "duration overflow".to_string())?,
+        ));
+    }
+    Err("expected suffix 's' or 'm' (e.g. 15s, 1m)".to_string())
+}
+
+pub fn parse_byte_size(raw: &str) -> Result<usize, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if let Some(k) = raw.strip_suffix('k') {
+        if k.is_empty() {
+            return Err("expected integer before 'k'".to_string());
+        }
+        let n: u64 = k
+            .parse()
+            .map_err(|_| "expected integer before 'k'".to_string())?;
+        let bytes = n
+            .checked_mul(1024)
+            .ok_or_else(|| "size overflow".to_string())?;
+        return usize::try_from(bytes).map_err(|_| "size too large".to_string());
+    }
+    if let Some(m) = raw.strip_suffix('m') {
+        if m.is_empty() {
+            return Err("expected integer before 'm'".to_string());
+        }
+        let n: u64 = m
+            .parse()
+            .map_err(|_| "expected integer before 'm'".to_string())?;
+        let bytes = n
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| "size overflow".to_string())?;
+        return usize::try_from(bytes).map_err(|_| "size too large".to_string());
+    }
+    Err("expected suffix 'k' or 'm' (e.g. 512k, 2m)".to_string())
+}
+
+fn parse_duration_field(raw: &str) -> Result<Duration, ConfigError> {
+    parse_duration(raw).map_err(|message| ConfigError::InvalidDuration {
+        value: raw.to_string(),
+        message,
+    })
+}
+
+fn parse_byte_size_field(raw: &str) -> Result<usize, ConfigError> {
+    parse_byte_size(raw).map_err(|message| ConfigError::InvalidByteSize {
+        value: raw.to_string(),
+        message,
+    })
 }
 
 fn parse_models(name: &str, models: ModelsField) -> Result<(bool, HashSet<String>), ConfigError> {
@@ -289,12 +396,6 @@ fn config_path() -> PathBuf {
 }
 
 fn resolve_listen_addr(port: Option<u16>) -> Result<SocketAddr, ConfigError> {
-    if let Ok(raw) = env::var("LISTEN_ADDR") {
-        return raw
-            .parse()
-            .map_err(|err| ConfigError::Port(format!("{raw}: {err}")));
-    }
-
     let port = port.unwrap_or(3000);
     format!("0.0.0.0:{port}")
         .parse()
@@ -368,10 +469,7 @@ mod tests {
 
     #[test]
     fn resolve_secret_literal() {
-        assert_eq!(
-            resolve_secret("sk-static").expect("literal"),
-            "sk-static"
-        );
+        assert_eq!(resolve_secret("sk-static").expect("literal"), "sk-static");
     }
 
     #[test]
@@ -381,29 +479,93 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_accepts_s_and_m_suffixes() {
+        assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
+        assert_eq!(parse_duration("1m").unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn parse_duration_rejects_invalid_values() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("15").is_err());
+        assert!(parse_duration("15x").is_err());
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_k_and_m_suffixes() {
+        assert_eq!(parse_byte_size("512k").unwrap(), 512 * 1024);
+        assert_eq!(parse_byte_size("2m").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_rejects_invalid_values() {
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("512").is_err());
+        assert!(parse_byte_size("512x").is_err());
+    }
+
+    #[test]
+    fn load_config_with_timeout_and_limits() {
+        let raw = r#"
+port = 3001
+upstream_timeout = "15s"
+max_request_body = "512k"
+
+[local]
+endpoint = "http://127.0.0.1:11434"
+protocol = "OPENAI"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config with limits");
+        assert_eq!(config.listen_addr, "0.0.0.0:3001".parse().unwrap());
+        assert_eq!(config.upstream_timeout, Duration::from_secs(15));
+        assert_eq!(config.max_request_body, 512 * 1024);
+    }
+
+    #[test]
+    fn load_config_rejects_invalid_timeout() {
+        let raw = r#"
+upstream_timeout = "15x"
+
+[local]
+endpoint = "http://127.0.0.1:11434"
+protocol = "OPENAI"
+models = "test-model"
+"#;
+        let err = Config::load_from_str(raw).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidDuration { .. }));
+    }
+
+    #[test]
     fn load_project_config_and_resolve_routes() {
         let _guard = env_lock();
         env::set_var("DEEPSEEK_API_KEY", "sk-deepseek-test");
         env::set_var("MAAS_API_KEY", "sk-maas-test");
 
         let config = Config::load().expect("project config");
-        assert_eq!(config.listen_addr.port(), 3383);
+        assert_eq!(config.listen_addr, "0.0.0.0:3383".parse().unwrap());
 
         let ollama = config.resolve_route("gemma4:31b").expect("ollama route");
         assert_eq!(ollama.endpoint, "http://127.0.0.1:11434");
         assert_eq!(ollama.protocol, Protocol::OpenAi);
         assert!(ollama.api_key.is_none());
 
-        let deepseek = config.resolve_route("deepseek-v4-pro[1m]").expect("deepseek route");
+        let deepseek = config
+            .resolve_route("deepseek-v4-pro[1m]")
+            .expect("deepseek route");
         assert_eq!(deepseek.endpoint, "https://api.deepseek.com/anthropic");
         assert_eq!(deepseek.api_key.as_deref(), Some("sk-deepseek-test"));
 
-        let default = config.resolve_route("unknown-model").expect("default route");
+        let default = config
+            .resolve_route("unknown-model")
+            .expect("default route");
         assert_eq!(default.endpoint, "https://api.modelarts-maas.com/openai/v1");
         assert_eq!(default.api_key.as_deref(), Some("sk-maas-test"));
 
         // Same model resolves regardless of ingress; conversion happens in handlers.
-        let ollama_again = config.resolve_route("gemma4:31b").expect("ollama route again");
+        let ollama_again = config
+            .resolve_route("gemma4:31b")
+            .expect("ollama route again");
         assert_eq!(ollama_again.protocol, Protocol::OpenAi);
 
         env::remove_var("DEEPSEEK_API_KEY");

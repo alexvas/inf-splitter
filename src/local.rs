@@ -23,6 +23,7 @@ impl OpenAiHandler {
     pub fn new(config: &Config) -> Result<Self, AppError> {
         Ok(Self {
             http: HttpClient::builder()
+                .timeout(config.upstream_timeout)
                 .build()
                 .map_err(|err| AppError::Internal(err.to_string()))?,
             omit_stream_options: config.omit_stream_options,
@@ -80,8 +81,10 @@ impl OpenAiHandler {
             translation = translation.model_map(mapped, mapped);
         }
 
-        let mut http = HttpClientConfig::default();
-        http.ssrf_protection = false;
+        let http = HttpClientConfig {
+            ssrf_protection: false,
+            ..Default::default()
+        };
 
         let client_config = ClientConfig::builder()
             .backend_url(backend_url)
@@ -122,7 +125,11 @@ impl OpenAiHandler {
         builder.build()
     }
 
-    async fn handle_sync_client(&self, req: &MessageCreateRequest, client: &Client) -> Result<Response, AppError> {
+    async fn handle_sync_client(
+        &self,
+        req: &MessageCreateRequest,
+        client: &Client,
+    ) -> Result<Response, AppError> {
         let response = client.messages(req).await?;
         Ok((StatusCode::OK, axum::Json(response)).into_response())
     }
@@ -154,7 +161,8 @@ impl OpenAiHandler {
         if self.omit_stream_options {
             self.handle_stream_manual(req, request_headers, route).await
         } else {
-            self.handle_stream_client(req, request_headers, client).await
+            self.handle_stream_client(req, request_headers, client)
+                .await
         }
     }
 
@@ -165,14 +173,14 @@ impl OpenAiHandler {
         client: &Client,
     ) -> Result<Response, AppError> {
         let (stream, _rate_limits) = client.messages_stream(req).await?;
-        Ok(sse_response(
+        sse_response(
             request_headers,
             stream.map(|event| {
                 event
                     .map(|stream_event| format_sse_event(&stream_event))
                     .map_err(|err| std::io::Error::other(err.to_string()))
             }),
-        )?)
+        )
     }
 
     async fn handle_stream_manual(
@@ -189,7 +197,9 @@ impl OpenAiHandler {
 
         let backend_url = format!("{}/v1/chat/completions", route.endpoint);
         let builder = apply_upstream_auth(
-            self.http.post(&backend_url).header(header::CONTENT_TYPE, "application/json"),
+            self.http
+                .post(&backend_url)
+                .header(header::CONTENT_TYPE, "application/json"),
             request_headers,
             route.api_key.as_deref(),
         );
@@ -203,9 +213,9 @@ impl OpenAiHandler {
         }
 
         let model = req.model.clone();
-        let byte_stream = upstream.bytes_stream().map(|chunk| {
-            chunk.map_err(|err| std::io::Error::other(err.to_string()))
-        });
+        let byte_stream = upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
 
         let sse_stream = futures::stream::unfold(
             (byte_stream, StreamingTranslator::new(model), String::new()),
@@ -215,10 +225,8 @@ impl OpenAiHandler {
                         let line = buffer[..line_end].trim_end_matches('\r').to_string();
                         buffer = buffer[line_end + 1..].to_string();
                         if let Some(events) = parse_sse_line(&line, &mut translator) {
-                            let payload = events
-                                .iter()
-                                .map(format_sse_event_str)
-                                .collect::<String>();
+                            let payload =
+                                events.iter().map(format_sse_event_str).collect::<String>();
                             return Some((
                                 Ok(bytes::Bytes::from(payload)),
                                 (byte_stream, translator, buffer),
@@ -262,9 +270,9 @@ async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, 
     let headers = upstream.headers().clone();
 
     if is_openai_event_stream(&headers) {
-        let stream = upstream.bytes_stream().map(|chunk| {
-            chunk.map_err(|err| std::io::Error::other(err.to_string()))
-        });
+        let stream = upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
         let mut response = Response::builder().status(status);
         if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
             if let Ok(value) = content_type.to_str() {
@@ -319,14 +327,14 @@ where
         .and_then(|value| value.to_str().ok())
         .unwrap_or("text/event-stream");
 
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .header(header::ACCEPT, accept)
         .body(Body::from_stream(body))
-        .map_err(|err| AppError::Internal(err.to_string()))?)
+        .map_err(|err| AppError::Internal(err.to_string()))
 }
 
 fn format_sse_event_str(event: &StreamEvent) -> String {

@@ -1,4 +1,6 @@
 port = 3383
+upstream_timeout = "5m"
+max_request_body = "2m"
 
 [ollama]
 endpoint = "http://127.0.0.1:11434"

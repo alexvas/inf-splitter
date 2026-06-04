@@ -134,16 +134,28 @@ async fn dispatch_messages(
 
     match (ingress, route.protocol) {
         (Protocol::Anthropic, Protocol::Anthropic) => {
-            state.anthropic.handle_from_anthropic(body, &headers, &route).await
+            state
+                .anthropic
+                .handle_from_anthropic(body, &headers, &route)
+                .await
         }
         (Protocol::Anthropic, Protocol::OpenAi) => {
-            state.openai.handle_from_anthropic(&body, &headers, &route).await
+            state
+                .openai
+                .handle_from_anthropic(&body, &headers, &route)
+                .await
         }
         (Protocol::OpenAi, Protocol::OpenAi) => {
-            state.openai.handle_from_openai(&body, &headers, &route).await
+            state
+                .openai
+                .handle_from_openai(&body, &headers, &route)
+                .await
         }
         (Protocol::OpenAi, Protocol::Anthropic) => {
-            state.anthropic.handle_from_openai(&body, &headers, &route).await
+            state
+                .anthropic
+                .handle_from_openai(&body, &headers, &route)
+                .await
         }
     }
 }
@@ -162,7 +174,10 @@ mod tests {
 
     #[test]
     fn models_response_has_anthropic_shape() {
-        let config = test_config(&[("gemma4:31b", "ollama"), ("deepseek-v4-pro[1m]", "deepseek")]);
+        let config = test_config(&[
+            ("gemma4:31b", "ollama"),
+            ("deepseek-v4-pro[1m]", "deepseek"),
+        ]);
         let response = build_models_response(&config);
 
         assert_eq!(response.has_more, false);

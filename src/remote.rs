@@ -23,9 +23,10 @@ pub struct AnthropicHandler {
 }
 
 impl AnthropicHandler {
-    pub fn new() -> Self {
+    pub fn new(config: &crate::config::Config) -> Self {
         Self {
             client: Client::builder()
+                .timeout(config.upstream_timeout)
                 .build()
                 .expect("reqwest client"),
         }
@@ -72,7 +73,8 @@ impl AnthropicHandler {
         }
 
         let anthropic_resp: MessageResponse = upstream.json().await?;
-        let openai_resp = translate_anthropic_to_openai_response(&anthropic_resp, &openai_req.model);
+        let openai_resp =
+            translate_anthropic_to_openai_response(&anthropic_resp, &openai_req.model);
         Ok((StatusCode::OK, axum::Json(openai_resp)).into_response())
     }
 
@@ -83,9 +85,8 @@ impl AnthropicHandler {
         route: &RouteTarget,
     ) -> Result<Response, AppError> {
         let mut warnings = TranslationWarnings::default();
-        let mut anthropic_req =
-            translate_openai_to_anthropic_request(openai_req, &mut warnings)
-                .map_err(|err| AppError::BadRequest(err.to_string()))?;
+        let mut anthropic_req = translate_openai_to_anthropic_request(openai_req, &mut warnings)
+            .map_err(|err| AppError::BadRequest(err.to_string()))?;
         anthropic_req.stream = Some(true);
 
         let builder = self.build_upstream_request(request_headers, route)?;
@@ -98,9 +99,9 @@ impl AnthropicHandler {
         }
 
         let model = openai_req.model.clone();
-        let byte_stream = upstream.bytes_stream().map(|chunk| {
-            chunk.map_err(|err| std::io::Error::other(err.to_string()))
-        });
+        let byte_stream = upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
 
         let sse_stream = futures::stream::unfold(
             (
@@ -131,7 +132,8 @@ impl AnthropicHandler {
                             }
 
                             if let Some(ref mut active) = translator {
-                                for chunk in active.process_event(&event) {
+                                if let Some(chunk) = active.process_event(&event).into_iter().next()
+                                {
                                     let payload = format_openai_sse_chunk(&chunk);
                                     return Some((
                                         Ok(bytes::Bytes::from(payload)),
@@ -225,14 +227,14 @@ where
         .and_then(|value| value.to_str().ok())
         .unwrap_or("text/event-stream");
 
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .header(header::ACCEPT, accept)
         .body(Body::from_stream(body))
-        .map_err(|err| AppError::Internal(err.to_string()))?)
+        .map_err(|err| AppError::Internal(err.to_string()))
 }
 
 fn relay_error_body(status: reqwest::StatusCode, body: String) -> Result<Response, AppError> {
@@ -248,9 +250,9 @@ async fn relay_upstream_response(upstream: reqwest::Response) -> Result<Response
     let response_headers = copy_response_headers(upstream.headers());
 
     if is_event_stream(upstream.headers()) {
-        let stream = upstream.bytes_stream().map(|chunk| {
-            chunk.map_err(|err| std::io::Error::other(err.to_string()))
-        });
+        let stream = upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
         let mut response = Response::builder().status(status);
         for (name, value) in &response_headers {
             response = response.header(name.as_str(), value.as_str());

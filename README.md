@@ -1,0 +1,192 @@
+# inf-splitter
+
+Тонкий, годный к контейнеризации HTTP-роутер для запросов инференса: маршрутизация по модели из TOML-конфигурации на OpenAI- и Anthropic-совместимые upstream.
+
+Заменяет `anyllm-proxy`: без LiteLLM YAML, admin UI и SSRF-обходов через `/etc/hosts`.
+
+**Прокси управляет API-ключами.** Если в секции конфигурации задан `api_key`, прокси подставляет его в upstream-запрос. Если `api_key` не задан, входящие auth-заголовки клиента передаются как есть.
+
+## Конфигурация
+
+Основной файл: [`config/inf-splitter.toml`](config/inf-splitter.toml).
+
+```toml
+port = 3383
+
+[ollama]
+endpoint = "http://127.0.0.1:11434"
+protocol = "OPENAI"
+models = "gemma4:31b"
+
+[deepseek]
+endpoint = "https://api.deepseek.com/anthropic"
+api_key = "${DEEPSEEK_API_KEY}"
+protocol = "ANTHROPIC"
+models = ["deepseek-v4-pro[1m]", "deepseek-v4-flash"]
+
+[etc]
+endpoint = "https://api.modelarts-maas.com/openai/v1"
+api_key = "${MAAS_API_KEY}"
+protocol = "OPENAI"
+models = "default"
+```
+
+| Поле секции | Описание |
+|-------------|----------|
+| `endpoint` | Base URL upstream-провайдера |
+| `protocol` | `OPENAI` или `ANTHROPIC` |
+| `models` | Одна модель, список моделей или `"default"` (fallback для несматчившихся) |
+| `api_key` | Опционально; `${VAR}` резолвится из env или файла `secrets/VAR` |
+
+Путь к конфигу можно переопределить через `INF_SPLITTER_CONFIG`. Адрес прослушивания: `port` из TOML или `LISTEN_ADDR` из env.
+
+### Секреты
+
+```bash
+mkdir -p secrets
+cp secrets.example/* secrets/
+# отредактируйте secrets/DEEPSEEK_API_KEY, secrets/MAAS_API_KEY
+```
+
+Каталог `secrets/` в `.gitignore` — не коммитьте реальные ключи.
+
+Порядок резолва `${VAR}`: переменная окружения → файл `secrets/VAR`.
+
+## Маршрутизация
+
+```
+Claude Code  --POST /openai/v1/messages-->     inf-splitter
+            --POST /anthropic/v1/messages-->
+                         |
+              model + ingress protocol
+                         |
+         +---------------+---------------+
+         |                               |
+    OPENAI section                  ANTHROPIC section
+         |                               |
+    OpenAI upstream               Anthropic upstream
+  (/v1/chat/completions)           (/v1/messages)
+```
+
+| Модель | Секция | Рекомендуемый ingress |
+|--------|--------|------------------------|
+| `gemma4:31b` | `[ollama]` | `POST /openai/v1/messages` |
+| `deepseek-v4-pro[1m]`, `deepseek-v4-flash` | `[deepseek]` | `POST /anthropic/v1/messages` |
+| любая другая | `[etc]` (`default`) | `POST /openai/v1/messages` |
+
+Ingress endpoint задаёт **формат входящего запроса и ответа клиенту**. Секция TOML задаёт **целевой upstream**. При несовпадении протоколов запрос и ответ конвертируются через `anyllm_translate`.
+
+| Ingress | Секция | Поведение |
+|---------|--------|-----------|
+| `/anthropic/v1/messages` | `ANTHROPIC` | passthrough |
+| `/anthropic/v1/messages` | `OPENAI` | Anthropic → OpenAI → Anthropic |
+| `/openai/v1/messages` | `OPENAI` | passthrough |
+| `/openai/v1/messages` | `ANTHROPIC` | OpenAI → Anthropic → OpenAI |
+
+### API-ключи
+
+| Секция | `api_key` | Поведение |
+|--------|-----------|-----------|
+| `[ollama]` | не задан | Входящий ключ клиента (или `Bearer ollama` для Ollama по умолчанию) |
+| `[deepseek]` | `${DEEPSEEK_API_KEY}` | Прокси подставляет ключ из env/`secrets/` |
+| `[etc]` | `${MAAS_API_KEY}` | Прокси подставляет ключ из env/`secrets/` |
+
+## HTTP API
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `GET` | `/health` | `{"status":"ok"}` |
+| `GET` | `/v1/models` | Anthropic-совместимый список моделей |
+| `POST` | `/openai/v1/messages` | OpenAI-формат; upstream по `model` из TOML |
+| `POST` | `/anthropic/v1/messages` | Anthropic-формат; upstream по `model` из TOML |
+
+### `GET /v1/models`
+
+Возвращает все явно перечисленные в TOML model id (без `"default"`), в лексикографическом порядке.
+
+## Интеграция с docker-compose
+
+Контейнер `claude` использует роутер как upstream Anthropic API:
+
+- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}/anthropic` (внутри Docker-сети)
+- Для локальных моделей через OpenAI-протокол: `http://inf-splitter:${PROXY_PORT}/openai`
+
+Смонтируйте конфиг и секреты:
+
+```yaml
+volumes:
+  - ./inf-splitter/config:/app/config:ro
+  - ./inf-splitter/secrets:/app/secrets:ro
+```
+
+### Доступ к Ollama на хосте
+
+В Docker для `[ollama].endpoint` используйте `http://host.docker.internal:11434` и `extra_hosts: host.docker.internal:host-gateway` в compose.
+
+## Сборка и запуск
+
+### Локально (cargo)
+
+```bash
+cd inf-splitter
+cp secrets.example/* secrets/
+export DEEPSEEK_API_KEY=sk-...   # или положите ключи в secrets/
+export MAAS_API_KEY=sk-...
+cargo run
+```
+
+### Docker
+
+```bash
+docker build -t inf-splitter .
+docker run --rm -p 3383:3383 \
+  -v "$PWD/config:/app/config:ro" \
+  -v "$PWD/secrets:/app/secrets:ro" \
+  inf-splitter
+```
+
+## Структура кода
+
+```
+src/
+├── main.rs      # точка входа, graceful shutdown
+├── config.rs    # TOML, маршрутизация по model/default, секреты
+├── auth.rs      # подстановка api_key / проброс auth-заголовков
+├── router.rs    # маршруты axum, /v1/models
+├── local.rs     # OpenAI upstream + конверсия Anthropic↔OpenAI
+├── remote.rs    # Anthropic upstream + конверсия OpenAI↔Anthropic
+└── error.rs     # ошибки в формате Anthropic API
+```
+
+## Тесты
+
+```bash
+env -u RUSTUP_TOOLCHAIN cargo test
+```
+
+Интеграционные тесты конверсии протоколов: `tests/protocol_conversion.rs` (mock upstream + HTTP через прокси).
+
+### Docker smoke test
+
+Проверяет сборку образа, старт с монтированным конфигом и HTTP endpoints:
+
+```bash
+./scripts/docker-smoke-test.sh
+```
+
+Переменные: `SMOKE_IMAGE` (тег образа, по умолчанию `inf-splitter:smoke-test`).
+
+## Устранение неполадок
+
+- **Config load failed: secret not found** — задайте env-переменную или скопируйте `secrets.example/` в `secrets/`.
+- **Ollama: Connection refused** — проверьте `[ollama].endpoint` и доступность Ollama с хоста/контейнера.
+
+## Лицензия
+
+Проект распространяется под [GNU General Public License v3.0 or later](LICENSE) (GPL-3.0-or-later).
+
+Зависимости Rust перечислены в [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES); тексты распространённых лицензий — в каталоге [licenses/](licenses/). После обновления `Cargo.lock` перегенерируйте список:
+
+```bash
+python3 scripts/generate-third-party-notices.py
+```

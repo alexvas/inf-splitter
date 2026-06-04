@@ -1,0 +1,28 @@
+[package]
+name = "inf-splitter"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "HTTP router for inference requests to OpenAI- and Anthropic-compatible upstreams"
+readme = "README.md"
+
+[dependencies]
+anyllm_client = "0.9"
+anyllm_translate = "0.9"
+axum = "0.8"
+bytes = "1"
+futures = "0.3"
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+anyllm_translate = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

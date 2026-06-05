@@ -135,13 +135,14 @@ Ingress endpoint задаёт **формат входящего запроса �
 | Метод | Путь | Описание |
 |-------|------|----------|
 | `GET` | `/health` | Readiness probe: `{"status":"ok","upstreams":{...}}` или `{"status":"degraded",...}` (HTTP 503) при недоступных upstream |
-| `GET` | `/v1/models` | Anthropic-совместимый список моделей |
+| `GET` | `/openai/v1/models` | OpenAI-совместимый список моделей |
+| `GET` | `/anthropic/v1/models` | Anthropic-совместимый список моделей |
 | `POST` | `/openai/v1/messages` | OpenAI-формат; upstream по `model` из TOML |
 | `POST` | `/anthropic/v1/messages` | Anthropic-формат; upstream по `model` из TOML |
 
-### `GET /v1/models`
+### `GET /openai/v1/models` и `GET /anthropic/v1/models`
 
-Возвращает все явно перечисленные в TOML model id (без `"default"`), в лексикографическом порядке.
+Возвращают все явно перечисленные в TOML model id (без `"default"`), в лексикографическом порядке.
 
 ## Интеграция с docker-compose
 
@@ -191,7 +192,7 @@ src/
 ├── main.rs      # точка входа, graceful shutdown
 ├── config.rs    # TOML, маршрутизация по model/default, секреты
 ├── auth.rs      # подстановка api_key / проброс auth-заголовков
-├── router.rs    # маршруты axum, /v1/models, /health
+├── router.rs    # маршруты axum, /v1/models (openai+anthropic), /health
 ├── local.rs     # OpenAI upstream + конверсия Anthropic↔OpenAI
 ├── remote.rs    # Anthropic upstream + конверсия OpenAI↔Anthropic
 ├── sse.rs       # общие утилиты для SSE (парсинг, форматирование, ответы)

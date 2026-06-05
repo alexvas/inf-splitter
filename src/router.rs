@@ -57,7 +57,8 @@ pub struct ModelsListResponse {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/v1/models", get(list_models))
+        .route("/openai/v1/models", get(list_models))
+        .route("/anthropic/v1/models", get(list_models))
         .route("/openai/v1/messages", post(post_openai_messages))
         .route("/anthropic/v1/messages", post(post_anthropic_messages))
         .with_state(state)

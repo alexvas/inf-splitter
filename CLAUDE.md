@@ -37,7 +37,7 @@ Client → POST /openai/v1/messages  or  /anthropic/v1/messages
 | Module | Role |
 |--------|------|
 | `config.rs` | TOML parsing, model→section routing, secret resolution (`${VAR}` from env or `secrets/VAR`), duration/byte-size parsing (`15s`, `2m`, `512k`) |
-| `router.rs` | Axum routes, `AppState`, `/health` readiness probe (parallel upstream checks, 5s cache), `/v1/models`, dispatch logic |
+| `router.rs` | Axum routes, `AppState`, `/health` readiness probe (parallel upstream checks, 5s cache), `/openai/v1/models` + `/anthropic/v1/models`, dispatch logic |
 | `local.rs` | `OpenAiHandler` — sends to `/v1/chat/completions`, handles Anthropic→OpenAI conversion (via `anyllm_client` + `anyllm_translate`) |
 | `remote.rs` | `AnthropicHandler` — sends to `/v1/messages`, handles OpenAI→Anthropic conversion |
 | `sse.rs` | Shared SSE utilities: event-stream detection, line parsing, event formatting |

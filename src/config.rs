@@ -56,6 +56,7 @@ pub struct Config {
     pub upstream_timeout: Duration,
     pub max_request_body: usize,
     pub body_too_large_hint_statuses: Arc<HashSet<StatusCode>>,
+    pub dump_on_error: bool,
     default_max_tokens: Option<u32>,
     default_max_output_tokens: Option<u32>,
     default_max_completion_tokens: Option<u32>,
@@ -167,6 +168,7 @@ impl Config {
 
         let listen_addr = resolve_listen_addr(file.port)?;
         let omit_stream_options = env_truthy("OMIT_STREAM_OPTIONS");
+        let dump_on_error = env_truthy("DUMP_ON_ERROR");
         let upstream_timeout = parse_duration_field(
             file.upstream_timeout
                 .as_deref()
@@ -259,6 +261,7 @@ impl Config {
         Ok(Self {
             listen_addr,
             omit_stream_options,
+            dump_on_error,
             upstream_timeout,
             max_request_body,
             body_too_large_hint_statuses,
@@ -331,6 +334,7 @@ impl Config {
         Self {
             listen_addr: "0.0.0.0:3000".parse().expect("test listen addr"),
             omit_stream_options: true,
+            dump_on_error: false,
             upstream_timeout: parse_duration(DEFAULT_UPSTREAM_TIMEOUT).expect("default timeout"),
             max_request_body: parse_byte_size(DEFAULT_MAX_REQUEST_BODY)
                 .expect("default body limit"),

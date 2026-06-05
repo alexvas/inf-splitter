@@ -20,6 +20,7 @@ use crate::sse;
 pub struct OpenAiHandler {
     http: HttpClient,
     omit_stream_options: bool,
+    dump_on_error: bool,
     hint_statuses: Arc<HashSet<StatusCode>>,
 }
 
@@ -31,6 +32,7 @@ impl OpenAiHandler {
                 .build()
                 .map_err(|err| AppError::Internal(err.to_string()))?,
             omit_stream_options: config.omit_stream_options,
+            dump_on_error: config.dump_on_error,
             hint_statuses,
         })
     }
@@ -66,6 +68,9 @@ impl OpenAiHandler {
         route: &RouteTarget,
         endpoint: &str,
     ) -> Result<Response, AppError> {
+        let request_size = body.len();
+        let model = crate::peek_model_from_json(body);
+        let messages_detail = crate::messages_detail_from_bytes(body);
         let body = crate::apply_token_caps(body, route)?;
         let backend_url = format!("{endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
@@ -77,6 +82,30 @@ impl OpenAiHandler {
         );
 
         let upstream = builder.body(body).send().await?;
+        if self.dump_on_error
+            && !upstream.status().is_success()
+            && !sse::is_event_stream(upstream.headers())
+        {
+            let status = upstream.status();
+            let error_body = upstream.text().await.unwrap_or_default();
+            crate::dump_upstream_error(&crate::UpstreamErrorCtx {
+                status: status.as_u16(),
+                error_message: error_body.clone(),
+                model,
+                request_size,
+                input_messages: None,
+                max_tokens: None,
+                chunks_received: None,
+                bytes_received: None,
+                messages_detail,
+            });
+            let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            return Response::builder()
+                .status(sc)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(error_body))
+                .map_err(|err| AppError::Internal(err.to_string()));
+        }
         relay_openai_upstream(upstream).await
     }
 
@@ -144,7 +173,25 @@ impl OpenAiHandler {
         req: &MessageCreateRequest,
         client: &Client,
     ) -> Result<Response, AppError> {
-        let response = client.messages(req).await?;
+        let response = match client.messages(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                if self.dump_on_error {
+                    crate::dump_upstream_error(&crate::UpstreamErrorCtx {
+                        status: 0,
+                        error_message: e.to_string(),
+                        model: req.model.clone(),
+                        request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
+                        input_messages: Some(req.messages.len()),
+                        max_tokens: Some(req.max_tokens),
+                        chunks_received: None,
+                        bytes_received: None,
+                        messages_detail: Some(crate::anthropic_messages_detail(req)),
+                    });
+                }
+                return Err(AppError::from(e));
+            }
+        };
         Ok((StatusCode::OK, axum::Json(response)).into_response())
     }
 
@@ -161,7 +208,25 @@ impl OpenAiHandler {
         openai_req.stream_options = None;
 
         let client = self.build_client(route, openai_endpoint, &req.model, request_headers)?;
-        let (openai_resp, _, _) = client.chat_completion(&openai_req).await?;
+        let (openai_resp, _, _) = match client.chat_completion(&openai_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                if self.dump_on_error {
+                    crate::dump_upstream_error(&crate::UpstreamErrorCtx {
+                        status: 0,
+                        error_message: e.to_string(),
+                        model: req.model.clone(),
+                        request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
+                        input_messages: Some(req.messages.len()),
+                        max_tokens: Some(req.max_tokens),
+                        chunks_received: None,
+                        bytes_received: None,
+                        messages_detail: Some(crate::anthropic_messages_detail(req)),
+                    });
+                }
+                return Err(AppError::from(e));
+            }
+        };
         let response = translate_response(&openai_resp, &req.model);
         Ok((StatusCode::OK, axum::Json(response)).into_response())
     }
@@ -189,7 +254,25 @@ impl OpenAiHandler {
         request_headers: &HeaderMap,
         client: &Client,
     ) -> Result<Response, AppError> {
-        let (stream, _rate_limits) = client.messages_stream(req).await?;
+        let (stream, _rate_limits) = match client.messages_stream(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                if self.dump_on_error {
+                    crate::dump_upstream_error(&crate::UpstreamErrorCtx {
+                        status: 0,
+                        error_message: e.to_string(),
+                        model: req.model.clone(),
+                        request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
+                        input_messages: Some(req.messages.len()),
+                        max_tokens: Some(req.max_tokens),
+                        chunks_received: None,
+                        bytes_received: None,
+                        messages_detail: Some(crate::anthropic_messages_detail(req)),
+                    });
+                }
+                return Err(AppError::from(e));
+            }
+        };
         sse::sse_response(
             request_headers,
             stream.map(|event| {
@@ -225,7 +308,31 @@ impl OpenAiHandler {
         let upstream = builder.json(&openai_req).send().await?;
 
         if !upstream.status().is_success() {
-            return relay_upstream_status_error(upstream, &self.hint_statuses).await;
+            let status = upstream.status();
+            let error_body = upstream
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
+            if self.dump_on_error {
+                crate::dump_upstream_error(&crate::UpstreamErrorCtx {
+                    status: status.as_u16(),
+                    error_message: error_body.clone(),
+                    model: req.model.clone(),
+                    request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
+                    input_messages: Some(req.messages.len()),
+                    max_tokens: Some(req.max_tokens),
+                    chunks_received: None,
+                    bytes_received: None,
+                    messages_detail: Some(crate::anthropic_messages_detail(req)),
+                });
+            }
+            let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = crate::append_size_hint(sc, error_body, &self.hint_statuses);
+            return Response::builder()
+                .status(sc)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .map_err(|err| AppError::Internal(err.to_string()));
         }
 
         let model = req.model.clone();
@@ -335,24 +442,6 @@ impl From<anyllm_client::ClientError> for AppError {
     fn from(err: ClientError) -> Self {
         Self::Upstream(err.to_string())
     }
-}
-
-async fn relay_upstream_status_error(
-    upstream: reqwest::Response,
-    hint_statuses: &HashSet<StatusCode>,
-) -> Result<Response, AppError> {
-    let status = upstream.status();
-    let body = upstream
-        .text()
-        .await
-        .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-    let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = crate::append_size_hint(status_code, body, hint_statuses);
-    Response::builder()
-        .status(status_code)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .map_err(|err| AppError::Internal(err.to_string()))
 }
 
 fn cap_anthropic_max_tokens(req: &mut MessageCreateRequest, limit: Option<u32>) {

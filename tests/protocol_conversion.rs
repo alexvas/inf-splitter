@@ -6,7 +6,7 @@ use anyllm_translate::anthropic::{Content, MessageCreateRequest};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
 use common::{
     anthropic_upstream_response, openai_upstream_response, spawn_error_upstream, spawn_router,
-    spawn_stream_upstream, spawn_upstream,
+    spawn_router_with_dump, spawn_stream_upstream, spawn_upstream,
 };
 
 const CLIENT_PROMPT: &str = "hello-from-client";
@@ -431,4 +431,135 @@ models = "stream-model"
         body.contains("content_block_delta") || body.contains("message_stop"),
         "expected Anthropic SSE events, got: {body}"
     );
+}
+
+/// With DUMP_ON_ERROR=1 the passthrough error path must still relay the
+/// correct status and body while writing diagnostic JSON to stderr.
+#[tokio::test]
+async fn dump_on_error_passthrough_does_not_break_response() {
+    let upstream_addr = spawn_error_upstream(
+        "/v1/chat/completions",
+        axum::http::StatusCode::BAD_GATEWAY,
+        serde_json::json!({"error": {"message": "upstream exploded"}}),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[local]
+endpoint_openai = "http://{upstream_addr}"
+models = "dump-model"
+"#
+    );
+
+    let proxy_addr = spawn_router_with_dump(&config).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "dump-model",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["message"], "upstream exploded");
+}
+
+/// With DUMP_ON_ERROR=1 the conversion error path must still relay the
+/// correct status and body (and messages_detail is populated from the
+/// typed request).
+#[tokio::test]
+async fn dump_on_error_conversion_does_not_break_response() {
+    let upstream_addr = spawn_error_upstream(
+        "/v1/messages",
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        serde_json::json!({"type": "error", "error": {"type": "overloaded", "message": "too busy"}}),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "dump-conv-model"
+"#
+    );
+
+    std::env::set_var("DUMP_ON_ERROR", "1");
+    let proxy_addr = spawn_router(&config).await;
+    std::env::remove_var("DUMP_ON_ERROR");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "dump-conv-model",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "user", "content": [{"type": "text", "text": "describe this"}]}
+            ]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["message"], "too busy");
+}
+
+/// With DUMP_ON_ERROR=1 and a stream request that fails at the HTTP level
+/// (non-2xx from upstream), the error relay must still work.
+#[tokio::test]
+async fn dump_on_error_stream_conversion_error_does_not_break_response() {
+    let upstream_addr = spawn_error_upstream(
+        "/v1/messages",
+        axum::http::StatusCode::BAD_GATEWAY,
+        serde_json::json!({"type": "error", "error": {"type": "api_error", "message": "down"}}),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "dump-stream-model"
+"#
+    );
+
+    std::env::set_var("DUMP_ON_ERROR", "1");
+    let proxy_addr = spawn_router(&config).await;
+    std::env::remove_var("DUMP_ON_ERROR");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "dump-stream-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["message"], "down");
 }

@@ -69,6 +69,19 @@ pub async fn spawn_router(config_toml: &str) -> SocketAddr {
     bind_and_serve(app).await.0
 }
 
+/// Like `spawn_router` but with `dump_on_error = true` on the config.
+pub async fn spawn_router_with_dump(config_toml: &str) -> SocketAddr {
+    let mut config = Config::load_from_str(config_toml).expect("test config");
+    config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");
+    config.omit_stream_options = true;
+    config.dump_on_error = true;
+
+    let app = inf_splitter::build_app(config)
+        .await
+        .expect("build proxy app");
+    bind_and_serve(app).await.0
+}
+
 /// Spawn an upstream that returns a fixed HTTP status and JSON body.
 pub async fn spawn_error_upstream(
     path: &'static str,

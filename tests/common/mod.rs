@@ -92,6 +92,26 @@ async fn capture_and_respond(
     Json(state.response.clone())
 }
 
+/// Spawn an upstream that returns a fixed SSE stream (content-type text/event-stream).
+pub async fn spawn_stream_upstream(path: &'static str, sse_body: String) -> SocketAddr {
+    use axum::body::Body;
+    use axum::http::{header, StatusCode};
+    use axum::response::Response;
+
+    let app = Router::new().route(
+        path,
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(sse_body.clone()))
+                .unwrap()
+        }),
+    );
+    bind_and_serve(app).await.0
+}
+
 async fn bind_and_serve(app: Router) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

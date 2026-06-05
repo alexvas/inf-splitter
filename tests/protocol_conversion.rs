@@ -6,7 +6,7 @@ use anyllm_translate::anthropic::{Content, MessageCreateRequest};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
 use common::{
     anthropic_upstream_response, openai_upstream_response, spawn_error_upstream, spawn_router,
-    spawn_upstream,
+    spawn_stream_upstream, spawn_upstream,
 };
 
 const CLIENT_PROMPT: &str = "hello-from-client";
@@ -329,4 +329,106 @@ models = "passthrough-model"
     assert!(response.status().is_success());
     let body: serde_json::Value = response.json().await.expect("json body");
     assert_eq!(body["type"], "message");
+}
+
+#[tokio::test]
+async fn openai_ingress_anthropic_upstream_streaming() {
+    let sse_body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_001\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"stream-model\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":5}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"streamed\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+";
+
+    let anthropic_addr = spawn_stream_upstream("/v1/messages", sse_body.to_string()).await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{anthropic_addr}"
+models = "stream-model"
+"#
+    );
+
+    let proxy_addr = spawn_router(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "stream-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    let status = response.status();
+    let body = response.text().await.expect("response body");
+    assert!(
+        status.is_success(),
+        "streaming request failed with {status}: {body}"
+    );
+    assert!(
+        body.contains("chat.completion.chunk") || body.contains("[DONE]"),
+        "expected OpenAI SSE chunks, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_ingress_openai_upstream_streaming() {
+    let sse_body = "\
+data: {\"id\":\"chatcmpl-001\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"stream-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}
+
+data: {\"id\":\"chatcmpl-001\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"stream-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"streamed\"},\"finish_reason\":null}]}
+
+data: {\"id\":\"chatcmpl-001\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"stream-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+";
+
+    let openai_addr = spawn_stream_upstream("/v1/chat/completions", sse_body.to_string()).await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[local]
+endpoint_openai = "http://{openai_addr}"
+models = "stream-model"
+"#
+    );
+
+    let proxy_addr = spawn_router(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "stream-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert!(response.status().is_success());
+    let body = response.text().await.expect("response body");
+    assert!(
+        body.contains("content_block_delta") || body.contains("message_stop"),
+        "expected Anthropic SSE events, got: {body}"
+    );
 }

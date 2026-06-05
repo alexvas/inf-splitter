@@ -12,7 +12,7 @@ use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
 use crate::auth::forward_request_headers;
-use crate::config::{cap_numeric_field, Config, RouteTarget};
+use crate::config::{Config, RouteTarget};
 use crate::error::AppError;
 use crate::sse;
 
@@ -66,7 +66,7 @@ impl OpenAiHandler {
         route: &RouteTarget,
         endpoint: &str,
     ) -> Result<Response, AppError> {
-        let body = apply_token_caps(body, route)?;
+        let body = crate::apply_token_caps(body, route)?;
         let backend_url = format!("{endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
             self.http
@@ -93,6 +93,8 @@ impl OpenAiHandler {
             translation = translation.model_map(mapped, mapped);
         }
 
+        // SSRF protection is disabled because upstream endpoints are
+        // statically configured by the operator, not user-controlled.
         let http = HttpClientConfig {
             ssrf_protection: false,
             ..Default::default()
@@ -126,7 +128,7 @@ impl OpenAiHandler {
                 return Auth::Bearer(token.to_string());
             }
         }
-        Auth::Bearer("ollama".into())
+        Auth::Bearer(String::new())
     }
 
     fn translation_for(&self, route: &RouteTarget, model: &str) -> TranslationConfig {
@@ -253,7 +255,19 @@ impl OpenAiHandler {
 
                     match byte_stream.next().await {
                         Some(Ok(chunk)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&chunk));
+                            match String::from_utf8(chunk.to_vec()) {
+                                Ok(s) => buffer.push_str(&s),
+                                Err(e) => {
+                                    tracing::warn!("invalid UTF-8 in SSE stream: {e}");
+                                    buffer.push_str(&String::from_utf8_lossy(e.as_bytes()));
+                                }
+                            }
+                            if buffer.len() > sse::MAX_SSE_LINE_LENGTH {
+                                return Some((
+                                    Err(std::io::Error::other("SSE line too long")),
+                                    (byte_stream, translator, buffer),
+                                ));
+                            }
                         }
                         Some(Err(err)) => {
                             return Some((Err(err), (byte_stream, translator, buffer)));
@@ -333,50 +347,12 @@ async fn relay_upstream_status_error(
         .await
         .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
     let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = append_size_hint(status_code, body, hint_statuses);
+    let body = crate::append_size_hint(status_code, body, hint_statuses);
     Response::builder()
         .status(status_code)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .map_err(|err| AppError::Internal(err.to_string()))
-}
-
-fn append_size_hint(
-    status: StatusCode,
-    body: String,
-    hint_statuses: &HashSet<StatusCode>,
-) -> String {
-    if !hint_statuses.contains(&status) {
-        return body;
-    }
-    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) {
-        if let Some(serde_json::Value::String(msg)) = value.pointer_mut("/error/message") {
-            *msg = format!("{msg}. Try reducing context size or splitting into smaller requests.");
-            return serde_json::to_string(&value).unwrap_or(body);
-        }
-    }
-    format!("{body}. Try reducing context size or splitting into smaller requests.")
-}
-
-fn apply_token_caps(body: &[u8], route: &RouteTarget) -> Result<Vec<u8>, AppError> {
-    let has_caps = route.max_tokens.is_some()
-        || route.max_output_tokens.is_some()
-        || route.max_completion_tokens.is_some();
-    if !has_caps {
-        return Ok(body.to_vec());
-    }
-    let mut value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
-    if let Some(limit) = route.max_tokens {
-        cap_numeric_field(&mut value, "max_tokens", limit);
-    }
-    if let Some(limit) = route.max_output_tokens {
-        cap_numeric_field(&mut value, "max_output_tokens", limit);
-    }
-    if let Some(limit) = route.max_completion_tokens {
-        cap_numeric_field(&mut value, "max_completion_tokens", limit);
-    }
-    serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))
 }
 
 fn cap_anthropic_max_tokens(req: &mut MessageCreateRequest, limit: Option<u32>) {
@@ -385,5 +361,40 @@ fn cap_anthropic_max_tokens(req: &mut MessageCreateRequest, limit: Option<u32>) 
     };
     if req.max_tokens > limit {
         req.max_tokens = limit;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_req(max_tokens: u32) -> MessageCreateRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn cap_anthropic_max_tokens_clamps_exceeding() {
+        let mut req = make_req(4096);
+        cap_anthropic_max_tokens(&mut req, Some(1024));
+        assert_eq!(req.max_tokens, 1024);
+    }
+
+    #[test]
+    fn cap_anthropic_max_tokens_leaves_below_unchanged() {
+        let mut req = make_req(512);
+        cap_anthropic_max_tokens(&mut req, Some(1024));
+        assert_eq!(req.max_tokens, 512);
+    }
+
+    #[test]
+    fn cap_anthropic_max_tokens_no_limit_unchanged() {
+        let mut req = make_req(4096);
+        cap_anthropic_max_tokens(&mut req, None);
+        assert_eq!(req.max_tokens, 4096);
     }
 }

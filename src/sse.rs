@@ -7,6 +7,10 @@ use axum::response::Response;
 
 use crate::error::AppError;
 
+/// Maximum length of a single SSE line before the connection is aborted.
+/// Protects against unbounded buffer growth from a misbehaving upstream.
+pub const MAX_SSE_LINE_LENGTH: usize = 1024 * 1024; // 1 MB
+
 pub fn is_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)

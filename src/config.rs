@@ -282,7 +282,10 @@ impl Config {
         let section = self
             .sections
             .get(&section_name)
-            .expect("section name from routes must exist");
+            .ok_or_else(|| ConfigError::Provider {
+                name: section_name.clone(),
+                message: "internal: section referenced by route does not exist".to_string(),
+            })?;
 
         Ok(RouteTarget {
             section: section.name.clone(),
@@ -704,5 +707,33 @@ max_tokens = 1024
         let remote = config.resolve_route("remote-model").expect("remote");
         assert_eq!(remote.max_tokens, Some(1024));
         assert_eq!(remote.max_completion_tokens, Some(8192));
+    }
+
+    #[test]
+    fn cap_numeric_field_sets_missing() {
+        let mut body = serde_json::json!({});
+        cap_numeric_field(&mut body, "max_tokens", 1024);
+        assert_eq!(body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn cap_numeric_field_clamps_exceeding() {
+        let mut body = serde_json::json!({"max_tokens": 4096});
+        cap_numeric_field(&mut body, "max_tokens", 1024);
+        assert_eq!(body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn cap_numeric_field_leaves_below_unchanged() {
+        let mut body = serde_json::json!({"max_tokens": 512});
+        cap_numeric_field(&mut body, "max_tokens", 1024);
+        assert_eq!(body["max_tokens"], 512);
+    }
+
+    #[test]
+    fn cap_numeric_field_leaves_equal_unchanged() {
+        let mut body = serde_json::json!({"max_tokens": 1024});
+        cap_numeric_field(&mut body, "max_tokens", 1024);
+        assert_eq!(body["max_tokens"], 1024);
     }
 }

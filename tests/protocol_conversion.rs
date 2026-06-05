@@ -26,8 +26,7 @@ async fn anthropic_ingress_openai_upstream_converts_both_ways() {
 port = 0
 
 [local]
-endpoint = "http://{openai_addr}"
-protocol = "OPENAI"
+endpoint_openai = "http://{openai_addr}"
 models = "local-openai-model"
 "#
     );
@@ -92,8 +91,7 @@ async fn openai_ingress_anthropic_upstream_converts_both_ways() {
 port = 0
 
 [remote]
-endpoint = "http://{anthropic_addr}"
-protocol = "ANTHROPIC"
+endpoint_anthropic = "http://{anthropic_addr}"
 models = "remote-anthropic-model"
 "#
     );
@@ -150,8 +148,7 @@ async fn unroutable_model_returns_400() {
 port = 0
 
 [local]
-endpoint = "http://127.0.0.1:1"
-protocol = "OPENAI"
+endpoint_openai = "http://127.0.0.1:1"
 models = "known-model"
 "#;
     let proxy_addr = spawn_router(config).await;
@@ -177,8 +174,7 @@ async fn empty_model_returns_400() {
 port = 0
 
 [local]
-endpoint = "http://127.0.0.1:1"
-protocol = "OPENAI"
+endpoint_openai = "http://127.0.0.1:1"
 models = "known-model"
 "#;
     let proxy_addr = spawn_router(config).await;
@@ -204,8 +200,7 @@ async fn invalid_json_body_returns_400() {
 port = 0
 
 [local]
-endpoint = "http://127.0.0.1:1"
-protocol = "OPENAI"
+endpoint_openai = "http://127.0.0.1:1"
 models = "known-model"
 "#;
     let proxy_addr = spawn_router(config).await;
@@ -236,8 +231,7 @@ async fn upstream_error_relays_status() {
 port = 0
 
 [local]
-endpoint = "http://{upstream_addr}"
-protocol = "OPENAI"
+endpoint_openai = "http://{upstream_addr}"
 models = "test-model"
 "#
     );
@@ -275,8 +269,7 @@ async fn openai_passthrough_no_conversion() {
 port = 0
 
 [local]
-endpoint = "http://{openai_addr}"
-protocol = "OPENAI"
+endpoint_openai = "http://{openai_addr}"
 models = "passthrough-model"
 "#
     );
@@ -314,8 +307,7 @@ async fn anthropic_passthrough_no_conversion() {
 port = 0
 
 [remote]
-endpoint = "http://{anthropic_addr}"
-protocol = "ANTHROPIC"
+endpoint_anthropic = "http://{anthropic_addr}"
 models = "passthrough-model"
 "#
     );

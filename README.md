@@ -26,20 +26,17 @@ max_tokens = 4096
 max_completion_tokens = 8192
 
 [ollama]
-endpoint = "http://127.0.0.1:11434"
-protocol = "OPENAI"
+endpoint_openai = "http://127.0.0.1:11434"
 models = "gemma4:31b"
 
 [deepseek]
-endpoint = "https://api.deepseek.com/anthropic"
+endpoint_anthropic = "https://api.deepseek.com/anthropic"
 api_key = "${DEEPSEEK_API_KEY}"
-protocol = "ANTHROPIC"
 models = ["deepseek-v4-pro[1m]", "deepseek-v4-flash"]
 
 [etc]
-endpoint = "https://api.modelarts-maas.com/openai/v1"
+endpoint_openai = "https://api.modelarts-maas.com/openai/v1"
 api_key = "${MAAS_API_KEY}"
-protocol = "OPENAI"
 models = "default"
 ```
 
@@ -64,8 +61,8 @@ models = "default"
 
 | Поле секции | Описание |
 |-------------|----------|
-| `endpoint` | Base URL upstream-провайдера |
-| `protocol` | `OPENAI` или `ANTHROPIC` |
+| `endpoint_openai` | Опционально; base URL OpenAI-совместимого upstream. Если задан, входящие запросы `/openai` идут сюда без конверсии |
+| `endpoint_anthropic` | Опционально; base URL Anthropic-совместимого upstream. Если задан, входящие запросы `/anthropic` идут сюда без конверсии |
 | `models` | Одна модель, список моделей или `"default"` (fallback для несматчившихся) |
 | `api_key` | Опционально; `${VAR}` резолвится из env или файла `secrets/VAR` |
 | `max_tokens` | Опционально; лимит на `max_tokens` в исходящем запросе. Если клиент не задал или превысил — прокси подставляет лимит |
@@ -115,14 +112,14 @@ Claude Code  --POST /openai/v1/messages-->     inf-splitter
 | `deepseek-v4-pro[1m]`, `deepseek-v4-flash` | `[deepseek]` | `POST /anthropic/v1/messages` |
 | любая другая | `[etc]` (`default`) | `POST /openai/v1/messages` |
 
-Ingress endpoint задаёт **формат входящего запроса и ответа клиенту**. Секция TOML задаёт **целевой upstream**. При несовпадении протоколов запрос и ответ конвертируются через `anyllm_translate`.
+Ingress endpoint задаёт **формат входящего запроса и ответа клиенту**. Секция TOML задаёт **целевой upstream** через `endpoint_openai` и/или `endpoint_anthropic`. Если заданы оба — `/openai` идёт на `endpoint_openai`, `/anthropic` — на `endpoint_anthropic` (passthrough). Если задан только один — встречный ingress конвертируется через `anyllm_translate`.
 
-| Ingress | Секция | Поведение |
-|---------|--------|-----------|
-| `/anthropic/v1/messages` | `ANTHROPIC` | passthrough |
-| `/anthropic/v1/messages` | `OPENAI` | Anthropic → OpenAI → Anthropic |
-| `/openai/v1/messages` | `OPENAI` | passthrough |
-| `/openai/v1/messages` | `ANTHROPIC` | OpenAI → Anthropic → OpenAI |
+| Ingress | Наличие endpoint | Поведение |
+|---------|-------------------|-----------|
+| `/openai/v1/messages` | `endpoint_openai` задан | passthrough → OpenAI upstream |
+| `/openai/v1/messages` | только `endpoint_anthropic` | OpenAI → Anthropic → OpenAI |
+| `/anthropic/v1/messages` | `endpoint_anthropic` задан | passthrough → Anthropic upstream |
+| `/anthropic/v1/messages` | только `endpoint_openai` | Anthropic → OpenAI → Anthropic |
 
 ### API-ключи
 

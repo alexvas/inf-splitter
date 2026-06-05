@@ -40,17 +40,19 @@ impl OpenAiHandler {
         body: &[u8],
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        openai_endpoint: &str,
     ) -> Result<Response, AppError> {
         let mut req: MessageCreateRequest = serde_json::from_slice(body)?;
         cap_anthropic_max_tokens(&mut req, route.max_tokens);
         let req = req;
-        let client = self.build_client(route, &req.model, request_headers)?;
+        let client = self.build_client(route, openai_endpoint, &req.model, request_headers)?;
 
         if req.stream.unwrap_or(false) {
-            self.handle_stream(&req, request_headers, route, &client)
+            self.handle_stream(&req, request_headers, route, openai_endpoint, &client)
                 .await
         } else if self.omit_stream_options {
-            self.handle_sync_manual(&req, request_headers, route).await
+            self.handle_sync_manual(&req, request_headers, route, openai_endpoint)
+                .await
         } else {
             self.handle_sync_client(&req, &client).await
         }
@@ -62,9 +64,10 @@ impl OpenAiHandler {
         body: &[u8],
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        endpoint: &str,
     ) -> Result<Response, AppError> {
         let body = apply_token_caps(body, route)?;
-        let backend_url = format!("{}/v1/chat/completions", route.endpoint);
+        let backend_url = format!("{endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
             self.http
                 .post(&backend_url)
@@ -80,10 +83,11 @@ impl OpenAiHandler {
     fn build_client(
         &self,
         route: &RouteTarget,
+        openai_endpoint: &str,
         model: &str,
         request_headers: &HeaderMap,
     ) -> Result<Client, AppError> {
-        let backend_url = format!("{}/v1/chat/completions", route.endpoint);
+        let backend_url = format!("{openai_endpoint}/v1/chat/completions");
         let mut translation = TranslationConfig::builder();
         for mapped in route.model_names.iter().chain([model.to_string()].iter()) {
             translation = translation.model_map(mapped, mapped);
@@ -147,13 +151,14 @@ impl OpenAiHandler {
         req: &MessageCreateRequest,
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        openai_endpoint: &str,
     ) -> Result<Response, AppError> {
         let translation = self.translation_for(route, &req.model);
         let mut openai_req = translate_request(req, &translation)
             .map_err(|err| AppError::Upstream(err.to_string()))?;
         openai_req.stream_options = None;
 
-        let client = self.build_client(route, &req.model, request_headers)?;
+        let client = self.build_client(route, openai_endpoint, &req.model, request_headers)?;
         let (openai_resp, _, _) = client.chat_completion(&openai_req).await?;
         let response = translate_response(&openai_resp, &req.model);
         Ok((StatusCode::OK, axum::Json(response)).into_response())
@@ -164,10 +169,12 @@ impl OpenAiHandler {
         req: &MessageCreateRequest,
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        openai_endpoint: &str,
         client: &Client,
     ) -> Result<Response, AppError> {
         if self.omit_stream_options {
-            self.handle_stream_manual(req, request_headers, route).await
+            self.handle_stream_manual(req, request_headers, route, openai_endpoint)
+                .await
         } else {
             self.handle_stream_client(req, request_headers, client)
                 .await
@@ -196,6 +203,7 @@ impl OpenAiHandler {
         req: &MessageCreateRequest,
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        openai_endpoint: &str,
     ) -> Result<Response, AppError> {
         let translation = self.translation_for(route, &req.model);
         let mut openai_req = translate_request(req, &translation)
@@ -203,7 +211,7 @@ impl OpenAiHandler {
         openai_req.stream = Some(true);
         openai_req.stream_options = None;
 
-        let backend_url = format!("{}/v1/chat/completions", route.endpoint);
+        let backend_url = format!("{openai_endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
             self.http
                 .post(&backend_url)

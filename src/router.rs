@@ -193,47 +193,51 @@ async fn dispatch_messages(
         .resolve_route(&peek.model)
         .map_err(AppError::from)?;
 
-    if ingress != route.protocol {
-        tracing::debug!(
-            model = %peek.model,
-            ingress = %ingress,
-            target = %route.protocol,
-            "converting request to target protocol"
-        );
-    }
-
     tracing::debug!(
         model = %peek.model,
         section = %route.section,
-        endpoint = %route.endpoint,
-        protocol = %route.protocol,
+        ingress = %ingress,
+        openai_endpoint = ?route.endpoint_openai,
+        anthropic_endpoint = ?route.endpoint_anthropic,
         "routing request"
     );
 
-    match (ingress, route.protocol) {
-        (Protocol::Anthropic, Protocol::Anthropic) => {
-            state
-                .anthropic
-                .handle_from_anthropic(body, &headers, &route)
-                .await
+    match ingress {
+        Protocol::OpenAi => {
+            if let Some(endpoint) = &route.endpoint_openai {
+                state
+                    .openai
+                    .handle_from_openai(&body, &headers, &route, endpoint)
+                    .await
+            } else if let Some(endpoint) = &route.endpoint_anthropic {
+                tracing::debug!("converting OpenAI ingress to Anthropic upstream");
+                state
+                    .anthropic
+                    .handle_from_openai(&body, &headers, &route, endpoint)
+                    .await
+            } else {
+                Err(AppError::Internal(
+                    "no endpoint configured for this provider".to_string(),
+                ))
+            }
         }
-        (Protocol::Anthropic, Protocol::OpenAi) => {
-            state
-                .openai
-                .handle_from_anthropic(&body, &headers, &route)
-                .await
-        }
-        (Protocol::OpenAi, Protocol::OpenAi) => {
-            state
-                .openai
-                .handle_from_openai(&body, &headers, &route)
-                .await
-        }
-        (Protocol::OpenAi, Protocol::Anthropic) => {
-            state
-                .anthropic
-                .handle_from_openai(&body, &headers, &route)
-                .await
+        Protocol::Anthropic => {
+            if let Some(endpoint) = &route.endpoint_anthropic {
+                state
+                    .anthropic
+                    .handle_from_anthropic(body, &headers, &route, endpoint)
+                    .await
+            } else if let Some(endpoint) = &route.endpoint_openai {
+                tracing::debug!("converting Anthropic ingress to OpenAI upstream");
+                state
+                    .openai
+                    .handle_from_anthropic(&body, &headers, &route, endpoint)
+                    .await
+            } else {
+                Err(AppError::Internal(
+                    "no endpoint configured for this provider".to_string(),
+                ))
+            }
         }
     }
 }

@@ -25,21 +25,11 @@ impl std::fmt::Display for Protocol {
     }
 }
 
-impl Protocol {
-    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
-        match raw.trim().to_ascii_uppercase().as_str() {
-            "OPENAI" => Ok(Self::OpenAi),
-            "ANTHROPIC" => Ok(Self::Anthropic),
-            other => Err(ConfigError::InvalidProtocol(other.to_string())),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct RouteTarget {
     pub section: String,
-    pub endpoint: String,
-    pub protocol: Protocol,
+    pub endpoint_openai: Option<String>,
+    pub endpoint_anthropic: Option<String>,
     pub api_key: Option<String>,
     pub max_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
@@ -50,8 +40,8 @@ pub struct RouteTarget {
 #[derive(Debug, Clone)]
 struct ProviderSection {
     name: String,
-    endpoint: String,
-    protocol: Protocol,
+    endpoint_openai: Option<String>,
+    endpoint_anthropic: Option<String>,
     api_key: Option<String>,
     max_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
@@ -101,8 +91,8 @@ struct DefaultConfig {
 
 #[derive(Debug, Deserialize)]
 struct ProviderConfigRaw {
-    endpoint: String,
-    protocol: String,
+    endpoint_openai: Option<String>,
+    endpoint_anthropic: Option<String>,
     models: ModelsField,
     api_key: Option<String>,
     max_tokens: Option<u32>,
@@ -127,8 +117,6 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
     #[error("provider section {name}: {message}")]
     Provider { name: String, message: String },
-    #[error("invalid protocol {0}: expected OPENAI or ANTHROPIC")]
-    InvalidProtocol(String),
     #[error("duplicate model {model} in sections {first} and {second}")]
     DuplicateModel {
         model: String,
@@ -209,23 +197,22 @@ impl Config {
         let mut default_section: Option<String> = None;
 
         for (name, raw_section) in file.providers {
-            let endpoint = raw_section
-                .endpoint
-                .trim()
-                .trim_end_matches('/')
-                .to_string();
-            if endpoint.is_empty() {
+            let endpoint_openai = raw_section
+                .endpoint_openai
+                .map(|e| e.trim().trim_end_matches('/').to_string())
+                .filter(|e| !e.is_empty());
+            let endpoint_anthropic = raw_section
+                .endpoint_anthropic
+                .map(|e| e.trim().trim_end_matches('/').to_string())
+                .filter(|e| !e.is_empty());
+
+            if endpoint_openai.is_none() && endpoint_anthropic.is_none() {
                 return Err(ConfigError::Provider {
                     name,
-                    message: "endpoint must not be empty".to_string(),
+                    message: "at least one of endpoint_openai or endpoint_anthropic must be set"
+                        .to_string(),
                 });
             }
-
-            let protocol =
-                Protocol::parse(&raw_section.protocol).map_err(|err| ConfigError::Provider {
-                    name: name.clone(),
-                    message: err.to_string(),
-                })?;
 
             let api_key = match raw_section.api_key {
                 Some(value) => Some(resolve_secret(&value)?),
@@ -258,8 +245,8 @@ impl Config {
                 name.clone(),
                 ProviderSection {
                     name,
-                    endpoint,
-                    protocol,
+                    endpoint_openai,
+                    endpoint_anthropic,
                     api_key,
                     max_tokens: raw_section.max_tokens,
                     max_output_tokens: raw_section.max_output_tokens,
@@ -299,8 +286,8 @@ impl Config {
 
         Ok(RouteTarget {
             section: section.name.clone(),
-            endpoint: section.endpoint.clone(),
-            protocol: section.protocol,
+            endpoint_openai: section.endpoint_openai.clone(),
+            endpoint_anthropic: section.endpoint_anthropic.clone(),
             api_key: section.api_key.clone(),
             max_tokens: section.max_tokens.or(self.default_max_tokens),
             max_output_tokens: section.max_output_tokens.or(self.default_max_output_tokens),
@@ -323,8 +310,14 @@ impl Config {
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         for section in self.sections.values() {
-            if seen.insert(section.endpoint.clone()) {
-                result.push((section.name.clone(), section.endpoint.clone()));
+            let eps = [
+                section.endpoint_openai.as_deref(),
+                section.endpoint_anthropic.as_deref(),
+            ];
+            for ep in eps.into_iter().flatten() {
+                if seen.insert(ep.to_string()) {
+                    result.push((section.name.clone(), ep.to_string()));
+                }
             }
         }
         result
@@ -486,11 +479,6 @@ pub fn cap_numeric_field(body: &mut serde_json::Value, field: &str, limit: u32) 
     }
 }
 
-/// Cap `max_tokens` in a JSON body (delegates to [`cap_numeric_field`]).
-pub fn cap_max_tokens_json(body: &mut serde_json::Value, limit: u32) {
-    cap_numeric_field(body, "max_tokens", limit);
-}
-
 pub fn resolve_secret(value: &str) -> Result<String, ConfigError> {
     if let Some(var) = value
         .strip_prefix("${")
@@ -562,12 +550,6 @@ mod tests {
     }
 
     #[test]
-    fn protocol_parse_accepts_case_insensitive() {
-        assert_eq!(Protocol::parse("openai").unwrap(), Protocol::OpenAi);
-        assert_eq!(Protocol::parse("ANTHROPIC").unwrap(), Protocol::Anthropic);
-    }
-
-    #[test]
     fn parse_duration_accepts_s_and_m_suffixes() {
         assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
         assert_eq!(parse_duration("1m").unwrap(), Duration::from_secs(60));
@@ -601,8 +583,7 @@ upstream_timeout = "15s"
 max_request_body = "512k"
 
 [local]
-endpoint = "http://127.0.0.1:11434"
-protocol = "OPENAI"
+endpoint_openai = "http://127.0.0.1:11434"
 models = "test-model"
 "#;
         let config = Config::load_from_str(raw).expect("config with limits");
@@ -617,12 +598,41 @@ models = "test-model"
 upstream_timeout = "15x"
 
 [local]
-endpoint = "http://127.0.0.1:11434"
-protocol = "OPENAI"
+endpoint_openai = "http://127.0.0.1:11434"
 models = "test-model"
 "#;
         let err = Config::load_from_str(raw).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidDuration { .. }));
+    }
+
+    #[test]
+    fn load_config_rejects_no_endpoint() {
+        let raw = r#"
+[local]
+models = "test-model"
+"#;
+        let err = Config::load_from_str(raw).unwrap_err();
+        assert!(matches!(err, ConfigError::Provider { .. }));
+    }
+
+    #[test]
+    fn load_config_allows_both_endpoints() {
+        let raw = r#"
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+endpoint_anthropic = "https://api.example.com/anthropic"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("both endpoints");
+        let route = config.resolve_route("test-model").expect("route");
+        assert_eq!(
+            route.endpoint_openai.as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(
+            route.endpoint_anthropic.as_deref(),
+            Some("https://api.example.com/anthropic")
+        );
     }
 
     #[test]
@@ -635,27 +645,32 @@ models = "test-model"
         assert_eq!(config.listen_addr, "0.0.0.0:3383".parse().unwrap());
 
         let ollama = config.resolve_route("gemma4:31b").expect("ollama route");
-        assert_eq!(ollama.endpoint, "http://127.0.0.1:11434");
-        assert_eq!(ollama.protocol, Protocol::OpenAi);
+        assert_eq!(
+            ollama.endpoint_openai.as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+        assert!(ollama.endpoint_anthropic.is_none());
         assert!(ollama.api_key.is_none());
 
         let deepseek = config
             .resolve_route("deepseek-v4-pro[1m]")
             .expect("deepseek route");
-        assert_eq!(deepseek.endpoint, "https://api.deepseek.com/anthropic");
+        assert!(deepseek.endpoint_openai.is_none());
+        assert_eq!(
+            deepseek.endpoint_anthropic.as_deref(),
+            Some("https://api.deepseek.com/anthropic")
+        );
         assert_eq!(deepseek.api_key.as_deref(), Some("sk-deepseek-test"));
 
         let default = config
             .resolve_route("unknown-model")
             .expect("default route");
-        assert_eq!(default.endpoint, "https://api.modelarts-maas.com/openai/v1");
+        assert_eq!(
+            default.endpoint_openai.as_deref(),
+            Some("https://api.modelarts-maas.com/openai/v1")
+        );
+        assert!(default.endpoint_anthropic.is_none());
         assert_eq!(default.api_key.as_deref(), Some("sk-maas-test"));
-
-        // Same model resolves regardless of ingress; conversion happens in handlers.
-        let ollama_again = config
-            .resolve_route("gemma4:31b")
-            .expect("ollama route again");
-        assert_eq!(ollama_again.protocol, Protocol::OpenAi);
 
         env::remove_var("DEEPSEEK_API_KEY");
         env::remove_var("MAAS_API_KEY");
@@ -671,25 +686,21 @@ max_tokens = 4096
 max_completion_tokens = 8192
 
 [local]
-endpoint = "http://127.0.0.1:11434"
-protocol = "OPENAI"
+endpoint_openai = "http://127.0.0.1:11434"
 models = "local-model"
 
 [remote]
-endpoint = "https://api.example.com/anthropic"
-protocol = "ANTHROPIC"
+endpoint_anthropic = "https://api.example.com/anthropic"
 models = "remote-model"
 max_tokens = 1024
 "#;
         let config = Config::load_from_str(raw).expect("config with defaults");
 
-        // local: no override, uses global defaults
         let local = config.resolve_route("local-model").expect("local");
         assert_eq!(local.max_tokens, Some(4096));
         assert_eq!(local.max_completion_tokens, Some(8192));
         assert_eq!(local.max_output_tokens, None);
 
-        // remote: overrides max_tokens, inherits max_completion_tokens
         let remote = config.resolve_route("remote-model").expect("remote");
         assert_eq!(remote.max_tokens, Some(1024));
         assert_eq!(remote.max_completion_tokens, Some(8192));

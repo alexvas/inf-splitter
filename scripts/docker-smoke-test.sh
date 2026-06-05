@@ -19,8 +19,7 @@ cat > "$TMPDIR/config/inf-splitter.toml" <<'EOF'
 port = 3383
 
 [local]
-endpoint = "http://127.0.0.1:9"
-protocol = "OPENAI"
+endpoint_openai = "http://127.0.0.1:9"
 models = "smoke-model"
 EOF
 

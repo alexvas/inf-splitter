@@ -47,9 +47,10 @@ impl AnthropicHandler {
         body: Bytes,
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        anthropic_endpoint: &str,
     ) -> Result<Response, AppError> {
         let body = apply_token_caps_bytes(&body, route)?;
-        let builder = self.build_upstream_request(request_headers, route)?;
+        let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let upstream = builder.body(body).send().await?;
         relay_upstream_response(upstream).await
     }
@@ -60,13 +61,14 @@ impl AnthropicHandler {
         body: &[u8],
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        anthropic_endpoint: &str,
     ) -> Result<Response, AppError> {
         let mut openai_req: ChatCompletionRequest = serde_json::from_slice(body)?;
         cap_openai_max_tokens(&mut openai_req, route);
 
         if openai_req.stream.unwrap_or(false) {
             return self
-                .handle_from_openai_stream(&openai_req, request_headers, route)
+                .handle_from_openai_stream(&openai_req, request_headers, route, anthropic_endpoint)
                 .await;
         }
 
@@ -74,7 +76,7 @@ impl AnthropicHandler {
         let anthropic_req = translate_openai_to_anthropic_request(&openai_req, &mut warnings)
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
 
-        let builder = self.build_upstream_request(request_headers, route)?;
+        let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let upstream = builder.json(&anthropic_req).send().await?;
 
         if !upstream.status().is_success() {
@@ -97,13 +99,14 @@ impl AnthropicHandler {
         openai_req: &ChatCompletionRequest,
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        anthropic_endpoint: &str,
     ) -> Result<Response, AppError> {
         let mut warnings = TranslationWarnings::default();
         let mut anthropic_req = translate_openai_to_anthropic_request(openai_req, &mut warnings)
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
         anthropic_req.stream = Some(true);
 
-        let builder = self.build_upstream_request(request_headers, route)?;
+        let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let upstream = builder.json(&anthropic_req).send().await?;
 
         if !upstream.status().is_success() {
@@ -199,8 +202,9 @@ impl AnthropicHandler {
         &self,
         request_headers: &HeaderMap,
         route: &RouteTarget,
+        anthropic_endpoint: &str,
     ) -> Result<RequestBuilder, AppError> {
-        let url = format!("{}/v1/messages", route.endpoint);
+        let url = format!("{anthropic_endpoint}/v1/messages");
         Ok(forward_request_headers(
             self.client
                 .post(url)

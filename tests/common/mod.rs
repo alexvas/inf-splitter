@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use inf_splitter::config::Config;
@@ -64,6 +66,21 @@ pub async fn spawn_router(config_toml: &str) -> SocketAddr {
     let app = inf_splitter::build_app(config)
         .await
         .expect("build proxy app");
+    bind_and_serve(app).await.0
+}
+
+/// Spawn an upstream that returns a fixed HTTP status and JSON body.
+pub async fn spawn_error_upstream(
+    path: &'static str,
+    status: StatusCode,
+    body: serde_json::Value,
+) -> SocketAddr {
+    let app = Router::new().route(
+        path,
+        post(move |Json(_): Json<serde_json::Value>| async move {
+            (status, Json(body)).into_response()
+        }),
+    );
     bind_and_serve(app).await.0
 }
 

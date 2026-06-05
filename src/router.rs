@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Mutex;
 
 use crate::config::{Config, Protocol};
 use crate::error::AppError;
@@ -19,6 +22,14 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub openai: OpenAiHandler,
     pub anthropic: AnthropicHandler,
+    pub health_client: reqwest::Client,
+    pub health_cache: Arc<Mutex<Option<(Instant, HealthResponse)>>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct HealthResponse {
+    pub status: String,
+    pub upstreams: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,8 +63,75 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    const CACHE_TTL: Duration = Duration::from_secs(5);
+    const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    {
+        let cache = state.health_cache.lock().await;
+        if let Some((cached_at, ref cached_response)) = *cache {
+            if cached_at.elapsed() < CACHE_TTL {
+                let status = if cached_response.status == "ok" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                return (status, Json(cached_response.clone())).into_response();
+            }
+        }
+    }
+
+    let endpoints = state.config.upstream_endpoints();
+    let mut upstreams = HashMap::new();
+    let mut all_ok = true;
+
+    let checks: Vec<_> = endpoints
+        .iter()
+        .map(|(name, endpoint)| {
+            let client = state.health_client.clone();
+            let endpoint = endpoint.clone();
+            let name = name.clone();
+            async move {
+                let url = format!("{endpoint}/");
+                let result = tokio::time::timeout(CHECK_TIMEOUT, client.head(&url).send()).await;
+                match result {
+                    Ok(Ok(_)) => (name, "ok".to_string()),
+                    Ok(Err(_)) => (name, "unreachable".to_string()),
+                    Err(_) => (name, "timeout".to_string()),
+                }
+            }
+        })
+        .collect();
+
+    for check in checks {
+        let (name, status) = check.await;
+        if status != "ok" {
+            all_ok = false;
+        }
+        upstreams.insert(name, status);
+    }
+
+    let response = HealthResponse {
+        status: if all_ok {
+            "ok".to_string()
+        } else {
+            "degraded".to_string()
+        },
+        upstreams,
+    };
+
+    {
+        let mut cache = state.health_cache.lock().await;
+        *cache = Some((Instant::now(), response.clone()));
+    }
+
+    let status_code = if all_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status_code, Json(response)).into_response()
 }
 
 pub fn build_models_response(config: &Config) -> ModelsListResponse {

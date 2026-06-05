@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use anyllm_client::{Auth, Client, ClientConfig, ClientError, HttpClientConfig};
-use anyllm_translate::anthropic::{MessageCreateRequest, StreamEvent};
+use anyllm_translate::anthropic::MessageCreateRequest;
 use anyllm_translate::mapping::streaming_map::StreamingTranslator;
-use anyllm_translate::openai::ChatCompletionChunk;
 use anyllm_translate::{translate_request, translate_response, TranslationConfig};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -9,24 +11,27 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
-use crate::auth::apply_upstream_auth;
-use crate::config::{Config, RouteTarget};
+use crate::auth::forward_request_headers;
+use crate::config::{cap_numeric_field, Config, RouteTarget};
 use crate::error::AppError;
+use crate::sse;
 
 #[derive(Clone)]
 pub struct OpenAiHandler {
     http: HttpClient,
     omit_stream_options: bool,
+    hint_statuses: Arc<HashSet<StatusCode>>,
 }
 
 impl OpenAiHandler {
-    pub fn new(config: &Config) -> Result<Self, AppError> {
+    pub fn new(config: &Config, hint_statuses: Arc<HashSet<StatusCode>>) -> Result<Self, AppError> {
         Ok(Self {
             http: HttpClient::builder()
                 .timeout(config.upstream_timeout)
                 .build()
                 .map_err(|err| AppError::Internal(err.to_string()))?,
             omit_stream_options: config.omit_stream_options,
+            hint_statuses,
         })
     }
 
@@ -36,7 +41,9 @@ impl OpenAiHandler {
         request_headers: &HeaderMap,
         route: &RouteTarget,
     ) -> Result<Response, AppError> {
-        let req: MessageCreateRequest = serde_json::from_slice(body)?;
+        let mut req: MessageCreateRequest = serde_json::from_slice(body)?;
+        cap_anthropic_max_tokens(&mut req, route.max_tokens);
+        let req = req;
         let client = self.build_client(route, &req.model, request_headers)?;
 
         if req.stream.unwrap_or(false) {
@@ -56,8 +63,9 @@ impl OpenAiHandler {
         request_headers: &HeaderMap,
         route: &RouteTarget,
     ) -> Result<Response, AppError> {
+        let body = apply_token_caps(body, route)?;
         let backend_url = format!("{}/v1/chat/completions", route.endpoint);
-        let builder = apply_upstream_auth(
+        let builder = forward_request_headers(
             self.http
                 .post(&backend_url)
                 .header(header::CONTENT_TYPE, "application/json"),
@@ -65,7 +73,7 @@ impl OpenAiHandler {
             route.api_key.as_deref(),
         );
 
-        let upstream = builder.body(body.to_vec()).send().await?;
+        let upstream = builder.body(body).send().await?;
         relay_openai_upstream(upstream).await
     }
 
@@ -173,11 +181,11 @@ impl OpenAiHandler {
         client: &Client,
     ) -> Result<Response, AppError> {
         let (stream, _rate_limits) = client.messages_stream(req).await?;
-        sse_response(
+        sse::sse_response(
             request_headers,
             stream.map(|event| {
                 event
-                    .map(|stream_event| format_sse_event(&stream_event))
+                    .map(|stream_event| sse::format_sse_event(&stream_event))
                     .map_err(|err| std::io::Error::other(err.to_string()))
             }),
         )
@@ -196,7 +204,7 @@ impl OpenAiHandler {
         openai_req.stream_options = None;
 
         let backend_url = format!("{}/v1/chat/completions", route.endpoint);
-        let builder = apply_upstream_auth(
+        let builder = forward_request_headers(
             self.http
                 .post(&backend_url)
                 .header(header::CONTENT_TYPE, "application/json"),
@@ -207,9 +215,7 @@ impl OpenAiHandler {
         let upstream = builder.json(&openai_req).send().await?;
 
         if !upstream.status().is_success() {
-            let status = upstream.status();
-            let body = upstream.text().await.unwrap_or_default();
-            return Err(AppError::Upstream(format!("HTTP {status}: {body}")));
+            return relay_upstream_status_error(upstream, &self.hint_statuses).await;
         }
 
         let model = req.model.clone();
@@ -224,9 +230,11 @@ impl OpenAiHandler {
                     if let Some(line_end) = buffer.find('\n') {
                         let line = buffer[..line_end].trim_end_matches('\r').to_string();
                         buffer = buffer[line_end + 1..].to_string();
-                        if let Some(events) = parse_sse_line(&line, &mut translator) {
-                            let payload =
-                                events.iter().map(format_sse_event_str).collect::<String>();
+                        if let Some(events) = sse::parse_sse_line(&line, &mut translator) {
+                            let payload = events
+                                .iter()
+                                .map(sse::format_sse_event_str)
+                                .collect::<String>();
                             return Some((
                                 Ok(bytes::Bytes::from(payload)),
                                 (byte_stream, translator, buffer),
@@ -246,7 +254,7 @@ impl OpenAiHandler {
                             let payload = translator
                                 .finish()
                                 .iter()
-                                .map(format_sse_event_str)
+                                .map(sse::format_sse_event_str)
                                 .collect::<String>();
                             if payload.is_empty() {
                                 return None;
@@ -261,7 +269,7 @@ impl OpenAiHandler {
             },
         );
 
-        sse_response(request_headers, sse_stream)
+        sse::sse_response(request_headers, sse_stream)
     }
 }
 
@@ -269,7 +277,7 @@ async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, 
     let status = upstream.status();
     let headers = upstream.headers().clone();
 
-    if is_openai_event_stream(&headers) {
+    if sse::is_event_stream(&headers) {
         let stream = upstream
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
@@ -301,53 +309,73 @@ async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, 
         .map_err(|err| AppError::Internal(err.to_string()))
 }
 
-fn is_openai_event_stream(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.contains("text/event-stream"))
-        .unwrap_or(false)
-}
-
-fn parse_sse_line(line: &str, translator: &mut StreamingTranslator) -> Option<Vec<StreamEvent>> {
-    let data = line.strip_prefix("data: ")?.trim();
-    if data == "[DONE]" {
-        return Some(translator.finish());
-    }
-    let chunk: ChatCompletionChunk = serde_json::from_str(data).ok()?;
-    Some(translator.process_chunk(&chunk))
-}
-
-fn sse_response<S>(request_headers: &HeaderMap, body: S) -> Result<Response, AppError>
-where
-    S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
-{
-    let accept = request_headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("text/event-stream");
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .header(header::ACCEPT, accept)
-        .body(Body::from_stream(body))
-        .map_err(|err| AppError::Internal(err.to_string()))
-}
-
-fn format_sse_event_str(event: &StreamEvent) -> String {
-    let payload = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
-    format!("event: message\ndata: {payload}\n\n")
-}
-
-fn format_sse_event(event: &StreamEvent) -> bytes::Bytes {
-    bytes::Bytes::from(format_sse_event_str(event))
-}
-
 impl From<anyllm_client::ClientError> for AppError {
     fn from(err: ClientError) -> Self {
         Self::Upstream(err.to_string())
+    }
+}
+
+async fn relay_upstream_status_error(
+    upstream: reqwest::Response,
+    hint_statuses: &HashSet<StatusCode>,
+) -> Result<Response, AppError> {
+    let status = upstream.status();
+    let body = upstream
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
+    let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = append_size_hint(status_code, body, hint_statuses);
+    Response::builder()
+        .status(status_code)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .map_err(|err| AppError::Internal(err.to_string()))
+}
+
+fn append_size_hint(
+    status: StatusCode,
+    body: String,
+    hint_statuses: &HashSet<StatusCode>,
+) -> String {
+    if !hint_statuses.contains(&status) {
+        return body;
+    }
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Some(serde_json::Value::String(msg)) = value.pointer_mut("/error/message") {
+            *msg = format!("{msg}. Try reducing context size or splitting into smaller requests.");
+            return serde_json::to_string(&value).unwrap_or(body);
+        }
+    }
+    format!("{body}. Try reducing context size or splitting into smaller requests.")
+}
+
+fn apply_token_caps(body: &[u8], route: &RouteTarget) -> Result<Vec<u8>, AppError> {
+    let has_caps = route.max_tokens.is_some()
+        || route.max_output_tokens.is_some()
+        || route.max_completion_tokens.is_some();
+    if !has_caps {
+        return Ok(body.to_vec());
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if let Some(limit) = route.max_tokens {
+        cap_numeric_field(&mut value, "max_tokens", limit);
+    }
+    if let Some(limit) = route.max_output_tokens {
+        cap_numeric_field(&mut value, "max_output_tokens", limit);
+    }
+    if let Some(limit) = route.max_completion_tokens {
+        cap_numeric_field(&mut value, "max_completion_tokens", limit);
+    }
+    serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))
+}
+
+fn cap_anthropic_max_tokens(req: &mut MessageCreateRequest, limit: Option<u32>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    if req.max_tokens > limit {
+        req.max_tokens = limit;
     }
 }

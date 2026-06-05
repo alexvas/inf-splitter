@@ -5,6 +5,6 @@ services:
       - "3383:3383"
     volumes:
       # Если certs/ca-bundle.crt существует — он переопределяет системный CA-бандл.
-      # Если файла нет — Docker упадёт. Чтобы запуститься без сертификатов:
+      # Чтобы запуститься без корпоративных сертификатов, создайте пустой файл:
       #   touch certs/ca-bundle.crt
       - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro

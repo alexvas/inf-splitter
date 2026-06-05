@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use anyllm_translate::anthropic::{Content, MessageCreateRequest};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
-use common::{anthropic_upstream_response, openai_upstream_response, spawn_router, spawn_upstream};
+use common::{
+    anthropic_upstream_response, openai_upstream_response, spawn_error_upstream, spawn_router,
+    spawn_upstream,
+};
 
 const CLIENT_PROMPT: &str = "hello-from-client";
 
@@ -139,4 +142,199 @@ models = "remote-anthropic-model"
         openai_response["choices"][0]["message"]["content"], "anthropic-upstream-reply",
         "client must receive OpenAI-shaped response"
     );
+}
+
+#[tokio::test]
+async fn unroutable_model_returns_400() {
+    let config = r#"
+port = 0
+
+[local]
+endpoint = "http://127.0.0.1:1"
+protocol = "OPENAI"
+models = "known-model"
+"#;
+    let proxy_addr = spawn_router(config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "unknown-model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn empty_model_returns_400() {
+    let config = r#"
+port = 0
+
+[local]
+endpoint = "http://127.0.0.1:1"
+protocol = "OPENAI"
+models = "known-model"
+"#;
+    let proxy_addr = spawn_router(config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn invalid_json_body_returns_400() {
+    let config = r#"
+port = 0
+
+[local]
+endpoint = "http://127.0.0.1:1"
+protocol = "OPENAI"
+models = "known-model"
+"#;
+    let proxy_addr = spawn_router(config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .header("content-type", "application/json")
+        .body("not json")
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn upstream_error_relays_status() {
+    let upstream_addr = spawn_error_upstream(
+        "/v1/chat/completions",
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        serde_json::json!({"error": "request too large"}),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[local]
+endpoint = "http://{upstream_addr}"
+protocol = "OPENAI"
+models = "test-model"
+"#
+    );
+
+    let proxy_addr = spawn_router(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["error"], "request too large");
+}
+
+#[tokio::test]
+async fn openai_passthrough_no_conversion() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let openai_addr = spawn_upstream(
+        "/v1/chat/completions",
+        captured.clone(),
+        openai_upstream_response("passthrough-model", "direct-openai-response"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[local]
+endpoint = "http://{openai_addr}"
+protocol = "OPENAI"
+models = "passthrough-model"
+"#
+    );
+
+    let proxy_addr = spawn_router(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "passthrough-model",
+            "messages": [{"role": "user", "content": "test"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["object"], "chat.completion");
+}
+
+#[tokio::test]
+async fn anthropic_passthrough_no_conversion() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let anthropic_addr = spawn_upstream(
+        "/v1/messages",
+        captured.clone(),
+        anthropic_upstream_response("passthrough-model", "direct-anthropic-response"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint = "http://{anthropic_addr}"
+protocol = "ANTHROPIC"
+models = "passthrough-model"
+"#
+    );
+
+    let proxy_addr = spawn_router(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "passthrough-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "test"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["type"], "message");
 }

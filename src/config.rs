@@ -3,8 +3,10 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -39,6 +41,9 @@ pub struct RouteTarget {
     pub endpoint: String,
     pub protocol: Protocol,
     pub api_key: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     pub model_names: HashSet<String>,
 }
 
@@ -48,6 +53,9 @@ struct ProviderSection {
     endpoint: String,
     protocol: Protocol,
     api_key: Option<String>,
+    max_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+    max_completion_tokens: Option<u32>,
     model_names: HashSet<String>,
 }
 
@@ -57,9 +65,17 @@ pub struct Config {
     pub omit_stream_options: bool,
     pub upstream_timeout: Duration,
     pub max_request_body: usize,
+    pub body_too_large_hint_statuses: Arc<HashSet<StatusCode>>,
+    default_max_tokens: Option<u32>,
+    default_max_output_tokens: Option<u32>,
+    default_max_completion_tokens: Option<u32>,
     sections: HashMap<String, ProviderSection>,
     model_routes: HashMap<String, String>,
     default_section: Option<String>,
+}
+
+fn default_body_too_large_hint_statuses() -> HashSet<StatusCode> {
+    HashSet::from([StatusCode::PAYLOAD_TOO_LARGE])
 }
 
 const DEFAULT_UPSTREAM_TIMEOUT: &str = "5m";
@@ -70,8 +86,17 @@ struct FileConfig {
     port: Option<u16>,
     upstream_timeout: Option<String>,
     max_request_body: Option<String>,
+    defaults: Option<DefaultConfig>,
+    body_too_large_hint_statuses: Option<Vec<u16>>,
     #[serde(flatten)]
     providers: HashMap<String, ProviderConfigRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultConfig {
+    max_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+    max_completion_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +105,9 @@ struct ProviderConfigRaw {
     protocol: String,
     models: ModelsField,
     api_key: Option<String>,
+    max_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+    max_completion_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +190,20 @@ impl Config {
                 .unwrap_or(DEFAULT_MAX_REQUEST_BODY),
         )?;
 
+        let defaults = file.defaults.unwrap_or(DefaultConfig {
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+        });
+
+        let body_too_large_hint_statuses = Arc::new(match file.body_too_large_hint_statuses {
+            Some(codes) if !codes.is_empty() => codes
+                .into_iter()
+                .map(|c| StatusCode::from_u16(c).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE))
+                .collect(),
+            _ => default_body_too_large_hint_statuses(),
+        });
+
         let mut sections = HashMap::new();
         let mut model_routes = HashMap::new();
         let mut default_section: Option<String> = None;
@@ -219,6 +261,9 @@ impl Config {
                     endpoint,
                     protocol,
                     api_key,
+                    max_tokens: raw_section.max_tokens,
+                    max_output_tokens: raw_section.max_output_tokens,
+                    max_completion_tokens: raw_section.max_completion_tokens,
                     model_names,
                 },
             );
@@ -229,6 +274,10 @@ impl Config {
             omit_stream_options,
             upstream_timeout,
             max_request_body,
+            body_too_large_hint_statuses,
+            default_max_tokens: defaults.max_tokens,
+            default_max_output_tokens: defaults.max_output_tokens,
+            default_max_completion_tokens: defaults.max_completion_tokens,
             sections,
             model_routes,
             default_section,
@@ -253,6 +302,11 @@ impl Config {
             endpoint: section.endpoint.clone(),
             protocol: section.protocol,
             api_key: section.api_key.clone(),
+            max_tokens: section.max_tokens.or(self.default_max_tokens),
+            max_output_tokens: section.max_output_tokens.or(self.default_max_output_tokens),
+            max_completion_tokens: section
+                .max_completion_tokens
+                .or(self.default_max_completion_tokens),
             model_names: section.model_names.clone(),
         })
     }
@@ -261,8 +315,19 @@ impl Config {
     pub fn sorted_model_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.model_routes.keys().cloned().collect();
         ids.sort();
-        ids.dedup();
         ids
+    }
+
+    /// Unique upstream endpoints for health checks.
+    pub fn upstream_endpoints(&self) -> Vec<(String, String)> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for section in self.sections.values() {
+            if seen.insert(section.endpoint.clone()) {
+                result.push((section.name.clone(), section.endpoint.clone()));
+            }
+        }
+        result
     }
 
     #[cfg(test)]
@@ -273,6 +338,10 @@ impl Config {
             upstream_timeout: parse_duration(DEFAULT_UPSTREAM_TIMEOUT).expect("default timeout"),
             max_request_body: parse_byte_size(DEFAULT_MAX_REQUEST_BODY)
                 .expect("default body limit"),
+            body_too_large_hint_statuses: Arc::new(default_body_too_large_hint_statuses()),
+            default_max_tokens: None,
+            default_max_output_tokens: None,
+            default_max_completion_tokens: None,
             sections: HashMap::new(),
             model_routes,
             default_section: None,
@@ -400,6 +469,26 @@ fn resolve_listen_addr(port: Option<u16>) -> Result<SocketAddr, ConfigError> {
     format!("0.0.0.0:{port}")
         .parse()
         .map_err(|err| ConfigError::Port(format!("0.0.0.0:{port}: {err}")))
+}
+
+/// Cap a numeric field in a JSON body: if missing, set to limit; if exceeding,
+/// clamp down.
+pub fn cap_numeric_field(body: &mut serde_json::Value, field: &str, limit: u32) {
+    let limit_val = serde_json::json!(limit);
+    match body.get(field).and_then(|v| v.as_u64()) {
+        Some(existing) if existing > limit as u64 => {
+            body[field] = limit_val;
+        }
+        None => {
+            body[field] = limit_val;
+        }
+        _ => {}
+    }
+}
+
+/// Cap `max_tokens` in a JSON body (delegates to [`cap_numeric_field`]).
+pub fn cap_max_tokens_json(body: &mut serde_json::Value, limit: u32) {
+    cap_numeric_field(body, "max_tokens", limit);
 }
 
 pub fn resolve_secret(value: &str) -> Result<String, ConfigError> {
@@ -570,5 +659,39 @@ models = "test-model"
 
         env::remove_var("DEEPSEEK_API_KEY");
         env::remove_var("MAAS_API_KEY");
+    }
+
+    #[test]
+    fn global_defaults_merge_with_per_provider_overrides() {
+        let raw = r#"
+port = 3000
+
+[defaults]
+max_tokens = 4096
+max_completion_tokens = 8192
+
+[local]
+endpoint = "http://127.0.0.1:11434"
+protocol = "OPENAI"
+models = "local-model"
+
+[remote]
+endpoint = "https://api.example.com/anthropic"
+protocol = "ANTHROPIC"
+models = "remote-model"
+max_tokens = 1024
+"#;
+        let config = Config::load_from_str(raw).expect("config with defaults");
+
+        // local: no override, uses global defaults
+        let local = config.resolve_route("local-model").expect("local");
+        assert_eq!(local.max_tokens, Some(4096));
+        assert_eq!(local.max_completion_tokens, Some(8192));
+        assert_eq!(local.max_output_tokens, None);
+
+        // remote: overrides max_tokens, inherits max_completion_tokens
+        let remote = config.resolve_route("remote-model").expect("remote");
+        assert_eq!(remote.max_tokens, Some(1024));
+        assert_eq!(remote.max_completion_tokens, Some(8192));
     }
 }

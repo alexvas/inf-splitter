@@ -21,6 +21,10 @@ port = 3383
 upstream_timeout = "5m"
 max_request_body = "2m"
 
+[defaults]
+max_tokens = 4096
+max_completion_tokens = 8192
+
 [ollama]
 endpoint = "http://127.0.0.1:11434"
 protocol = "OPENAI"
@@ -44,6 +48,19 @@ models = "default"
 | `port` | TCP-порт; сервис слушает `0.0.0.0:{port}` (по умолчанию 3000) |
 | `upstream_timeout` | Таймаут исходящих запросов к upstream; суффиксы `s` (секунды) или `m` (минуты), напр. `15s`, `1m` (по умолчанию `5m`) |
 | `max_request_body` | Максимальный размер входящего тела запроса; суффиксы `k` (KiB) или `m` (MiB), напр. `512k`, `2m` (по умолчанию `2m`) |
+| `body_too_large_hint_statuses` | Опциональный список HTTP-статусов (числа), при которых к ошибке добавляется подсказка `Try reducing context size...` (по умолчанию `[413]`, пустой список = подсказка не добавляется) |
+
+### Секция `[defaults]`
+
+Глобальные лимиты токенов для всех провайдеров. Конкретный провайдер может переопределить их своим значением.
+
+| Поле | Описание |
+|------|----------|
+| `max_tokens` | Глобальный лимит `max_tokens` (действует для всех upstream, если не переопределён) |
+| `max_output_tokens` | Глобальный лимит `max_output_tokens` (Anthropic/Gemini-совместимые upstream) |
+| `max_completion_tokens` | Глобальный лимит `max_completion_tokens` (OpenAI-совместимые upstream) |
+
+### Секции провайдеров
 
 | Поле секции | Описание |
 |-------------|----------|
@@ -51,8 +68,18 @@ models = "default"
 | `protocol` | `OPENAI` или `ANTHROPIC` |
 | `models` | Одна модель, список моделей или `"default"` (fallback для несматчившихся) |
 | `api_key` | Опционально; `${VAR}` резолвится из env или файла `secrets/VAR` |
+| `max_tokens` | Опционально; лимит на `max_tokens` в исходящем запросе. Если клиент не задал или превысил — прокси подставляет лимит |
+| `max_output_tokens` | Опционально; лимит на `max_output_tokens` (Anthropic/Gemini-совместимые upstream) |
+| `max_completion_tokens` | Опционально; лимит на `max_completion_tokens` (OpenAI-совместимые upstream) |
 
 Путь к конфигу можно переопределить через `INF_SPLITTER_CONFIG`.
+
+### Переменные окружения
+
+| Переменная | Описание |
+|------------|----------|
+| `INF_SPLITTER_CONFIG` | Путь к TOML-конфигу (по умолчанию `config/inf-splitter.toml`) |
+| `OMIT_STREAM_OPTIONS` | `1`/`true`/`yes` — не отправлять `stream_options` в OpenAI upstream (обход для прокси, не поддерживающих это поле) |
 
 ### Секреты
 
@@ -109,7 +136,7 @@ Ingress endpoint задаёт **формат входящего запроса �
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| `GET` | `/health` | `{"status":"ok"}` |
+| `GET` | `/health` | Readiness probe: `{"status":"ok","upstreams":{...}}` или `{"status":"degraded",...}` (HTTP 503) при недоступных upstream |
 | `GET` | `/v1/models` | Anthropic-совместимый список моделей |
 | `POST` | `/openai/v1/messages` | OpenAI-формат; upstream по `model` из TOML |
 | `POST` | `/anthropic/v1/messages` | Anthropic-формат; upstream по `model` из TOML |
@@ -166,9 +193,10 @@ src/
 ├── main.rs      # точка входа, graceful shutdown
 ├── config.rs    # TOML, маршрутизация по model/default, секреты
 ├── auth.rs      # подстановка api_key / проброс auth-заголовков
-├── router.rs    # маршруты axum, /v1/models
+├── router.rs    # маршруты axum, /v1/models, /health
 ├── local.rs     # OpenAI upstream + конверсия Anthropic↔OpenAI
 ├── remote.rs    # Anthropic upstream + конверсия OpenAI↔Anthropic
+├── sse.rs       # общие утилиты для SSE (парсинг, форматирование, ответы)
 └── error.rs     # ошибки в формате Anthropic API
 ```
 

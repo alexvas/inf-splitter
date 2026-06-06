@@ -50,8 +50,12 @@ impl OpenAiHandler {
         let client = self.build_client(route, openai_endpoint, &req.model, request_headers)?;
 
         if req.stream.unwrap_or(false) {
-            self.handle_stream(&req, request_headers, route, openai_endpoint, &client)
-                .await
+            if self.omit_stream_options {
+                self.handle_stream_manual(&req, request_headers, route, openai_endpoint)
+                    .await
+            } else {
+                self.handle_stream_client(&req, request_headers, &client).await
+            }
         } else if self.omit_stream_options {
             self.handle_sync_manual(&req, request_headers, route, openai_endpoint)
                 .await
@@ -229,23 +233,6 @@ impl OpenAiHandler {
         };
         let response = translate_response(&openai_resp, &req.model);
         Ok((StatusCode::OK, axum::Json(response)).into_response())
-    }
-
-    async fn handle_stream(
-        &self,
-        req: &MessageCreateRequest,
-        request_headers: &HeaderMap,
-        route: &RouteTarget,
-        openai_endpoint: &str,
-        client: &Client,
-    ) -> Result<Response, AppError> {
-        if self.omit_stream_options {
-            self.handle_stream_manual(req, request_headers, route, openai_endpoint)
-                .await
-        } else {
-            self.handle_stream_client(req, request_headers, client)
-                .await
-        }
     }
 
     async fn handle_stream_client(

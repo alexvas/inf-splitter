@@ -22,7 +22,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked -- -D warnings
       - name: cargo test
-        run: cargo test --locked
+        run: |
+          cp config/inf-splitter.toml.example config/inf-splitter.toml
+          cargo test --locked
 
   smoke:
     needs: rust

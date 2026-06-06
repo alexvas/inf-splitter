@@ -193,8 +193,8 @@ src/
 ├── config.rs    # TOML, маршрутизация по model/default, секреты
 ├── auth.rs      # подстановка api_key / проброс auth-заголовков
 ├── router.rs    # маршруты axum, /v1/models (openai+anthropic), /health
-├── local.rs     # OpenAI upstream + конверсия Anthropic↔OpenAI
-├── remote.rs    # Anthropic upstream + конверсия OpenAI↔Anthropic
+├── openai.rs    # OpenAI upstream + конверсия Anthropic↔OpenAI
+├── anthropic.rs # Anthropic upstream + конверсия OpenAI↔Anthropic
 ├── sse.rs       # общие утилиты для SSE (парсинг, форматирование, ответы)
 └── error.rs     # ошибки в формате Anthropic API
 ```

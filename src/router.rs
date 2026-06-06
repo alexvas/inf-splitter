@@ -14,8 +14,8 @@ use tokio::sync::Mutex;
 
 use crate::config::{Config, Protocol};
 use crate::error::AppError;
-use crate::local::OpenAiHandler;
-use crate::remote::AnthropicHandler;
+use crate::anthropic::AnthropicHandler;
+use crate::openai::OpenAiHandler;
 
 #[derive(Clone)]
 pub struct AppState {

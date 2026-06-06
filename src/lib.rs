@@ -1,8 +1,8 @@
 pub mod auth;
 pub mod config;
 pub mod error;
-pub mod local;
-pub mod remote;
+pub mod anthropic;
+pub mod openai;
 pub mod router;
 pub mod sse;
 
@@ -20,8 +20,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::config::{cap_numeric_field, Config, RouteTarget};
 use crate::error::AppError;
-use crate::local::OpenAiHandler;
-use crate::remote::AnthropicHandler;
+use crate::openai::OpenAiHandler;
+use crate::anthropic::AnthropicHandler;
 use crate::router::{router, AppState};
 
 const BODY_TOO_LARGE_HINT: &str = "Try reducing context size or splitting into smaller requests.";

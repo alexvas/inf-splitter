@@ -53,6 +53,9 @@ jobs:
           path: target/release/
       - run: chmod +x target/release/inf-splitter
       - name: Build image from pre-built binary
-        run: docker build -f Dockerfile.ci -t inf-splitter:smoke-test .
+        run: |
+          cp target/release/inf-splitter ./inf-splitter.bin
+          docker build -f Dockerfile.ci -t inf-splitter:smoke-test .
+          rm -f ./inf-splitter.bin
       - name: Smoke test
         run: SKIP_BUILD=1 ./scripts/docker-smoke-test.sh

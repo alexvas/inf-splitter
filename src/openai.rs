@@ -43,7 +43,10 @@ impl OpenAiHandler {
         openai_endpoint: &str,
     ) -> Result<Response, AppError> {
         let body = strip_adaptive_thinking(body);
-        let mut req: MessageCreateRequest = serde_json::from_slice(&body)?;
+        let mut req: MessageCreateRequest = serde_json::from_slice(&body).map_err(|err| {
+            crate::dump_request_error(400, &format!("invalid Anthropic body: {err}"), &body);
+            AppError::BadRequest(err.to_string())
+        })?;
         cap_anthropic_max_tokens(&mut req, route.max_tokens);
         let req = req;
 

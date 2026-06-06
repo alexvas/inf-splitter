@@ -305,6 +305,26 @@ pub(crate) fn dump_upstream_error(ctx: &UpstreamErrorCtx) {
     eprintln!("{}", serde_json::to_string(&entry).unwrap_or_default());
 }
 
+/// Dump a request-level (non-upstream) error to stderr.
+///
+/// Captures model, request size, and message detail from the request body,
+/// mirroring the shape of `dump_upstream_error`.
+pub(crate) fn dump_request_error(status: u16, error_message: &str, body: &[u8]) {
+    let model = peek_model_from_json(body);
+    let messages_detail = messages_detail_from_bytes(body);
+    let mut entry = serde_json::json!({
+        "event": "request_error",
+        "status": status,
+        "error_message": error_message,
+        "model": model,
+        "request_size_bytes": body.len(),
+    });
+    if let Some(ref detail) = messages_detail {
+        entry["messages_detail"] = detail.clone();
+    }
+    eprintln!("{}", serde_json::to_string(&entry).unwrap_or_default());
+}
+
 fn chrono_now() -> String {
     std::env::var("DUMP_ON_ERROR_TS")
         .ok()

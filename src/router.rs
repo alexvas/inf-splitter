@@ -182,17 +182,20 @@ async fn dispatch_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let peek: MessagePeek = serde_json::from_slice(&body)
-        .map_err(|err| AppError::BadRequest(format!("invalid JSON body: {err}")))?;
+    let peek: MessagePeek = serde_json::from_slice(&body).map_err(|err| {
+        crate::dump_request_error(400, &format!("invalid JSON body: {err}"), &body);
+        AppError::BadRequest(format!("invalid JSON body: {err}"))
+    })?;
 
     if peek.model.trim().is_empty() {
+        crate::dump_request_error(400, "model must not be empty", &body);
         return Err(AppError::BadRequest("model must not be empty".to_string()));
     }
 
-    let route = state
-        .config
-        .resolve_route(&peek.model)
-        .map_err(AppError::from)?;
+    let route = state.config.resolve_route(&peek.model).map_err(|err| {
+        crate::dump_request_error(400, &err.to_string(), &body);
+        AppError::from(err)
+    })?;
 
     tracing::debug!(
         model = %peek.model,

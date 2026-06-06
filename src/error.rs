@@ -49,6 +49,7 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
+        tracing::error!(status = status.as_u16(), error = %self, "request error");
         let body = AnthropicErrorBody {
             r#type: "error",
             error: AnthropicErrorDetail {

@@ -4,6 +4,8 @@ Mandatory checks before opening or merging a PR. These mirror [`.github/workflow
 
 ## Required checks
 
+**After any Rust code change, run `cargo fmt` before committing.** Then verify:
+
 Run from the repository root:
 
 ```bash

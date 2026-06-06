@@ -1,7 +1,7 @@
+pub mod anthropic;
 pub mod auth;
 pub mod config;
 pub mod error;
-pub mod anthropic;
 pub mod openai;
 pub mod router;
 pub mod sse;
@@ -18,10 +18,10 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tower_http::limit::RequestBodyLimitLayer;
 
+use crate::anthropic::AnthropicHandler;
 use crate::config::{cap_numeric_field, Config, RouteTarget};
 use crate::error::AppError;
 use crate::openai::OpenAiHandler;
-use crate::anthropic::AnthropicHandler;
 use crate::router::{router, AppState};
 
 const BODY_TOO_LARGE_HINT: &str = "Try reducing context size or splitting into smaller requests.";

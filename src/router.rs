@@ -12,9 +12,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use crate::anthropic::AnthropicHandler;
 use crate::config::{Config, Protocol};
 use crate::error::AppError;
-use crate::anthropic::AnthropicHandler;
 use crate::openai::OpenAiHandler;
 
 #[derive(Clone)]

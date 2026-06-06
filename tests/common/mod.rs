@@ -61,7 +61,6 @@ pub async fn spawn_upstream(
 pub async fn spawn_router(config_toml: &str) -> SocketAddr {
     let mut config = Config::load_from_str(config_toml).expect("test config");
     config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");
-    config.omit_stream_options = true;
 
     let app = inf_splitter::build_app(config)
         .await
@@ -73,7 +72,6 @@ pub async fn spawn_router(config_toml: &str) -> SocketAddr {
 pub async fn spawn_router_with_dump(config_toml: &str) -> SocketAddr {
     let mut config = Config::load_from_str(config_toml).expect("test config");
     config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");
-    config.omit_stream_options = true;
     config.dump_on_error = true;
 
     let app = inf_splitter::build_app(config)

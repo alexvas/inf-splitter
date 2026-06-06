@@ -7,9 +7,8 @@ description = "HTTP router for inference requests to OpenAI- and Anthropic-compa
 readme = "README.md"
 
 [dependencies]
-anyllm_client = "0.9"
-openssl = { version = "0.10", features = ["vendored"] }
 anyllm_translate = "0.9"
+openssl = { version = "0.10", features = ["vendored"] }
 axum = "0.8"
 bytes = "1"
 futures = "0.3"

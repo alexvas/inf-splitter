@@ -52,7 +52,6 @@ struct ProviderSection {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen_addr: SocketAddr,
-    pub omit_stream_options: bool,
     pub upstream_timeout: Duration,
     pub max_request_body: usize,
     pub body_too_large_hint_statuses: Arc<HashSet<StatusCode>>,
@@ -167,7 +166,6 @@ impl Config {
         }
 
         let listen_addr = resolve_listen_addr(file.port)?;
-        let omit_stream_options = env_truthy("OMIT_STREAM_OPTIONS");
         let dump_on_error = env_truthy("DUMP_ON_ERROR");
         let upstream_timeout = parse_duration_field(
             file.upstream_timeout
@@ -260,7 +258,6 @@ impl Config {
 
         Ok(Self {
             listen_addr,
-            omit_stream_options,
             dump_on_error,
             upstream_timeout,
             max_request_body,
@@ -333,7 +330,6 @@ impl Config {
     pub fn from_model_routes(model_routes: HashMap<String, String>) -> Self {
         Self {
             listen_addr: "0.0.0.0:3000".parse().expect("test listen addr"),
-            omit_stream_options: true,
             dump_on_error: false,
             upstream_timeout: parse_duration(DEFAULT_UPSTREAM_TIMEOUT).expect("default timeout"),
             max_request_body: parse_byte_size(DEFAULT_MAX_REQUEST_BODY)

@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyllm_client::{Auth, Client, ClientConfig, ClientError, HttpClientConfig};
 use anyllm_translate::anthropic::MessageCreateRequest;
 use anyllm_translate::mapping::streaming_map::StreamingTranslator;
+use anyllm_translate::openai::ChatCompletionResponse;
 use anyllm_translate::{translate_request, translate_response, TranslationConfig};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -19,7 +19,6 @@ use crate::sse;
 #[derive(Clone)]
 pub struct OpenAiHandler {
     http: HttpClient,
-    omit_stream_options: bool,
     dump_on_error: bool,
     hint_statuses: Arc<HashSet<StatusCode>>,
 }
@@ -31,7 +30,6 @@ impl OpenAiHandler {
                 .timeout(config.upstream_timeout)
                 .build()
                 .map_err(|err| AppError::Internal(err.to_string()))?,
-            omit_stream_options: config.omit_stream_options,
             dump_on_error: config.dump_on_error,
             hint_statuses,
         })
@@ -47,20 +45,13 @@ impl OpenAiHandler {
         let mut req: MessageCreateRequest = serde_json::from_slice(body)?;
         cap_anthropic_max_tokens(&mut req, route.max_tokens);
         let req = req;
-        let client = self.build_client(route, openai_endpoint, &req.model, request_headers)?;
 
         if req.stream.unwrap_or(false) {
-            if self.omit_stream_options {
-                self.handle_stream_manual(&req, request_headers, route, openai_endpoint)
-                    .await
-            } else {
-                self.handle_stream_client(&req, request_headers, &client).await
-            }
-        } else if self.omit_stream_options {
-            self.handle_sync_manual(&req, request_headers, route, openai_endpoint)
+            self.handle_stream_manual(&req, request_headers, route, openai_endpoint)
                 .await
         } else {
-            self.handle_sync_client(&req, &client).await
+            self.handle_sync_manual(&req, request_headers, route, openai_endpoint)
+                .await
         }
     }
 
@@ -113,90 +104,12 @@ impl OpenAiHandler {
         relay_openai_upstream(upstream).await
     }
 
-    fn build_client(
-        &self,
-        route: &RouteTarget,
-        openai_endpoint: &str,
-        model: &str,
-        request_headers: &HeaderMap,
-    ) -> Result<Client, AppError> {
-        let backend_url = format!("{openai_endpoint}/v1/chat/completions");
-        let mut translation = TranslationConfig::builder();
-        for mapped in route.model_names.iter().chain([model.to_string()].iter()) {
-            translation = translation.model_map(mapped, mapped);
-        }
-
-        // SSRF protection is disabled because upstream endpoints are
-        // statically configured by the operator, not user-controlled.
-        let http = HttpClientConfig {
-            ssrf_protection: false,
-            ..Default::default()
-        };
-
-        let client_config = ClientConfig::builder()
-            .backend_url(backend_url)
-            .auth(Self::resolve_bearer_auth(route, request_headers))
-            .http(http)
-            .translation(translation.build())
-            .build();
-
-        Ok(Client::new(client_config))
-    }
-
-    fn resolve_bearer_auth(route: &RouteTarget, request_headers: &HeaderMap) -> Auth {
-        if let Some(key) = &route.api_key {
-            return Auth::Bearer(key.clone());
-        }
-        if let Some(key) = request_headers
-            .get("x-api-key")
-            .and_then(|value| value.to_str().ok())
-        {
-            return Auth::Bearer(key.to_string());
-        }
-        if let Some(value) = request_headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-        {
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                return Auth::Bearer(token.to_string());
-            }
-        }
-        Auth::Bearer(String::new())
-    }
-
     fn translation_for(&self, route: &RouteTarget, model: &str) -> TranslationConfig {
         let mut builder = TranslationConfig::builder();
         for mapped in route.model_names.iter().chain([model.to_string()].iter()) {
             builder = builder.model_map(mapped, mapped);
         }
         builder.build()
-    }
-
-    async fn handle_sync_client(
-        &self,
-        req: &MessageCreateRequest,
-        client: &Client,
-    ) -> Result<Response, AppError> {
-        let response = match client.messages(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                if self.dump_on_error {
-                    crate::dump_upstream_error(&crate::UpstreamErrorCtx {
-                        status: 0,
-                        error_message: e.to_string(),
-                        model: req.model.clone(),
-                        request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
-                        input_messages: Some(req.messages.len()),
-                        max_tokens: Some(req.max_tokens),
-                        chunks_received: None,
-                        bytes_received: None,
-                        messages_detail: Some(crate::anthropic_messages_detail(req)),
-                    });
-                }
-                return Err(AppError::from(e));
-            }
-        };
-        Ok((StatusCode::OK, axum::Json(response)).into_response())
     }
 
     async fn handle_sync_manual(
@@ -211,63 +124,48 @@ impl OpenAiHandler {
             .map_err(|err| AppError::Upstream(err.to_string()))?;
         openai_req.stream_options = None;
 
-        let client = self.build_client(route, openai_endpoint, &req.model, request_headers)?;
-        let (openai_resp, _, _) = match client.chat_completion(&openai_req).await {
-            Ok(r) => r,
-            Err(e) => {
-                if self.dump_on_error {
-                    crate::dump_upstream_error(&crate::UpstreamErrorCtx {
-                        status: 0,
-                        error_message: e.to_string(),
-                        model: req.model.clone(),
-                        request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
-                        input_messages: Some(req.messages.len()),
-                        max_tokens: Some(req.max_tokens),
-                        chunks_received: None,
-                        bytes_received: None,
-                        messages_detail: Some(crate::anthropic_messages_detail(req)),
-                    });
-                }
-                return Err(AppError::from(e));
+        let backend_url = format!("{openai_endpoint}/v1/chat/completions");
+        let builder = forward_request_headers(
+            self.http
+                .post(&backend_url)
+                .header(header::CONTENT_TYPE, "application/json"),
+            request_headers,
+            route.api_key.as_deref(),
+        );
+
+        let upstream = builder.json(&openai_req).send().await?;
+
+        if !upstream.status().is_success() {
+            let status = upstream.status();
+            let error_body = upstream
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
+            if self.dump_on_error {
+                crate::dump_upstream_error(&crate::UpstreamErrorCtx {
+                    status: status.as_u16(),
+                    error_message: error_body.clone(),
+                    model: req.model.clone(),
+                    request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
+                    input_messages: Some(req.messages.len()),
+                    max_tokens: Some(req.max_tokens),
+                    chunks_received: None,
+                    bytes_received: None,
+                    messages_detail: Some(crate::anthropic_messages_detail(req)),
+                });
             }
-        };
+            let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = crate::append_size_hint(sc, error_body, &self.hint_statuses);
+            return Response::builder()
+                .status(sc)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .map_err(|err| AppError::Internal(err.to_string()));
+        }
+
+        let openai_resp: ChatCompletionResponse = upstream.json().await?;
         let response = translate_response(&openai_resp, &req.model);
         Ok((StatusCode::OK, axum::Json(response)).into_response())
-    }
-
-    async fn handle_stream_client(
-        &self,
-        req: &MessageCreateRequest,
-        request_headers: &HeaderMap,
-        client: &Client,
-    ) -> Result<Response, AppError> {
-        let (stream, _rate_limits) = match client.messages_stream(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                if self.dump_on_error {
-                    crate::dump_upstream_error(&crate::UpstreamErrorCtx {
-                        status: 0,
-                        error_message: e.to_string(),
-                        model: req.model.clone(),
-                        request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
-                        input_messages: Some(req.messages.len()),
-                        max_tokens: Some(req.max_tokens),
-                        chunks_received: None,
-                        bytes_received: None,
-                        messages_detail: Some(crate::anthropic_messages_detail(req)),
-                    });
-                }
-                return Err(AppError::from(e));
-            }
-        };
-        sse::sse_response(
-            request_headers,
-            stream.map(|event| {
-                event
-                    .map(|stream_event| sse::format_sse_event(&stream_event))
-                    .map_err(|err| std::io::Error::other(err.to_string()))
-            }),
-        )
     }
 
     async fn handle_stream_manual(
@@ -423,12 +321,6 @@ async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, 
     response
         .body(Body::from(body))
         .map_err(|err| AppError::Internal(err.to_string()))
-}
-
-impl From<anyllm_client::ClientError> for AppError {
-    fn from(err: ClientError) -> Self {
-        Self::Upstream(err.to_string())
-    }
 }
 
 fn cap_anthropic_max_tokens(req: &mut MessageCreateRequest, limit: Option<u32>) {

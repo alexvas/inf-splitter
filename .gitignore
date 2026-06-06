@@ -27,3 +27,4 @@ lcov.info
 secrets/
 certs/ca-bundle.crt
 .claude
+config/inf-splitter.toml

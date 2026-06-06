@@ -94,10 +94,11 @@ impl AnthropicHandler {
         anthropic_endpoint: &str,
     ) -> Result<Response, AppError> {
         let request_size = body.len();
-        let mut openai_req: ChatCompletionRequest = serde_json::from_slice(body).map_err(|err| {
-            crate::dump_request_error(400, &format!("invalid OpenAI body: {err}"), body);
-            AppError::BadRequest(err.to_string())
-        })?;
+        let mut openai_req: ChatCompletionRequest =
+            serde_json::from_slice(body).map_err(|err| {
+                crate::dump_request_error(400, &format!("invalid OpenAI body: {err}"), body);
+                AppError::BadRequest(err.to_string())
+            })?;
         cap_openai_max_tokens(&mut openai_req, route);
 
         if openai_req.stream.unwrap_or(false) {

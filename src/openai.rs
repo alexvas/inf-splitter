@@ -367,8 +367,7 @@ mod tests {
 
     #[test]
     fn strip_adaptive_thinking_removes_field() {
-        let body =
-            br#"{"model":"x","max_tokens":1,"messages":[],"thinking":{"type":"adaptive"}}"#;
+        let body = br#"{"model":"x","max_tokens":1,"messages":[],"thinking":{"type":"adaptive"}}"#;
         let cleaned = strip_adaptive_thinking(body);
         let v: serde_json::Value = serde_json::from_slice(&cleaned).unwrap();
         assert!(v.get("thinking").is_none());

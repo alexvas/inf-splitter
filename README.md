@@ -17,8 +17,7 @@
 Основной файл: [`config/inf-splitter.toml`](config/inf-splitter.toml).
 
 ```toml
-port = 3383
-upstream_timeout = "5m"
+upstream_timeout = "3m"
 max_request_body = "2m"
 
 [defaults]
@@ -178,7 +177,7 @@ cargo run
 
 ```bash
 docker build -t inf-splitter .
-docker run --rm -p 3383:3383 \
+docker run --rm \
   -v "$PWD/config:/app/config:ro" \
   -v "$PWD/secrets:/app/secrets:ro" \
   inf-splitter

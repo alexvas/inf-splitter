@@ -1,10 +1,7 @@
 services:
   splitter:
     build: .
-    ports:
-      - "3383:3383"
     volumes:
-      # Если certs/ca-bundle.crt существует — он переопределяет системный CA-бандл.
-      # Чтобы запуститься без корпоративных сертификатов, создайте пустой файл:
-      #   touch certs/ca-bundle.crt
+      # Если certs/ca-bundle.crt не пустой (с корпоративными сертификатами) —
+      # он переопределяет системный CA-бандл.
       - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro

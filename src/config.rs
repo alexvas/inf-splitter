@@ -645,7 +645,7 @@ models = "test-model"
         env::set_var("MAAS_API_KEY", "sk-maas-test");
 
         let config = Config::load().expect("project config");
-        assert_eq!(config.listen_addr, "0.0.0.0:3383".parse().unwrap());
+        assert_eq!(config.listen_addr, "0.0.0.0:3000".parse().unwrap());
 
         let ollama = config.resolve_route("gemma4:31b").expect("ollama route");
         assert_eq!(

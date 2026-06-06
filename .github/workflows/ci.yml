@@ -20,3 +20,20 @@ jobs:
         run: cargo clippy --locked -- -D warnings
       - name: cargo test
         run: cargo test --locked
+
+  smoke:
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: inf-splitter:smoke-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test
+        run: SKIP_BUILD=1 ./scripts/docker-smoke-test.sh

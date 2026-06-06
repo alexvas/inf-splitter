@@ -54,8 +54,10 @@ http_get() {
   curl -fsS "$url"
 }
 
-echo "Building ${IMAGE}..."
-docker build -t "$IMAGE" .
+if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
+  echo "Building ${IMAGE}..."
+  docker build -t "$IMAGE" .
+fi
 
 echo "Starting container ${CONTAINER}..."
 docker run -d --name "$CONTAINER" \

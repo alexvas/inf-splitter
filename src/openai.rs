@@ -42,7 +42,8 @@ impl OpenAiHandler {
         route: &RouteTarget,
         openai_endpoint: &str,
     ) -> Result<Response, AppError> {
-        let mut req: MessageCreateRequest = serde_json::from_slice(body)?;
+        let body = strip_adaptive_thinking(body);
+        let mut req: MessageCreateRequest = serde_json::from_slice(&body)?;
         cap_anthropic_max_tokens(&mut req, route.max_tokens);
         let req = req;
 
@@ -323,6 +324,22 @@ async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, 
         .map_err(|err| AppError::Internal(err.to_string()))
 }
 
+/// Strip `thinking` field when it has type `adaptive` — not supported by
+/// anyllm_translate 0.9.x `ThinkingConfig` enum.  Since Anthropic→OpenAI
+/// translation doesn't propagate thinking blocks anyway, removal is safe.
+fn strip_adaptive_thinking(body: &[u8]) -> Vec<u8> {
+    let mut value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return body.to_vec(),
+    };
+    if let Some(thinking) = value.get("thinking") {
+        if thinking.get("type").and_then(|t| t.as_str()) == Some("adaptive") {
+            value.as_object_mut().and_then(|obj| obj.remove("thinking"));
+        }
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
 fn cap_anthropic_max_tokens(req: &mut MessageCreateRequest, limit: Option<u32>) {
     let Some(limit) = limit else {
         return;
@@ -343,6 +360,24 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn strip_adaptive_thinking_removes_field() {
+        let body =
+            br#"{"model":"x","max_tokens":1,"messages":[],"thinking":{"type":"adaptive"}}"#;
+        let cleaned = strip_adaptive_thinking(body);
+        let v: serde_json::Value = serde_json::from_slice(&cleaned).unwrap();
+        assert!(v.get("thinking").is_none());
+    }
+
+    #[test]
+    fn strip_adaptive_thinking_passes_through_other() {
+        let body = br#"{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+        let cleaned = strip_adaptive_thinking(body);
+        let original: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let cleaned: serde_json::Value = serde_json::from_slice(&cleaned).unwrap();
+        assert_eq!(cleaned, original);
     }
 
     #[test]

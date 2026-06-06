@@ -1,7 +1,7 @@
 services:
   splitter:
     build: .
-    volumes:
-      # Если certs/ca-bundle.crt не пустой (с корпоративными сертификатами) —
-      # он переопределяет системный CA-бандл.
-      - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    # volumes:
+    #   # Положите непустой certs/ca-bundle.crt (с корпоративными сертификатами)
+    #   # чтобы переопределить системный CA-бандл.
+    #   - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro

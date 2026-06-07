@@ -326,9 +326,9 @@ pub(crate) fn dump_request_error(status: u16, error_message: &str, body: &[u8]) 
 }
 
 fn chrono_now() -> String {
-    std::env::var("DUMP_ON_ERROR_TS")
-        .ok()
-        .filter(|v| !v.is_empty())
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
         .unwrap_or_default()
 }
 

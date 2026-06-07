@@ -497,9 +497,7 @@ models = "dump-conv-model"
 "#
     );
 
-    std::env::set_var("DUMP_ON_ERROR", "1");
-    let proxy_addr = spawn_router(&config).await;
-    std::env::remove_var("DUMP_ON_ERROR");
+    let proxy_addr = spawn_router_with_dump(&config).await;
 
     let client = reqwest::Client::new();
     let response = client
@@ -542,9 +540,7 @@ models = "dump-stream-model"
 "#
     );
 
-    std::env::set_var("DUMP_ON_ERROR", "1");
-    let proxy_addr = spawn_router(&config).await;
-    std::env::remove_var("DUMP_ON_ERROR");
+    let proxy_addr = spawn_router_with_dump(&config).await;
 
     let client = reqwest::Client::new();
     let response = client

@@ -650,13 +650,13 @@ models = "test-model"
         let ollama = config.resolve_route("gemma4:31b").expect("ollama route");
         assert_eq!(
             ollama.endpoint_openai.as_deref(),
-            Some("http://127.0.0.1:11434")
+            Some("http://host.docker.internal:11434")
         );
         assert!(ollama.endpoint_anthropic.is_none());
         assert!(ollama.api_key.is_none());
 
         let deepseek = config
-            .resolve_route("deepseek-v4-pro[1m]")
+            .resolve_route("deepseek-v4-pro")
             .expect("deepseek route");
         assert!(deepseek.endpoint_openai.is_none());
         assert_eq!(

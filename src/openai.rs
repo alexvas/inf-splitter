@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
+use crate::anthropic::cap_openai_max_tokens;
 use crate::auth::forward_request_headers;
 use crate::config::{Config, RouteTarget};
 use crate::error::AppError;
@@ -86,6 +87,7 @@ impl OpenAiHandler {
             && !sse::is_event_stream(upstream.headers())
         {
             let status = upstream.status();
+            let response_headers = upstream.headers().clone();
             let error_body = upstream.text().await.unwrap_or_default();
             crate::dump_upstream_error(&crate::UpstreamErrorCtx {
                 status: status.as_u16(),
@@ -99,9 +101,13 @@ impl OpenAiHandler {
                 messages_detail,
             });
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            return Response::builder()
+            let mut response = Response::builder()
                 .status(sc)
-                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in relay_response_headers(&response_headers) {
+                response = response.header(name, value);
+            }
+            return response
                 .body(Body::from(error_body))
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
@@ -126,6 +132,7 @@ impl OpenAiHandler {
         let translation = self.translation_for(route, &req.model);
         let mut openai_req = translate_request(req, &translation)
             .map_err(|err| AppError::Upstream(err.to_string()))?;
+        cap_openai_max_tokens(&mut openai_req, route);
         openai_req.stream_options = None;
 
         let backend_url = format!("{openai_endpoint}/v1/chat/completions");
@@ -182,6 +189,7 @@ impl OpenAiHandler {
         let translation = self.translation_for(route, &req.model);
         let mut openai_req = translate_request(req, &translation)
             .map_err(|err| AppError::Upstream(err.to_string()))?;
+        cap_openai_max_tokens(&mut openai_req, route);
         openai_req.stream = Some(true);
         openai_req.stream_options = None;
 
@@ -291,20 +299,47 @@ impl OpenAiHandler {
     }
 }
 
+/// Forward relevant non-hop-by-hop headers from OpenAI upstream responses.
+fn relay_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str();
+            let lower = name.to_ascii_lowercase();
+            if lower == "content-type"
+                || lower.starts_with("x-ratelimit-")
+                || lower == "x-request-id"
+                || lower == "request-id"
+                || lower.starts_with("openai-")
+            {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.to_string(), v.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, AppError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
+    let relay_headers = relay_response_headers(&headers);
 
     if sse::is_event_stream(&headers) {
         let stream = upstream
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
         let mut response = Response::builder().status(status);
-        if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
-            if let Ok(value) = content_type.to_str() {
-                response = response.header(header::CONTENT_TYPE, value);
-            }
-        } else {
+        for (name, value) in &relay_headers {
+            response = response.header(name.as_str(), value.as_str());
+        }
+        if !relay_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
             response = response.header(header::CONTENT_TYPE, "text/event-stream");
         }
         response = response
@@ -317,10 +352,8 @@ async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, 
 
     let body = upstream.bytes().await?;
     let mut response = Response::builder().status(status);
-    if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
-        if let Ok(value) = content_type.to_str() {
-            response = response.header(header::CONTENT_TYPE, value);
-        }
+    for (name, value) in relay_headers {
+        response = response.header(name, value);
     }
     response
         .body(Body::from(body))

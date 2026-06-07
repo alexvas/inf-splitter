@@ -8,10 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("inf_splitter=info".parse()?))
         .init();
 
-    let config = Config::load().map_err(|err| {
-        eprintln!("configuration error: {err}");
-        err
-    })?;
+    let config = Config::load()?;
 
     info!(
         listen = %config.listen_addr,

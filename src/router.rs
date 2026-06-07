@@ -104,8 +104,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect();
 
-    for check in checks {
-        let (name, status) = check.await;
+    for (name, status) in futures::future::join_all(checks).await {
         if status != "ok" {
             all_ok = false;
         }

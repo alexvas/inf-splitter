@@ -62,6 +62,7 @@ impl AnthropicHandler {
             && !sse::is_event_stream(upstream.headers())
         {
             let status = upstream.status();
+            let response_headers = copy_response_headers(upstream.headers());
             let error_body = upstream.text().await.unwrap_or_default();
             crate::dump_upstream_error(&crate::UpstreamErrorCtx {
                 status: status.as_u16(),
@@ -76,9 +77,13 @@ impl AnthropicHandler {
             });
             let sc = axum::http::StatusCode::from_u16(status.as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-            return axum::response::Response::builder()
+            let mut response = axum::response::Response::builder()
                 .status(sc)
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::CONTENT_TYPE, "application/json");
+            for (name, value) in response_headers {
+                response = response.header(name, value);
+            }
+            return response
                 .body(axum::body::Body::from(error_body))
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
@@ -381,7 +386,7 @@ fn copy_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-fn cap_openai_max_tokens(req: &mut ChatCompletionRequest, route: &RouteTarget) {
+pub(crate) fn cap_openai_max_tokens(req: &mut ChatCompletionRequest, route: &RouteTarget) {
     if let Some(limit) = route.max_tokens {
         match req.max_tokens {
             Some(existing) if existing > limit => req.max_tokens = Some(limit),
@@ -408,5 +413,126 @@ fn cap_openai_max_tokens(req: &mut ChatCompletionRequest, route: &RouteTarget) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn empty_route() -> RouteTarget {
+        RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: HashSet::new(),
+        }
+    }
+
+    fn make_openai_req() -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn cap_openai_max_tokens_sets_missing() {
+        let mut req = make_openai_req();
+        let mut route = empty_route();
+        route.max_tokens = Some(1024);
+        cap_openai_max_tokens(&mut req, &route);
+        assert_eq!(req.max_tokens, Some(1024));
+    }
+
+    #[test]
+    fn cap_openai_max_tokens_clamps_exceeding() {
+        let mut req = make_openai_req();
+        req.max_tokens = Some(4096);
+        let mut route = empty_route();
+        route.max_tokens = Some(1024);
+        cap_openai_max_tokens(&mut req, &route);
+        assert_eq!(req.max_tokens, Some(1024));
+    }
+
+    #[test]
+    fn cap_openai_max_tokens_leaves_below() {
+        let mut req = make_openai_req();
+        req.max_tokens = Some(512);
+        let mut route = empty_route();
+        route.max_tokens = Some(1024);
+        cap_openai_max_tokens(&mut req, &route);
+        assert_eq!(req.max_tokens, Some(512));
+    }
+
+    #[test]
+    fn cap_openai_max_completion_tokens_sets_missing() {
+        let mut req = make_openai_req();
+        let mut route = empty_route();
+        route.max_completion_tokens = Some(2048);
+        cap_openai_max_tokens(&mut req, &route);
+        assert_eq!(req.max_completion_tokens, Some(2048));
+    }
+
+    #[test]
+    fn cap_openai_max_output_tokens_sets_missing_via_extra() {
+        let mut req = make_openai_req();
+        let mut route = empty_route();
+        route.max_output_tokens = Some(500);
+        cap_openai_max_tokens(&mut req, &route);
+        assert_eq!(
+            req.extra.get("max_output_tokens").and_then(|v| v.as_u64()),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn cap_openai_max_output_tokens_clamps_exceeding() {
+        let mut req = make_openai_req();
+        req.extra
+            .insert("max_output_tokens".into(), serde_json::json!(1000u64));
+        let mut route = empty_route();
+        route.max_output_tokens = Some(500);
+        cap_openai_max_tokens(&mut req, &route);
+        assert_eq!(
+            req.extra.get("max_output_tokens").and_then(|v| v.as_u64()),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn cap_openai_no_limits_leaves_unchanged() {
+        let mut req = make_openai_req();
+        req.max_tokens = Some(4096);
+        let route = empty_route();
+        cap_openai_max_tokens(&mut req, &route);
+        assert_eq!(req.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn copy_response_headers_filters_to_whitelist() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("request-id", "req-123".parse().unwrap());
+        headers.insert("x-custom", "should-be-dropped".parse().unwrap());
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            "1000".parse().unwrap(),
+        );
+        headers.insert("connection", "keep-alive".parse().unwrap());
+
+        let result = copy_response_headers(&headers);
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"content-type"));
+        assert!(names.contains(&"request-id"));
+        assert!(names.contains(&"anthropic-ratelimit-requests-limit"));
+        assert!(!names.contains(&"x-custom"));
+        assert!(!names.contains(&"connection"));
     }
 }

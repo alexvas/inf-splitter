@@ -40,8 +40,8 @@ impl AppError {
     fn error_type(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "invalid_request_error",
-            Self::Upstream(_) => "api_error",
-            Self::Internal(_) => "api_error",
+            Self::Upstream(_) => "upstream_error",
+            Self::Internal(_) => "internal_error",
         }
     }
 }
@@ -49,7 +49,14 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
-        tracing::error!(status = status.as_u16(), error = %self, "request error");
+        match &self {
+            Self::BadRequest(_) => {
+                tracing::warn!(status = status.as_u16(), error = %self, "client error");
+            }
+            _ => {
+                tracing::error!(status = status.as_u16(), error = %self, "request error");
+            }
+        }
         let body = AnthropicErrorBody {
             r#type: "error",
             error: AnthropicErrorDetail {

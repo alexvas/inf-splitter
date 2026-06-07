@@ -53,6 +53,98 @@ pub fn format_sse_event(event: &StreamEvent) -> bytes::Bytes {
     bytes::Bytes::from(format_sse_event_str(event))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_event_stream_detects_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        assert!(is_event_stream(&headers));
+    }
+
+    #[test]
+    fn is_event_stream_rejects_json() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        assert!(!is_event_stream(&headers));
+    }
+
+    #[test]
+    fn is_event_stream_empty_headers() {
+        assert!(!is_event_stream(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn parse_anthropic_sse_event_parses_message_start() {
+        let line = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}";
+        let event = parse_anthropic_sse_event(line).expect("should parse");
+        assert!(matches!(event, StreamEvent::MessageStart { .. }));
+    }
+
+    #[test]
+    fn parse_anthropic_sse_event_ignores_empty_data() {
+        assert!(parse_anthropic_sse_event("data: ").is_none());
+        assert!(parse_anthropic_sse_event("data:").is_none());
+    }
+
+    #[test]
+    fn parse_anthropic_sse_event_returns_none_on_garbage() {
+        assert!(parse_anthropic_sse_event("data: not json").is_none());
+        assert!(parse_anthropic_sse_event("no prefix").is_none());
+    }
+
+    #[test]
+    fn format_openai_sse_chunk_produces_valid_sse() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4",
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+        }))
+        .unwrap();
+        let result = format_openai_sse_chunk(&chunk);
+        assert!(result.starts_with("data: "));
+        assert!(result.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn format_sse_event_str_produces_valid_sse() {
+        let event: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens":0,"output_tokens":0}
+            }
+        }))
+        .unwrap();
+        let result = format_sse_event_str(&event);
+        assert!(result.starts_with("event: message\ndata: "));
+        assert!(result.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn sse_response_sets_correct_headers() {
+        let headers = HeaderMap::new();
+        let stream = futures::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+        let response = sse_response(&headers, stream).expect("should build SSE response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(ct, Some("text/event-stream"));
+    }
+}
+
 pub fn sse_response<S>(request_headers: &HeaderMap, body: S) -> Result<Response, AppError>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,

@@ -2,13 +2,16 @@ upstream_timeout = "3m"
 max_request_body = "2m"
 
 [ollama]
-endpoint_openai = "http://127.0.0.1:11434"
+endpoint_openai = "http://host.docker.internal:11434"
 models = "gemma4:31b"
+max_tokens = 10_000
+max_output_tokens = 10_000
+max_completion_tokens = 10_000
 
 [deepseek]
 endpoint_anthropic = "https://api.deepseek.com/anthropic"
 api_key = "${DEEPSEEK_API_KEY}"
-models = ["deepseek-v4-pro[1m]", "deepseek-v4-flash"]
+models = ["deepseek-v4-pro", "deepseek-v4-flash"]
 
 [etc]
 endpoint_openai = "https://api.modelarts-maas.com/openai/v1"

@@ -5,3 +5,6 @@ services:
     #   # Положите непустой certs/ca-bundle.crt (с корпоративными сертификатами)
     #   # чтобы переопределить системный CA-бандл.
     #   - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    #   # Для записи диагностики в файл (вместо stderr):
+    #   # - ./logs:/app/logs
+    #   # и в TOML: [diagnostics] output = "/app/logs/diagnostics.ndjson"

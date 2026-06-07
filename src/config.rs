@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
+
+use crate::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -55,7 +57,7 @@ pub struct Config {
     pub upstream_timeout: Duration,
     pub max_request_body: usize,
     pub body_too_large_hint_statuses: Arc<HashSet<StatusCode>>,
-    pub dump_on_error: bool,
+    pub diagnostics: DiagnosticsConfig,
     default_max_tokens: Option<u32>,
     default_max_output_tokens: Option<u32>,
     default_max_completion_tokens: Option<u32>,
@@ -72,12 +74,38 @@ const DEFAULT_UPSTREAM_TIMEOUT: &str = "5m";
 const DEFAULT_MAX_REQUEST_BODY: &str = "2m";
 
 #[derive(Debug, Deserialize)]
+struct DiagnosticsConfigRaw {
+    output: Option<String>,
+    stats: Option<DiagnosticModeField>,
+    dump: Option<DiagnosticModeField>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DiagnosticModeField {
+    Off,
+    Error,
+    All,
+}
+
+impl From<DiagnosticModeField> for DiagnosticMode {
+    fn from(f: DiagnosticModeField) -> Self {
+        match f {
+            DiagnosticModeField::Off => DiagnosticMode::Off,
+            DiagnosticModeField::Error => DiagnosticMode::Error,
+            DiagnosticModeField::All => DiagnosticMode::All,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct FileConfig {
     port: Option<u16>,
     upstream_timeout: Option<String>,
     max_request_body: Option<String>,
     defaults: Option<DefaultConfig>,
     body_too_large_hint_statuses: Option<Vec<u16>>,
+    diagnostics: Option<DiagnosticsConfigRaw>,
     #[serde(flatten)]
     providers: HashMap<String, ProviderConfigRaw>,
 }
@@ -166,7 +194,24 @@ impl Config {
         }
 
         let listen_addr = resolve_listen_addr(file.port)?;
-        let dump_on_error = env_truthy("DUMP_ON_ERROR");
+        let diagnostics = match file.diagnostics {
+            Some(raw) => DiagnosticsConfig {
+                output: match raw.output.as_deref() {
+                    Some("stdout") => Sink::Stdout,
+                    Some("stderr") | None => Sink::Stderr,
+                    Some(path) => Sink::File(path.into()),
+                },
+                stats: raw
+                    .stats
+                    .map(DiagnosticMode::from)
+                    .unwrap_or(DiagnosticMode::Off),
+                dump: raw
+                    .dump
+                    .map(DiagnosticMode::from)
+                    .unwrap_or(DiagnosticMode::Off),
+            },
+            None => DiagnosticsConfig::default(),
+        };
         let upstream_timeout = parse_duration_field(
             file.upstream_timeout
                 .as_deref()
@@ -258,7 +303,7 @@ impl Config {
 
         Ok(Self {
             listen_addr,
-            dump_on_error,
+            diagnostics,
             upstream_timeout,
             max_request_body,
             body_too_large_hint_statuses,
@@ -330,7 +375,7 @@ impl Config {
     pub fn from_model_routes(model_routes: HashMap<String, String>) -> Self {
         Self {
             listen_addr: "0.0.0.0:3000".parse().expect("test listen addr"),
-            dump_on_error: false,
+            diagnostics: DiagnosticsConfig::default(),
             upstream_timeout: parse_duration(DEFAULT_UPSTREAM_TIMEOUT).expect("default timeout"),
             max_request_body: parse_byte_size(DEFAULT_MAX_REQUEST_BODY)
                 .expect("default body limit"),
@@ -512,16 +557,6 @@ fn resolve_var(name: &str) -> Result<String, ConfigError> {
     }
 
     Err(ConfigError::SecretNotFound(name.to_string()))
-}
-
-fn env_truthy(name: &str) -> bool {
-    match env::var(name) {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
 }
 
 #[cfg(test)]

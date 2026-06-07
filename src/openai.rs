@@ -14,24 +14,29 @@ use reqwest::Client as HttpClient;
 use crate::anthropic::cap_openai_max_tokens;
 use crate::auth::forward_request_headers;
 use crate::config::{Config, RouteTarget};
+use crate::diagnostics::{Diagnostics, StatsEvent};
 use crate::error::AppError;
 use crate::sse;
 
 #[derive(Clone)]
 pub struct OpenAiHandler {
     http: HttpClient,
-    dump_on_error: bool,
+    diagnostics: Diagnostics,
     hint_statuses: Arc<HashSet<StatusCode>>,
 }
 
 impl OpenAiHandler {
-    pub fn new(config: &Config, hint_statuses: Arc<HashSet<StatusCode>>) -> Result<Self, AppError> {
+    pub fn new(
+        config: &Config,
+        diagnostics: Diagnostics,
+        hint_statuses: Arc<HashSet<StatusCode>>,
+    ) -> Result<Self, AppError> {
         Ok(Self {
             http: HttpClient::builder()
                 .timeout(config.upstream_timeout)
                 .build()
                 .map_err(|err| AppError::Internal(err.to_string()))?,
-            dump_on_error: config.dump_on_error,
+            diagnostics,
             hint_statuses,
         })
     }
@@ -45,7 +50,23 @@ impl OpenAiHandler {
     ) -> Result<Response, AppError> {
         let body = strip_adaptive_thinking(body);
         let mut req: MessageCreateRequest = serde_json::from_slice(&body).map_err(|err| {
-            crate::dump_request_error(400, &format!("invalid Anthropic body: {err}"), &body);
+            self.diagnostics.record_stats(&StatsEvent {
+                request_id: self.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: "anthropic->openai".into(),
+                model: "?".into(),
+                upstream: openai_endpoint.into(),
+                status: 400,
+                duration_ms: 0,
+                request_size_bytes: body.len(),
+                response_size_bytes: None,
+                streaming: false,
+                input_messages: None,
+                max_tokens: None,
+                messages_detail_ingress: None,
+                messages_detail_egress: None,
+                error: Some(format!("invalid Anthropic body: {err}")),
+            });
             AppError::BadRequest(err.to_string())
         })?;
         cap_anthropic_max_tokens(&mut req, route.max_tokens);
@@ -70,7 +91,7 @@ impl OpenAiHandler {
     ) -> Result<Response, AppError> {
         let request_size = body.len();
         let model = crate::peek_model_from_json(body);
-        let messages_detail = crate::messages_detail_from_bytes(body);
+        let messages_detail = crate::diagnostics::messages_detail_from_bytes(body);
         let body = crate::apply_token_caps(body, route)?;
         let backend_url = format!("{endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
@@ -82,23 +103,28 @@ impl OpenAiHandler {
         );
 
         let upstream = builder.body(body).send().await?;
-        if self.dump_on_error
-            && !upstream.status().is_success()
-            && !sse::is_event_stream(upstream.headers())
-        {
+        let is_err = !upstream.status().is_success() && !sse::is_event_stream(upstream.headers());
+        if is_err {
             let status = upstream.status();
             let response_headers = upstream.headers().clone();
             let error_body = upstream.text().await.unwrap_or_default();
-            crate::dump_upstream_error(&crate::UpstreamErrorCtx {
+            let request_id = self.diagnostics.new_request_id();
+            self.diagnostics.record_stats(&StatsEvent {
+                request_id: request_id.clone(),
+                ts: crate::diagnostics::ts_string(),
+                direction: "openai->openai".into(),
+                model: model.clone(),
+                upstream: endpoint.to_string(),
                 status: status.as_u16(),
-                error_message: error_body.clone(),
-                model,
-                request_size,
+                duration_ms: 0,
+                request_size_bytes: request_size,
+                response_size_bytes: None,
+                streaming: false,
                 input_messages: None,
                 max_tokens: None,
-                chunks_received: None,
-                bytes_received: None,
-                messages_detail,
+                messages_detail_ingress: None,
+                messages_detail_egress: messages_detail.clone(),
+                error: Some(error_body.clone()),
             });
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = Response::builder()
@@ -152,19 +178,25 @@ impl OpenAiHandler {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-            if self.dump_on_error {
-                crate::dump_upstream_error(&crate::UpstreamErrorCtx {
-                    status: status.as_u16(),
-                    error_message: error_body.clone(),
-                    model: req.model.clone(),
-                    request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
-                    input_messages: Some(req.messages.len()),
-                    max_tokens: Some(req.max_tokens),
-                    chunks_received: None,
-                    bytes_received: None,
-                    messages_detail: Some(crate::anthropic_messages_detail(req)),
-                });
-            }
+            self.diagnostics.record_stats(&StatsEvent {
+                request_id: self.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: "anthropic->openai".into(),
+                model: req.model.clone(),
+                upstream: openai_endpoint.into(),
+                status: status.as_u16(),
+                duration_ms: 0,
+                request_size_bytes: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
+                response_size_bytes: None,
+                streaming: false,
+                input_messages: Some(req.messages.len()),
+                max_tokens: Some(req.max_tokens),
+                messages_detail_ingress: Some(crate::diagnostics::anthropic_messages_detail(req)),
+                messages_detail_egress: Some(crate::diagnostics::openai_messages_detail(
+                    &openai_req,
+                )),
+                error: Some(error_body.clone()),
+            });
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = crate::append_size_hint(sc, error_body, &self.hint_statuses);
             return Response::builder()
@@ -210,19 +242,25 @@ impl OpenAiHandler {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-            if self.dump_on_error {
-                crate::dump_upstream_error(&crate::UpstreamErrorCtx {
-                    status: status.as_u16(),
-                    error_message: error_body.clone(),
-                    model: req.model.clone(),
-                    request_size: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
-                    input_messages: Some(req.messages.len()),
-                    max_tokens: Some(req.max_tokens),
-                    chunks_received: None,
-                    bytes_received: None,
-                    messages_detail: Some(crate::anthropic_messages_detail(req)),
-                });
-            }
+            self.diagnostics.record_stats(&StatsEvent {
+                request_id: self.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: "anthropic->openai".into(),
+                model: req.model.clone(),
+                upstream: openai_endpoint.into(),
+                status: status.as_u16(),
+                duration_ms: 0,
+                request_size_bytes: serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0),
+                response_size_bytes: None,
+                streaming: true,
+                input_messages: Some(req.messages.len()),
+                max_tokens: Some(req.max_tokens),
+                messages_detail_ingress: Some(crate::diagnostics::anthropic_messages_detail(req)),
+                messages_detail_egress: Some(crate::diagnostics::openai_messages_detail(
+                    &openai_req,
+                )),
+                error: Some(error_body.clone()),
+            });
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = crate::append_size_hint(sc, error_body, &self.hint_statuses);
             return Response::builder()

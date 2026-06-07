@@ -1,4 +1,5 @@
 use inf_splitter::config::Config;
+use inf_splitter::diagnostics::Diagnostics;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -9,6 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::load()?;
+    let diagnostics = Diagnostics::new(config.diagnostics.clone());
 
     info!(
         listen = %config.listen_addr,
@@ -19,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let listen_addr = config.listen_addr;
-    let app = inf_splitter::build_app(config).await?;
+    let app = inf_splitter::build_app(config, diagnostics).await?;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!(addr = %listen_addr, "listening");
 

@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use inf_splitter::config::Config;
+use inf_splitter::diagnostics::{DiagnosticMode, Diagnostics, DiagnosticsConfig};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -62,19 +63,24 @@ pub async fn spawn_router(config_toml: &str) -> SocketAddr {
     let mut config = Config::load_from_str(config_toml).expect("test config");
     config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");
 
-    let app = inf_splitter::build_app(config)
+    let diagnostics = Diagnostics::new(DiagnosticsConfig::default());
+    let app = inf_splitter::build_app(config, diagnostics)
         .await
         .expect("build proxy app");
     bind_and_serve(app).await.0
 }
 
-/// Like `spawn_router` but with `dump_on_error = true` on the config.
+/// Like `spawn_router` but with `stats = "error"` in the diagnostics config.
 pub async fn spawn_router_with_dump(config_toml: &str) -> SocketAddr {
     let mut config = Config::load_from_str(config_toml).expect("test config");
     config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");
-    config.dump_on_error = true;
 
-    let app = inf_splitter::build_app(config)
+    let diag_config = DiagnosticsConfig {
+        stats: DiagnosticMode::Error,
+        ..DiagnosticsConfig::default()
+    };
+    let diagnostics = Diagnostics::new(diag_config);
+    let app = inf_splitter::build_app(config, diagnostics)
         .await
         .expect("build proxy app");
     bind_and_serve(app).await.0

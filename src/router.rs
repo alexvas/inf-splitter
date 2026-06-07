@@ -14,12 +14,14 @@ use tokio::sync::Mutex;
 
 use crate::anthropic::AnthropicHandler;
 use crate::config::{Config, Protocol};
+use crate::diagnostics::Diagnostics;
 use crate::error::AppError;
 use crate::openai::OpenAiHandler;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub diagnostics: Diagnostics,
     pub openai: OpenAiHandler,
     pub anthropic: AnthropicHandler,
     pub health_client: reqwest::Client,
@@ -182,17 +184,71 @@ async fn dispatch_messages(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let peek: MessagePeek = serde_json::from_slice(&body).map_err(|err| {
-        crate::dump_request_error(400, &format!("invalid JSON body: {err}"), &body);
+        state
+            .diagnostics
+            .record_stats(&crate::diagnostics::StatsEvent {
+                request_id: state.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: ingress.to_string(),
+                model: "?".into(),
+                upstream: String::new(),
+                status: 400,
+                duration_ms: 0,
+                request_size_bytes: body.len(),
+                response_size_bytes: None,
+                streaming: false,
+                input_messages: None,
+                max_tokens: None,
+                messages_detail_ingress: None,
+                messages_detail_egress: None,
+                error: Some(format!("invalid JSON body: {err}")),
+            });
         AppError::BadRequest(format!("invalid JSON body: {err}"))
     })?;
 
     if peek.model.trim().is_empty() {
-        crate::dump_request_error(400, "model must not be empty", &body);
+        state
+            .diagnostics
+            .record_stats(&crate::diagnostics::StatsEvent {
+                request_id: state.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: ingress.to_string(),
+                model: "?".into(),
+                upstream: String::new(),
+                status: 400,
+                duration_ms: 0,
+                request_size_bytes: body.len(),
+                response_size_bytes: None,
+                streaming: false,
+                input_messages: None,
+                max_tokens: None,
+                messages_detail_ingress: None,
+                messages_detail_egress: None,
+                error: Some("model must not be empty".into()),
+            });
         return Err(AppError::BadRequest("model must not be empty".to_string()));
     }
 
     let route = state.config.resolve_route(&peek.model).map_err(|err| {
-        crate::dump_request_error(400, &err.to_string(), &body);
+        state
+            .diagnostics
+            .record_stats(&crate::diagnostics::StatsEvent {
+                request_id: state.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: ingress.to_string(),
+                model: peek.model.clone(),
+                upstream: String::new(),
+                status: 400,
+                duration_ms: 0,
+                request_size_bytes: body.len(),
+                response_size_bytes: None,
+                streaming: false,
+                input_messages: None,
+                max_tokens: None,
+                messages_detail_ingress: None,
+                messages_detail_egress: None,
+                error: Some(err.to_string()),
+            });
         AppError::from(err)
     })?;
 

@@ -18,19 +18,21 @@ use reqwest::RequestBuilder;
 
 use crate::auth::forward_request_headers;
 use crate::config::RouteTarget;
+use crate::diagnostics::{Diagnostics, StatsEvent};
 use crate::error::AppError;
 use crate::sse;
 
 #[derive(Clone)]
 pub struct AnthropicHandler {
     client: Client,
-    dump_on_error: bool,
+    diagnostics: Diagnostics,
     hint_statuses: Arc<HashSet<StatusCode>>,
 }
 
 impl AnthropicHandler {
     pub fn new(
         config: &crate::config::Config,
+        diagnostics: Diagnostics,
         hint_statuses: Arc<HashSet<StatusCode>>,
     ) -> Result<Self, AppError> {
         Ok(Self {
@@ -38,7 +40,7 @@ impl AnthropicHandler {
                 .timeout(config.upstream_timeout)
                 .build()
                 .map_err(|err| AppError::Internal(err.to_string()))?,
-            dump_on_error: config.dump_on_error,
+            diagnostics,
             hint_statuses,
         })
     }
@@ -53,27 +55,30 @@ impl AnthropicHandler {
     ) -> Result<Response, AppError> {
         let request_size = body.len();
         let model = crate::peek_model_from_json(&body);
-        let messages_detail = crate::messages_detail_from_bytes(&body);
+        let messages_detail = crate::diagnostics::messages_detail_from_bytes(&body);
         let body = Bytes::from(crate::apply_token_caps(&body, route)?);
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let upstream = builder.body(body).send().await?;
-        if self.dump_on_error
-            && !upstream.status().is_success()
-            && !sse::is_event_stream(upstream.headers())
-        {
+        if !upstream.status().is_success() && !sse::is_event_stream(upstream.headers()) {
             let status = upstream.status();
             let response_headers = copy_response_headers(upstream.headers());
             let error_body = upstream.text().await.unwrap_or_default();
-            crate::dump_upstream_error(&crate::UpstreamErrorCtx {
+            self.diagnostics.record_stats(&StatsEvent {
+                request_id: self.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: "anthropic->anthropic".into(),
+                model: model.clone(),
+                upstream: anthropic_endpoint.into(),
                 status: status.as_u16(),
-                error_message: error_body.clone(),
-                model,
-                request_size,
+                duration_ms: 0,
+                request_size_bytes: request_size,
+                response_size_bytes: None,
+                streaming: false,
                 input_messages: None,
                 max_tokens: None,
-                chunks_received: None,
-                bytes_received: None,
-                messages_detail,
+                messages_detail_ingress: None,
+                messages_detail_egress: messages_detail.clone(),
+                error: Some(error_body.clone()),
             });
             let sc = axum::http::StatusCode::from_u16(status.as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
@@ -101,7 +106,23 @@ impl AnthropicHandler {
         let request_size = body.len();
         let mut openai_req: ChatCompletionRequest =
             serde_json::from_slice(body).map_err(|err| {
-                crate::dump_request_error(400, &format!("invalid OpenAI body: {err}"), body);
+                self.diagnostics.record_stats(&StatsEvent {
+                    request_id: self.diagnostics.new_request_id(),
+                    ts: crate::diagnostics::ts_string(),
+                    direction: "openai->anthropic".into(),
+                    model: "?".into(),
+                    upstream: anthropic_endpoint.into(),
+                    status: 400,
+                    duration_ms: 0,
+                    request_size_bytes: body.len(),
+                    response_size_bytes: None,
+                    streaming: false,
+                    input_messages: None,
+                    max_tokens: None,
+                    messages_detail_ingress: None,
+                    messages_detail_egress: None,
+                    error: Some(format!("invalid OpenAI body: {err}")),
+                });
                 AppError::BadRequest(err.to_string())
             })?;
         cap_openai_max_tokens(&mut openai_req, route);
@@ -131,19 +152,27 @@ impl AnthropicHandler {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-            if self.dump_on_error {
-                crate::dump_upstream_error(&crate::UpstreamErrorCtx {
-                    status: status.as_u16(),
-                    error_message: error_body.clone(),
-                    model: openai_req.model.clone(),
-                    request_size,
-                    input_messages: Some(openai_req.messages.len()),
-                    max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
-                    chunks_received: None,
-                    bytes_received: None,
-                    messages_detail: Some(crate::openai_messages_detail(&openai_req)),
-                });
-            }
+            self.diagnostics.record_stats(&StatsEvent {
+                request_id: self.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: "openai->anthropic".into(),
+                model: openai_req.model.clone(),
+                upstream: anthropic_endpoint.into(),
+                status: status.as_u16(),
+                duration_ms: 0,
+                request_size_bytes: request_size,
+                response_size_bytes: None,
+                streaming: false,
+                input_messages: Some(openai_req.messages.len()),
+                max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
+                messages_detail_ingress: Some(crate::diagnostics::openai_messages_detail(
+                    &openai_req,
+                )),
+                messages_detail_egress: Some(crate::diagnostics::anthropic_messages_detail(
+                    &anthropic_req,
+                )),
+                error: Some(error_body.clone()),
+            });
             return relay_error_body(status, error_body, &self.hint_statuses);
         }
 
@@ -175,19 +204,27 @@ impl AnthropicHandler {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-            if self.dump_on_error {
-                crate::dump_upstream_error(&crate::UpstreamErrorCtx {
-                    status: status.as_u16(),
-                    error_message: error_body.clone(),
-                    model: openai_req.model.clone(),
-                    request_size,
-                    input_messages: Some(openai_req.messages.len()),
-                    max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
-                    chunks_received: None,
-                    bytes_received: None,
-                    messages_detail: Some(crate::openai_messages_detail(openai_req)),
-                });
-            }
+            self.diagnostics.record_stats(&StatsEvent {
+                request_id: self.diagnostics.new_request_id(),
+                ts: crate::diagnostics::ts_string(),
+                direction: "openai->anthropic".into(),
+                model: openai_req.model.clone(),
+                upstream: anthropic_endpoint.into(),
+                status: status.as_u16(),
+                duration_ms: 0,
+                request_size_bytes: request_size,
+                response_size_bytes: None,
+                streaming: true,
+                input_messages: Some(openai_req.messages.len()),
+                max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
+                messages_detail_ingress: Some(crate::diagnostics::openai_messages_detail(
+                    openai_req,
+                )),
+                messages_detail_egress: Some(crate::diagnostics::anthropic_messages_detail(
+                    &anthropic_req,
+                )),
+                error: Some(error_body.clone()),
+            });
             return relay_error_body(status, error_body, &self.hint_statuses);
         }
 

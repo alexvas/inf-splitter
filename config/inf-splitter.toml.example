@@ -17,6 +17,10 @@ models = ["deepseek-v4-pro", "deepseek-v4-flash"]
 endpoint_openai = "https://api.modelarts-maas.com/openai/v1"
 api_key = "${MAAS_API_KEY}"
 models = "default"
+# openai-related settings:
+max_tokens = 10_000
+max_output_tokens = 10_000
+max_completion_tokens = 10_000
 
 [diagnostics]
 # Куда писать NDJSON статистики: "stderr" (по умолчанию), "stdout", или путь к файлу.

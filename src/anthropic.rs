@@ -92,7 +92,25 @@ impl AnthropicHandler {
                 .body(axum::body::Body::from(error_body))
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
-        relay_upstream_response(upstream).await
+        let relayed = relay_upstream_response(upstream).await?;
+        self.diagnostics.record_stats(&StatsEvent {
+            request_id: self.diagnostics.new_request_id(),
+            ts: crate::diagnostics::ts_string(),
+            direction: "anthropic->anthropic".into(),
+            model,
+            upstream: anthropic_endpoint.into(),
+            status: relayed.status().as_u16(),
+            duration_ms: 0,
+            request_size_bytes: request_size,
+            response_size_bytes: None,
+            streaming: false,
+            input_messages: None,
+            max_tokens: None,
+            messages_detail_ingress: None,
+            messages_detail_egress: messages_detail,
+            error: None,
+        });
+        Ok(relayed)
     }
 
     /// OpenAI ingress → Anthropic upstream (translate request/response).
@@ -152,8 +170,9 @@ impl AnthropicHandler {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
+            let request_id = self.diagnostics.new_request_id();
             self.diagnostics.record_stats(&StatsEvent {
-                request_id: self.diagnostics.new_request_id(),
+                request_id: request_id.clone(),
                 ts: crate::diagnostics::ts_string(),
                 direction: "openai->anthropic".into(),
                 model: openai_req.model.clone(),
@@ -173,6 +192,43 @@ impl AnthropicHandler {
                 )),
                 error: Some(error_body.clone()),
             });
+            if let Ok(ingress_str) = serde_json::to_string(&openai_req) {
+                self.diagnostics.record_dump(
+                    &crate::diagnostics::DumpEvent {
+                        request_id: request_id.clone(),
+                        ts: crate::diagnostics::ts_string(),
+                        stage: "ingress".into(),
+                        direction: "request".into(),
+                        model: openai_req.model.clone(),
+                        headers: request_headers
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                v.to_str()
+                                    .ok()
+                                    .map(|val| (k.as_str().to_string(), val.to_string()))
+                            })
+                            .collect(),
+                        body: ingress_str,
+                        status: None,
+                    },
+                    true,
+                );
+            }
+            if let Ok(egress_str) = serde_json::to_string(&anthropic_req) {
+                self.diagnostics.record_dump(
+                    &crate::diagnostics::DumpEvent {
+                        request_id,
+                        ts: crate::diagnostics::ts_string(),
+                        stage: "egress".into(),
+                        direction: "request".into(),
+                        model: openai_req.model.clone(),
+                        headers: Vec::new(),
+                        body: egress_str,
+                        status: None,
+                    },
+                    true,
+                );
+            }
             return relay_error_body(status, error_body, &self.hint_statuses);
         }
 
@@ -204,8 +260,9 @@ impl AnthropicHandler {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
+            let request_id = self.diagnostics.new_request_id();
             self.diagnostics.record_stats(&StatsEvent {
-                request_id: self.diagnostics.new_request_id(),
+                request_id: request_id.clone(),
                 ts: crate::diagnostics::ts_string(),
                 direction: "openai->anthropic".into(),
                 model: openai_req.model.clone(),
@@ -225,6 +282,43 @@ impl AnthropicHandler {
                 )),
                 error: Some(error_body.clone()),
             });
+            if let Ok(ingress_str) = serde_json::to_string(&openai_req) {
+                self.diagnostics.record_dump(
+                    &crate::diagnostics::DumpEvent {
+                        request_id: request_id.clone(),
+                        ts: crate::diagnostics::ts_string(),
+                        stage: "ingress".into(),
+                        direction: "request".into(),
+                        model: openai_req.model.clone(),
+                        headers: request_headers
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                v.to_str()
+                                    .ok()
+                                    .map(|val| (k.as_str().to_string(), val.to_string()))
+                            })
+                            .collect(),
+                        body: ingress_str,
+                        status: None,
+                    },
+                    true,
+                );
+            }
+            if let Ok(egress_str) = serde_json::to_string(&anthropic_req) {
+                self.diagnostics.record_dump(
+                    &crate::diagnostics::DumpEvent {
+                        request_id,
+                        ts: crate::diagnostics::ts_string(),
+                        stage: "egress".into(),
+                        direction: "request".into(),
+                        model: openai_req.model.clone(),
+                        headers: Vec::new(),
+                        body: egress_str,
+                        status: None,
+                    },
+                    true,
+                );
+            }
             return relay_error_body(status, error_body, &self.hint_statuses);
         }
 

@@ -7,4 +7,4 @@ services:
     #   - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
     #   # Для записи диагностики в файл (вместо stderr):
     #   # - ./logs:/app/logs
-    #   # и в TOML: [diagnostics] output = "/app/logs/diagnostics.ndjson"
+    #   # и в TOML: [diagnostics] stats_output = "/app/logs/stats.ndjson"

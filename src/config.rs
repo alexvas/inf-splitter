@@ -75,9 +75,11 @@ const DEFAULT_MAX_REQUEST_BODY: &str = "2m";
 
 #[derive(Debug, Deserialize)]
 struct DiagnosticsConfigRaw {
-    output: Option<String>,
-    stats: Option<DiagnosticModeField>,
-    dump: Option<DiagnosticModeField>,
+    stats_output: Option<String>,
+    dump_output: Option<String>,
+    stats_mode: Option<DiagnosticModeField>,
+    dump_mode: Option<DiagnosticModeField>,
+    flush_period: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -196,19 +198,21 @@ impl Config {
         let listen_addr = resolve_listen_addr(file.port)?;
         let diagnostics = match file.diagnostics {
             Some(raw) => DiagnosticsConfig {
-                output: match raw.output.as_deref() {
-                    Some("stdout") => Sink::Stdout,
-                    Some("stderr") | None => Sink::Stderr,
-                    Some(path) => Sink::File(path.into()),
-                },
-                stats: raw
-                    .stats
+                stats_output: sink_from_str(raw.stats_output.as_deref()),
+                dump_output: sink_from_str(raw.dump_output.as_deref()),
+                stats_mode: raw
+                    .stats_mode
                     .map(DiagnosticMode::from)
                     .unwrap_or(DiagnosticMode::Off),
-                dump: raw
-                    .dump
+                dump_mode: raw
+                    .dump_mode
                     .map(DiagnosticMode::from)
                     .unwrap_or(DiagnosticMode::Off),
+                flush_period: raw
+                    .flush_period
+                    .as_deref()
+                    .map(parse_duration_field)
+                    .transpose()?,
             },
             None => DiagnosticsConfig::default(),
         };
@@ -498,6 +502,14 @@ fn parse_models(name: &str, models: ModelsField) -> Result<(bool, HashSet<String
     }
 }
 
+fn sink_from_str(raw: Option<&str>) -> Sink {
+    match raw {
+        Some("stdout") => Sink::Stdout,
+        Some("stderr") | None => Sink::Stderr,
+        Some(path) => Sink::File(path.into()),
+    }
+}
+
 fn config_path() -> PathBuf {
     if let Ok(path) = env::var("INF_SPLITTER_CONFIG") {
         return PathBuf::from(path);
@@ -684,10 +696,10 @@ models = "test-model"
 
         let ollama = config.resolve_route("gemma4:31b").expect("ollama route");
         assert_eq!(
-            ollama.endpoint_openai.as_deref(),
+            ollama.endpoint_anthropic.as_deref(),
             Some("http://host.docker.internal:11434")
         );
-        assert!(ollama.endpoint_anthropic.is_none());
+        assert!(ollama.endpoint_openai.is_none());
         assert!(ollama.api_key.is_none());
 
         let deepseek = config

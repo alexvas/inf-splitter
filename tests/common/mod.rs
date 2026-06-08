@@ -76,9 +76,24 @@ pub async fn spawn_router_with_dump(config_toml: &str) -> SocketAddr {
     config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");
 
     let diag_config = DiagnosticsConfig {
-        stats: DiagnosticMode::Error,
+        stats_mode: DiagnosticMode::Error,
         ..DiagnosticsConfig::default()
     };
+    let diagnostics = Diagnostics::new(diag_config);
+    let app = inf_splitter::build_app(config, diagnostics)
+        .await
+        .expect("build proxy app");
+    bind_and_serve(app).await.0
+}
+
+/// Spawn router with a fully custom `DiagnosticsConfig`.
+pub async fn spawn_router_with_diagnostics(
+    config_toml: &str,
+    diag_config: DiagnosticsConfig,
+) -> SocketAddr {
+    let mut config = Config::load_from_str(config_toml).expect("test config");
+    config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");
+
     let diagnostics = Diagnostics::new(diag_config);
     let app = inf_splitter::build_app(config, diagnostics)
         .await

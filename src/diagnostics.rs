@@ -1,7 +1,8 @@
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -10,17 +11,23 @@ use tokio::sync::mpsc;
 /// Parsed from the optional `[diagnostics]` TOML section.
 #[derive(Debug, Clone)]
 pub struct DiagnosticsConfig {
-    pub output: Sink,
-    pub stats: DiagnosticMode,
-    pub dump: DiagnosticMode,
+    pub stats_output: Sink,
+    pub dump_output: Sink,
+    pub stats_mode: DiagnosticMode,
+    pub dump_mode: DiagnosticMode,
+    /// When set, flush to disk at most this often (e.g. `10s`).
+    /// When `None`, flush after every line.
+    pub flush_period: Option<Duration>,
 }
 
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
-            output: Sink::Stderr,
-            stats: DiagnosticMode::Off,
-            dump: DiagnosticMode::Off,
+            stats_output: Sink::Stderr,
+            dump_output: Sink::Stderr,
+            stats_mode: DiagnosticMode::Off,
+            dump_mode: DiagnosticMode::Off,
+            flush_period: None,
         }
     }
 }
@@ -45,7 +52,8 @@ pub enum Sink {
 /// Cloning is cheap — all clones share the same channel sender.
 #[derive(Clone)]
 pub struct Diagnostics {
-    sender: mpsc::Sender<String>,
+    stats_tx: mpsc::Sender<String>,
+    dump_tx: mpsc::Sender<String>,
     stats_mode: DiagnosticMode,
     dump_mode: DiagnosticMode,
     counter: Arc<AtomicU64>,
@@ -93,16 +101,21 @@ pub struct DumpEvent {
 
 impl Diagnostics {
     pub fn new(config: DiagnosticsConfig) -> Self {
-        let (sender, receiver) = mpsc::channel(1024);
-        let stats_mode = config.stats.clone();
-        let dump_mode = config.dump.clone();
+        let (stats_tx, stats_rx) = mpsc::channel(1024);
+        let (dump_tx, dump_rx) = mpsc::channel(1024);
+        let stats_mode = config.stats_mode.clone();
+        let dump_mode = config.dump_mode.clone();
 
         tokio::task::spawn_blocking(move || {
-            writer_loop(receiver, config.output);
+            writer_loop(stats_rx, config.stats_output, config.flush_period);
+        });
+        tokio::task::spawn_blocking(move || {
+            writer_loop(dump_rx, config.dump_output, config.flush_period);
         });
 
         Self {
-            sender,
+            stats_tx,
+            dump_tx,
             stats_mode,
             dump_mode,
             counter: Arc::new(AtomicU64::new(0)),
@@ -113,9 +126,11 @@ impl Diagnostics {
     /// Create a no-op Diagnostics for tests (no background writer task).
     #[cfg(test)]
     pub fn new_noop() -> Self {
-        let (sender, _receiver) = mpsc::channel(1);
+        let (stats_tx, _rx) = mpsc::channel(1);
+        let (dump_tx, _rx) = mpsc::channel(1);
         Self {
-            sender,
+            stats_tx,
+            dump_tx,
             stats_mode: DiagnosticMode::Off,
             dump_mode: DiagnosticMode::Off,
             counter: Arc::new(AtomicU64::new(0)),
@@ -152,7 +167,7 @@ impl Diagnostics {
         let Ok(json) = serde_json::to_string(event) else {
             return;
         };
-        let _ = self.sender.try_send(json);
+        let _ = self.stats_tx.try_send(json);
     }
 
     /// Non-blocking send of a dump line. Respects `dump_mode`.
@@ -167,14 +182,14 @@ impl Diagnostics {
         let Ok(json) = serde_json::to_string(event) else {
             return;
         };
-        let _ = self.sender.try_send(json);
+        let _ = self.dump_tx.try_send(json);
     }
 }
 
 // ── background writer ────────────────────────────────────────────
 
-fn writer_loop(mut receiver: mpsc::Receiver<String>, sink: Sink) {
-    let mut writer: Box<dyn Write + Send> = match &sink {
+fn open_sink(sink: &Sink) -> Box<dyn Write + Send> {
+    match sink {
         Sink::Stderr => Box::new(std::io::stderr()),
         Sink::Stdout => Box::new(std::io::stdout()),
         Sink::File(path) => {
@@ -197,12 +212,35 @@ fn writer_loop(mut receiver: mpsc::Receiver<String>, sink: Sink) {
                 }
             }
         }
+    }
+}
+
+fn writer_loop(mut receiver: mpsc::Receiver<String>, sink: Sink, flush_period: Option<Duration>) {
+    let inner = open_sink(&sink);
+    let mut writer = BufWriter::new(inner);
+
+    let period = match flush_period {
+        Some(p) => p,
+        None => {
+            // Flush every line.
+            while let Some(line) = receiver.blocking_recv() {
+                let _ = writeln!(writer, "{line}");
+                let _ = writer.flush();
+            }
+            return;
+        }
     };
 
+    let mut last_flush = Instant::now();
     while let Some(line) = receiver.blocking_recv() {
         let _ = writeln!(writer, "{line}");
-        let _ = writer.flush();
+        if last_flush.elapsed() >= period {
+            let _ = writer.flush();
+            last_flush = Instant::now();
+        }
     }
+    // Final flush on shutdown.
+    let _ = writer.flush();
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -408,9 +446,10 @@ mod tests {
     #[test]
     fn diagnostic_mode_default_is_off() {
         let config = DiagnosticsConfig::default();
-        assert!(matches!(config.stats, DiagnosticMode::Off));
-        assert!(matches!(config.dump, DiagnosticMode::Off));
-        assert!(matches!(config.output, Sink::Stderr));
+        assert!(matches!(config.stats_mode, DiagnosticMode::Off));
+        assert!(matches!(config.dump_mode, DiagnosticMode::Off));
+        assert!(matches!(config.stats_output, Sink::Stderr));
+        assert!(matches!(config.dump_output, Sink::Stderr));
     }
 
     #[test]

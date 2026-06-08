@@ -2,7 +2,7 @@ upstream_timeout = "3m"
 max_request_body = "2m"
 
 [ollama]
-endpoint_openai = "http://host.docker.internal:11434"
+endpoint_anthropic = "http://host.docker.internal:11434"
 models = "gemma4:31b"
 max_tokens = 10_000
 max_output_tokens = 10_000
@@ -17,3 +17,18 @@ models = ["deepseek-v4-pro", "deepseek-v4-flash"]
 endpoint_openai = "https://api.modelarts-maas.com/openai/v1"
 api_key = "${MAAS_API_KEY}"
 models = "default"
+
+[diagnostics]
+# Куда писать NDJSON статистики: "stderr" (по умолчанию), "stdout", или путь к файлу.
+stats_output = "/app/logs/diag.ndjson"
+
+# Куда писать NDJSON дампа: "stderr" (по умолчанию), "stdout", или путь к файлу.
+dump_output = "/app/logs/dump.ndjson"
+
+# Статистика (сводка по каждому запросу: модель, длительность, количество токенов, разбор сообщений):
+# "off" — не собирать; "error" — только при ошибках; "all" — каждый запрос.
+stats_mode = "all"
+
+# Дамп тел запросов и ответов (для отладки, может быть объёмным):
+# "off" — не дампить; "error" — только при ошибках; "all" — каждый запрос.
+dump_mode = "error"

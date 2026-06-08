@@ -488,6 +488,9 @@ fn anthropic_block_part(block: &anyllm_translate::anthropic::ContentBlock) -> Va
         ContentBlock::RedactedThinking { data } => {
             serde_json::json!({"type": "redacted_thinking", "bytes": data.len()})
         }
+        // Catch-all for forward-compat (ServerToolUse, WebSearchToolResult,
+        // WebFetchToolResult, Unknown added in anyllm_translate 0.9.7+).
+        _ => serde_json::json!({"type": "unknown"}),
     }
 }
 

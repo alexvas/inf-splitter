@@ -55,6 +55,8 @@ pub fn format_sse_event_str(event: &StreamEvent) -> String {
         StreamEvent::MessageStop { .. } => "message_stop",
         StreamEvent::Ping { .. } => "ping",
         StreamEvent::Error { .. } => "error",
+        // Catch-all for forward-compat (e.g. Unknown added in anyllm_translate 0.9.7+).
+        _ => "message",
     };
     format!("event: {event_name}\ndata: {payload}\n\n")
 }

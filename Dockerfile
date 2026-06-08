@@ -2,7 +2,7 @@
 
 FROM rust:1-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     if [ -s /tmp/ca-bundle.crt ]; then \
       cp /tmp/ca-bundle.crt /usr/local/share/ca-certificates/corp-ca.crt; \
     fi; \
-    cargo build --release
+    cargo build --locked --release
 
 FROM debian:bookworm-slim
 RUN apt-get update \

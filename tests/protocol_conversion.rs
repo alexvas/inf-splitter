@@ -6,7 +6,8 @@ use anyllm_translate::anthropic::{Content, MessageCreateRequest};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
 use common::{
     anthropic_upstream_response, openai_upstream_response, spawn_error_upstream, spawn_router,
-    spawn_router_with_diagnostics, spawn_router_with_dump, spawn_stream_upstream, spawn_upstream,
+    spawn_router_with_diagnostics, spawn_router_with_dump, spawn_sse_upstream_with_headers,
+    spawn_stream_upstream, spawn_upstream, wait_for_file,
 };
 use inf_splitter::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
@@ -434,8 +435,7 @@ models = "stream-model"
     );
 }
 
-/// With DUMP_ON_ERROR=1 the passthrough error path must still relay the
-/// correct status and body while writing diagnostic JSON to stderr.
+/// Passthrough error path relays correct status/body while recording diagnostics.
 #[tokio::test]
 async fn dump_on_error_passthrough_does_not_break_response() {
     let upstream_addr = spawn_error_upstream(
@@ -476,9 +476,7 @@ models = "dump-model"
     assert_eq!(body["error"]["message"], "upstream exploded");
 }
 
-/// With DUMP_ON_ERROR=1 the conversion error path must still relay the
-/// correct status and body (and messages_detail is populated from the
-/// typed request).
+/// Conversion error path relays correct status/body with messages_detail from typed request.
 #[tokio::test]
 async fn dump_on_error_conversion_does_not_break_response() {
     let upstream_addr = spawn_error_upstream(
@@ -520,8 +518,7 @@ models = "dump-conv-model"
     assert_eq!(body["error"]["message"], "too busy");
 }
 
-/// With DUMP_ON_ERROR=1 and a stream request that fails at the HTTP level
-/// (non-2xx from upstream), the error relay must still work.
+/// Streaming conversion error path relays correct status/body.
 #[tokio::test]
 async fn dump_on_error_stream_conversion_error_does_not_break_response() {
     let upstream_addr = spawn_error_upstream(
@@ -606,9 +603,7 @@ models = "test-model"
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
     // Give the background writer a moment to flush.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let content = std::fs::read_to_string(&tmp).expect("read stats file");
+    let content = wait_for_file(&tmp).await;
     let _ = std::fs::remove_file(&tmp);
 
     let lines: Vec<&str> = content.trim().lines().collect();
@@ -668,9 +663,7 @@ models = "test-model"
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let content = std::fs::read_to_string(&tmp).expect("read dump file");
+    let content = wait_for_file(&tmp).await;
     let _ = std::fs::remove_file(&tmp);
 
     assert!(!content.trim().is_empty(), "dump file should not be empty");
@@ -758,9 +751,7 @@ models = "fail-model"
         .expect("fail request");
     assert_eq!(err_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let content = std::fs::read_to_string(&tmp).expect("read stats file");
+    let content = wait_for_file(&tmp).await;
     let _ = std::fs::remove_file(&tmp);
 
     let lines: Vec<&str> = content.trim().lines().collect();
@@ -845,9 +836,7 @@ models = "fail-model"
         .expect("fail request");
     assert_eq!(err_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let content = std::fs::read_to_string(&tmp).expect("read dump file");
+    let content = wait_for_file(&tmp).await;
     let _ = std::fs::remove_file(&tmp);
 
     let lines: Vec<&str> = content.trim().lines().collect();
@@ -929,12 +918,10 @@ models = "trans-model"
         .expect("proxy request");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
     // Check stats: must have both ingress and egress message details.
-    let stats_content =
-        std::fs::read_to_string(format!("{}.stats", tmp.display())).expect("read stats");
-    let _ = std::fs::remove_file(format!("{}.stats", tmp.display()));
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_content = wait_for_file(&stats_path).await;
+    let _ = std::fs::remove_file(&stats_path);
     let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
     assert_eq!(stats_lines.len(), 1, "expected exactly one stats line");
     let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
@@ -949,9 +936,9 @@ models = "trans-model"
     );
 
     // Check dump: must have both ingress and egress stage entries.
-    let dump_content =
-        std::fs::read_to_string(format!("{}.dump", tmp.display())).expect("read dump");
-    let _ = std::fs::remove_file(format!("{}.dump", tmp.display()));
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_content = wait_for_file(&dump_path).await;
+    let _ = std::fs::remove_file(&dump_path);
     let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
     assert_unique_requests(&dump_lines);
     // We expect at least "ingress" stage (the original Anthropic body).
@@ -1012,12 +999,10 @@ models = "trans-model"
         .expect("proxy request");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
     // Stats: must have ingress and egress details.
-    let stats_content =
-        std::fs::read_to_string(format!("{}.stats", tmp.display())).expect("read stats");
-    let _ = std::fs::remove_file(format!("{}.stats", tmp.display()));
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_content = wait_for_file(&stats_path).await;
+    let _ = std::fs::remove_file(&stats_path);
     let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
     assert_eq!(stats_lines.len(), 1, "expected exactly one stats line");
     let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
@@ -1026,9 +1011,9 @@ models = "trans-model"
     assert!(stats["messages_detail_egress"].is_array());
 
     // Dump: must have ingress stage.
-    let dump_content =
-        std::fs::read_to_string(format!("{}.dump", tmp.display())).expect("read dump");
-    let _ = std::fs::remove_file(format!("{}.dump", tmp.display()));
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_content = wait_for_file(&dump_path).await;
+    let _ = std::fs::remove_file(&dump_path);
     let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
     assert_unique_requests(&dump_lines);
     let has_ingress = dump_lines.iter().any(|l| {
@@ -1038,6 +1023,469 @@ models = "trans-model"
     assert!(
         has_ingress,
         "translation dump must have ingress stage entries"
+    );
+}
+
+// ── Gap tests: diagnostics coverage on paths that were missing it ──
+
+/// Anthropic passthrough success with `stats_mode = All` and `dump_mode = All`
+/// must write a stats line and at least one dump line.
+#[tokio::test]
+async fn anthropic_passthrough_success_produces_stats_and_dumps() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("ap-model", "reply"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-ap-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "ap-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        dump_mode: DiagnosticMode::All,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "ap-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // Stats
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_content = wait_for_file(&stats_path).await;
+    let _ = std::fs::remove_file(&stats_path);
+    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    assert!(!stats_lines.is_empty(), "expected at least one stats line");
+    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    assert_eq!(stats["direction"], "anthropic->anthropic");
+    assert_eq!(stats["model"], "ap-model");
+    assert_eq!(stats["status"], 200);
+    assert!(stats.get("error").is_none());
+
+    // Dump
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_content = wait_for_file(&dump_path).await;
+    let _ = std::fs::remove_file(&dump_path);
+    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    assert!(
+        !dump_lines.is_empty(),
+        "anthropic passthrough must produce dump lines"
+    );
+    assert_unique_requests(&dump_lines);
+    let has_egress = dump_lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("egress")
+    });
+    assert!(
+        has_egress,
+        "anthropic passthrough dump must have egress stage"
+    );
+}
+
+/// Anthropic passthrough error with `dump_mode = Error` must write a dump line.
+#[tokio::test]
+async fn anthropic_passthrough_error_produces_dumps() {
+    let upstream_addr = spawn_error_upstream(
+        "/v1/messages",
+        axum::http::StatusCode::BAD_GATEWAY,
+        serde_json::json!({"type": "error", "error": {"type": "api_error", "message": "down"}}),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-ape-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "ape-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::Error,
+        dump_mode: DiagnosticMode::Error,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "ape-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    // Stats: must have error
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_content = wait_for_file(&stats_path).await;
+    let _ = std::fs::remove_file(&stats_path);
+    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    assert!(
+        !stats_lines.is_empty(),
+        "expected at least one stats line on error"
+    );
+    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    assert!(stats["error"].is_string());
+
+    // Dump: must have at least egress
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_content = wait_for_file(&dump_path).await;
+    let _ = std::fs::remove_file(&dump_path);
+    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    assert!(
+        !dump_lines.is_empty(),
+        "anthropic passthrough error must produce dump lines"
+    );
+    assert_unique_requests(&dump_lines);
+    let has_egress = dump_lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("egress")
+    });
+    assert!(
+        has_egress,
+        "anthropic passthrough error dump must have egress stage"
+    );
+}
+
+/// OpenAI→Anthropic translation success with `stats_mode = All` must write a
+/// stats line with both messages_detail_ingress and messages_detail_egress.
+#[tokio::test]
+async fn openai_to_anthropic_translation_success_produces_stats_and_dumps() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("oa-model", "reply"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-oa-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "oa-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        dump_mode: DiagnosticMode::All,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "oa-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "translate me"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // Stats
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_content = wait_for_file(&stats_path).await;
+    let _ = std::fs::remove_file(&stats_path);
+    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    assert!(
+        !stats_lines.is_empty(),
+        "translation success must produce stats"
+    );
+    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    assert_eq!(stats["direction"], "openai->anthropic");
+    assert_eq!(stats["status"], 200);
+    assert!(stats.get("error").is_none());
+    assert!(
+        stats["messages_detail_ingress"].is_array(),
+        "translation stats must have messages_detail_ingress"
+    );
+    assert!(
+        stats["messages_detail_egress"].is_array(),
+        "translation stats must have messages_detail_egress"
+    );
+
+    // Dump
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_content = wait_for_file(&dump_path).await;
+    let _ = std::fs::remove_file(&dump_path);
+    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    assert!(
+        !dump_lines.is_empty(),
+        "translation success must produce dump lines"
+    );
+    assert_unique_requests(&dump_lines);
+    let has_ingress = dump_lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("ingress")
+    });
+    assert!(has_ingress, "translation dump must have ingress stage");
+    let has_egress = dump_lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("egress")
+    });
+    assert!(has_egress, "translation dump must have egress stage");
+}
+
+/// Anthropic→OpenAI translation success with `stats_mode = All` must write stats.
+#[tokio::test]
+async fn anthropic_to_openai_translation_success_produces_stats_and_dumps() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/chat/completions",
+        captured,
+        openai_upstream_response("ao-model", "reply"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-ao-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_openai = "http://{upstream_addr}"
+models = "ao-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        dump_mode: DiagnosticMode::All,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "ao-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "translate me"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // Stats
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_content = wait_for_file(&stats_path).await;
+    let _ = std::fs::remove_file(&stats_path);
+    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    assert!(
+        !stats_lines.is_empty(),
+        "translation success must produce stats"
+    );
+    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    assert_eq!(stats["direction"], "anthropic->openai");
+    assert_eq!(stats["status"], 200);
+    assert!(stats.get("error").is_none());
+    assert!(
+        stats["messages_detail_ingress"].is_array(),
+        "translation stats must have messages_detail_ingress"
+    );
+    assert!(
+        stats["messages_detail_egress"].is_array(),
+        "translation stats must have messages_detail_egress"
+    );
+
+    // Dump
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_content = wait_for_file(&dump_path).await;
+    let _ = std::fs::remove_file(&dump_path);
+    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    assert!(
+        !dump_lines.is_empty(),
+        "translation success must produce dump lines"
+    );
+    assert_unique_requests(&dump_lines);
+    let has_ingress = dump_lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("ingress")
+    });
+    assert!(has_ingress, "translation dump must have ingress stage");
+    let has_egress = dump_lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("egress")
+    });
+    assert!(has_egress, "translation dump must have egress stage");
+}
+
+/// Streaming passthrough must record `streaming: true` in stats (not hardcoded false).
+#[tokio::test]
+async fn streaming_passthrough_records_streaming_true_in_stats() {
+    let sse_body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_001\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"stream-model\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":5}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+";
+
+    let upstream_addr = spawn_stream_upstream("/v1/messages", sse_body.to_string()).await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-streaming-{}.ndjson", uuid_suffix()));
+
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "stream-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+
+    let _response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "stream-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    let content = wait_for_file(&tmp).await;
+    let _ = std::fs::remove_file(&tmp);
+
+    let lines: Vec<&str> = content.trim().lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "streaming passthrough must produce stats"
+    );
+
+    let line: serde_json::Value = serde_json::from_str(lines[0]).expect("valid NDJSON");
+    assert_eq!(line["direction"], "anthropic->anthropic");
+    assert_eq!(
+        line["streaming"], true,
+        "streaming field must be true for SSE response"
+    );
+}
+
+// ── Duplicate headers test ──
+
+/// `relay_openai_upstream` must not duplicate `cache-control` or `connection`
+/// headers that the upstream already sends in its SSE response.
+#[tokio::test]
+async fn relay_openai_upstream_does_not_duplicate_sse_headers() {
+    let sse_body = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\ndata: [DONE]\n\n";
+
+    let upstream_addr = spawn_sse_upstream_with_headers(
+        "/v1/chat/completions",
+        sse_body.to_string(),
+        vec![
+            ("cache-control", "private, no-cache".into()),
+            ("connection", "close".into()),
+        ],
+    )
+    .await;
+
+    let config = format!(
+        r#"
+port = 0
+
+[local]
+endpoint_openai = "http://{upstream_addr}"
+models = "dup-model"
+"#
+    );
+
+    let proxy_addr = spawn_router(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "dup-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert!(response.status().is_success());
+
+    // Each header must appear exactly once — not duplicated by the relay function.
+    let cc_vals: Vec<_> = response.headers().get_all("cache-control").iter().collect();
+    assert_eq!(
+        cc_vals.len(),
+        1,
+        "cache-control must not be duplicated, got {cc_vals:?}"
+    );
+
+    let conn_vals: Vec<_> = response.headers().get_all("connection").iter().collect();
+    assert_eq!(
+        conn_vals.len(),
+        1,
+        "connection must not be duplicated, got {conn_vals:?}"
     );
 }
 

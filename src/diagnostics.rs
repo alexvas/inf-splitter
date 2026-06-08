@@ -106,11 +106,22 @@ impl Diagnostics {
         let stats_mode = config.stats_mode.clone();
         let dump_mode = config.dump_mode.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let stats_handle = tokio::task::spawn_blocking(move || {
             writer_loop(stats_rx, config.stats_output, config.flush_period);
         });
-        tokio::task::spawn_blocking(move || {
+        let dump_handle = tokio::task::spawn_blocking(move || {
             writer_loop(dump_rx, config.dump_output, config.flush_period);
+        });
+        // Supervisors: log panics from background writers.
+        tokio::spawn(async move {
+            if let Err(e) = stats_handle.await {
+                tracing::error!("stats writer panicked: {:?}", e);
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = dump_handle.await {
+                tracing::error!("dump writer panicked: {:?}", e);
+            }
         });
 
         Self {
@@ -224,8 +235,14 @@ fn writer_loop(mut receiver: mpsc::Receiver<String>, sink: Sink, flush_period: O
         None => {
             // Flush every line.
             while let Some(line) = receiver.blocking_recv() {
-                let _ = writeln!(writer, "{line}");
-                let _ = writer.flush();
+                if let Err(e) = writeln!(writer, "{line}") {
+                    tracing::error!(error = %e, "diagnostics write error, reopening sink");
+                    writer = BufWriter::new(open_sink(&sink));
+                }
+                if let Err(e) = writer.flush() {
+                    tracing::error!(error = %e, "diagnostics flush error, reopening sink");
+                    writer = BufWriter::new(open_sink(&sink));
+                }
             }
             return;
         }
@@ -233,14 +250,22 @@ fn writer_loop(mut receiver: mpsc::Receiver<String>, sink: Sink, flush_period: O
 
     let mut last_flush = Instant::now();
     while let Some(line) = receiver.blocking_recv() {
-        let _ = writeln!(writer, "{line}");
+        if let Err(e) = writeln!(writer, "{line}") {
+            tracing::error!(error = %e, "diagnostics write error, reopening sink");
+            writer = BufWriter::new(open_sink(&sink));
+        }
         if last_flush.elapsed() >= period {
-            let _ = writer.flush();
+            if let Err(e) = writer.flush() {
+                tracing::error!(error = %e, "diagnostics periodic flush error, reopening sink");
+                writer = BufWriter::new(open_sink(&sink));
+            }
             last_flush = Instant::now();
         }
     }
     // Final flush on shutdown.
-    let _ = writer.flush();
+    if let Err(e) = writer.flush() {
+        tracing::error!(error = %e, "diagnostics final flush error");
+    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────

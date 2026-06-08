@@ -70,7 +70,7 @@ pub async fn spawn_router(config_toml: &str) -> SocketAddr {
     bind_and_serve(app).await.0
 }
 
-/// Like `spawn_router` but with `stats = "error"` in the diagnostics config.
+/// Like `spawn_router` but with `stats_mode = "error"` in the diagnostics config.
 pub async fn spawn_router_with_dump(config_toml: &str) -> SocketAddr {
     let mut config = Config::load_from_str(config_toml).expect("test config");
     config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");
@@ -139,6 +139,52 @@ pub async fn spawn_stream_upstream(path: &'static str, sse_body: String) -> Sock
                 .header(header::CACHE_CONTROL, "no-cache")
                 .body(Body::from(sse_body.clone()))
                 .unwrap()
+        }),
+    );
+    bind_and_serve(app).await.0
+}
+
+/// Poll a file until it exists and has non-empty content, with a timeout.
+pub async fn wait_for_file(path: &std::path::Path) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if !content.trim().is_empty() {
+                return content;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("timed out waiting for diagnostics file: {}", path.display());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Spawn an upstream that returns an SSE stream with custom headers.
+pub async fn spawn_sse_upstream_with_headers(
+    path: &'static str,
+    sse_body: String,
+    extra_headers: Vec<(&'static str, String)>,
+) -> SocketAddr {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+
+    let app = Router::new().route(
+        path,
+        post(move || {
+            let body = sse_body.clone();
+            let extra_headers = extra_headers.clone();
+            async move {
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream");
+                for (name, value) in &extra_headers {
+                    builder = builder.header(*name, value.as_str());
+                }
+                builder.body(Body::from(body)).unwrap()
+            }
         }),
     );
     bind_and_serve(app).await.0

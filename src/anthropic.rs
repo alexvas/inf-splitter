@@ -56,15 +56,18 @@ impl AnthropicHandler {
         let request_size = body.len();
         let model = crate::peek_model_from_json(&body);
         let messages_detail = crate::diagnostics::messages_detail_from_bytes(&body);
+        let original_body = body.clone();
         let body = Bytes::from(crate::apply_token_caps(&body, route)?);
+        let egress_body = body.clone();
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let upstream = builder.body(body).send().await?;
         if !upstream.status().is_success() && !sse::is_event_stream(upstream.headers()) {
             let status = upstream.status();
             let response_headers = copy_response_headers(upstream.headers());
             let error_body = upstream.text().await.unwrap_or_default();
+            let request_id = self.diagnostics.new_request_id();
             self.diagnostics.record_stats(&StatsEvent {
-                request_id: self.diagnostics.new_request_id(),
+                request_id: request_id.clone(),
                 ts: crate::diagnostics::ts_string(),
                 direction: "anthropic->anthropic".into(),
                 model: model.clone(),
@@ -80,6 +83,52 @@ impl AnthropicHandler {
                 messages_detail_egress: messages_detail.clone(),
                 error: Some(error_body.clone()),
             });
+            // Egress dump: body sent upstream after token caps.
+            if let Ok(body_str) = String::from_utf8(egress_body.to_vec()) {
+                self.diagnostics.record_dump(
+                    &crate::diagnostics::DumpEvent {
+                        request_id: request_id.clone(),
+                        ts: crate::diagnostics::ts_string(),
+                        stage: "egress".into(),
+                        direction: "request".into(),
+                        model: model.clone(),
+                        headers: request_headers
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                v.to_str()
+                                    .ok()
+                                    .map(|val| (k.as_str().to_string(), val.to_string()))
+                            })
+                            .collect(),
+                        body: body_str,
+                        status: None,
+                    },
+                    true,
+                );
+            }
+            // Ingress dump: original client body before token caps.
+            if let Ok(body_str) = String::from_utf8(original_body.to_vec()) {
+                self.diagnostics.record_dump(
+                    &crate::diagnostics::DumpEvent {
+                        request_id,
+                        ts: crate::diagnostics::ts_string(),
+                        stage: "ingress".into(),
+                        direction: "request".into(),
+                        model: model.clone(),
+                        headers: request_headers
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                v.to_str()
+                                    .ok()
+                                    .map(|val| (k.as_str().to_string(), val.to_string()))
+                            })
+                            .collect(),
+                        body: body_str,
+                        status: None,
+                    },
+                    true,
+                );
+            }
             let sc = axum::http::StatusCode::from_u16(status.as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
             let mut response = axum::response::Response::builder()
@@ -93,23 +142,48 @@ impl AnthropicHandler {
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
         let relayed = relay_upstream_response(upstream).await?;
+        let is_streaming = sse::is_event_stream(relayed.headers());
+        let request_id = self.diagnostics.new_request_id();
         self.diagnostics.record_stats(&StatsEvent {
-            request_id: self.diagnostics.new_request_id(),
+            request_id: request_id.clone(),
             ts: crate::diagnostics::ts_string(),
             direction: "anthropic->anthropic".into(),
-            model,
+            model: model.clone(),
             upstream: anthropic_endpoint.into(),
             status: relayed.status().as_u16(),
             duration_ms: 0,
             request_size_bytes: request_size,
             response_size_bytes: None,
-            streaming: false,
+            streaming: is_streaming,
             input_messages: None,
             max_tokens: None,
             messages_detail_ingress: None,
             messages_detail_egress: messages_detail,
             error: None,
         });
+        // Egress dump: body sent upstream after token caps.
+        if let Ok(body_str) = String::from_utf8(egress_body.to_vec()) {
+            self.diagnostics.record_dump(
+                &crate::diagnostics::DumpEvent {
+                    request_id,
+                    ts: crate::diagnostics::ts_string(),
+                    stage: "egress".into(),
+                    direction: "request".into(),
+                    model,
+                    headers: request_headers
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            v.to_str()
+                                .ok()
+                                .map(|val| (k.as_str().to_string(), val.to_string()))
+                        })
+                        .collect(),
+                    body: body_str,
+                    status: Some(relayed.status().as_u16()),
+                },
+                false,
+            );
+        }
         Ok(relayed)
     }
 
@@ -161,6 +235,13 @@ impl AnthropicHandler {
         let anthropic_req = translate_openai_to_anthropic_request(&openai_req, &mut warnings)
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
 
+        let messages_detail_ingress = Some(crate::diagnostics::openai_messages_detail(&openai_req));
+        let messages_detail_egress = Some(crate::diagnostics::anthropic_messages_detail(
+            &anthropic_req,
+        ));
+        let ingress_str = serde_json::to_string(&openai_req).ok();
+        let egress_str = serde_json::to_string(&anthropic_req).ok();
+
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let upstream = builder.json(&anthropic_req).send().await?;
 
@@ -184,15 +265,11 @@ impl AnthropicHandler {
                 streaming: false,
                 input_messages: Some(openai_req.messages.len()),
                 max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
-                messages_detail_ingress: Some(crate::diagnostics::openai_messages_detail(
-                    &openai_req,
-                )),
-                messages_detail_egress: Some(crate::diagnostics::anthropic_messages_detail(
-                    &anthropic_req,
-                )),
+                messages_detail_ingress: messages_detail_ingress.clone(),
+                messages_detail_egress: messages_detail_egress.clone(),
                 error: Some(error_body.clone()),
             });
-            if let Ok(ingress_str) = serde_json::to_string(&openai_req) {
+            if let Some(ref s) = ingress_str {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
                         request_id: request_id.clone(),
@@ -208,13 +285,13 @@ impl AnthropicHandler {
                                     .map(|val| (k.as_str().to_string(), val.to_string()))
                             })
                             .collect(),
-                        body: ingress_str,
+                        body: s.clone(),
                         status: None,
                     },
                     true,
                 );
             }
-            if let Ok(egress_str) = serde_json::to_string(&anthropic_req) {
+            if let Some(ref s) = egress_str {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
                         request_id,
@@ -223,7 +300,7 @@ impl AnthropicHandler {
                         direction: "request".into(),
                         model: openai_req.model.clone(),
                         headers: Vec::new(),
-                        body: egress_str,
+                        body: s.clone(),
                         status: None,
                     },
                     true,
@@ -235,6 +312,63 @@ impl AnthropicHandler {
         let anthropic_resp: MessageResponse = upstream.json().await?;
         let openai_resp =
             translate_anthropic_to_openai_response(&anthropic_resp, &openai_req.model);
+
+        // Success diagnostics.
+        let request_id = self.diagnostics.new_request_id();
+        self.diagnostics.record_stats(&StatsEvent {
+            request_id: request_id.clone(),
+            ts: crate::diagnostics::ts_string(),
+            direction: "openai->anthropic".into(),
+            model: openai_req.model.clone(),
+            upstream: anthropic_endpoint.into(),
+            status: 200,
+            duration_ms: 0,
+            request_size_bytes: request_size,
+            response_size_bytes: None,
+            streaming: false,
+            input_messages: Some(openai_req.messages.len()),
+            max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
+            messages_detail_ingress,
+            messages_detail_egress,
+            error: None,
+        });
+        if let Some(ingress_str) = ingress_str {
+            self.diagnostics.record_dump(
+                &crate::diagnostics::DumpEvent {
+                    request_id: request_id.clone(),
+                    ts: crate::diagnostics::ts_string(),
+                    stage: "ingress".into(),
+                    direction: "request".into(),
+                    model: openai_req.model.clone(),
+                    headers: request_headers
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            v.to_str()
+                                .ok()
+                                .map(|val| (k.as_str().to_string(), val.to_string()))
+                        })
+                        .collect(),
+                    body: ingress_str,
+                    status: None,
+                },
+                false,
+            );
+        }
+        if let Some(egress_str) = egress_str {
+            self.diagnostics.record_dump(
+                &crate::diagnostics::DumpEvent {
+                    request_id,
+                    ts: crate::diagnostics::ts_string(),
+                    stage: "egress".into(),
+                    direction: "request".into(),
+                    model: openai_req.model,
+                    headers: Vec::new(),
+                    body: egress_str,
+                    status: None,
+                },
+                false,
+            );
+        }
         Ok((StatusCode::OK, axum::Json(openai_resp)).into_response())
     }
 
@@ -250,6 +384,13 @@ impl AnthropicHandler {
         let mut anthropic_req = translate_openai_to_anthropic_request(openai_req, &mut warnings)
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
         anthropic_req.stream = Some(true);
+
+        let messages_detail_ingress = Some(crate::diagnostics::openai_messages_detail(openai_req));
+        let messages_detail_egress = Some(crate::diagnostics::anthropic_messages_detail(
+            &anthropic_req,
+        ));
+        let ingress_str = serde_json::to_string(openai_req).ok();
+        let egress_str = serde_json::to_string(&anthropic_req).ok();
 
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let upstream = builder.json(&anthropic_req).send().await?;
@@ -274,15 +415,11 @@ impl AnthropicHandler {
                 streaming: true,
                 input_messages: Some(openai_req.messages.len()),
                 max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
-                messages_detail_ingress: Some(crate::diagnostics::openai_messages_detail(
-                    openai_req,
-                )),
-                messages_detail_egress: Some(crate::diagnostics::anthropic_messages_detail(
-                    &anthropic_req,
-                )),
+                messages_detail_ingress: messages_detail_ingress.clone(),
+                messages_detail_egress: messages_detail_egress.clone(),
                 error: Some(error_body.clone()),
             });
-            if let Ok(ingress_str) = serde_json::to_string(&openai_req) {
+            if let Some(ref s) = ingress_str {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
                         request_id: request_id.clone(),
@@ -298,13 +435,13 @@ impl AnthropicHandler {
                                     .map(|val| (k.as_str().to_string(), val.to_string()))
                             })
                             .collect(),
-                        body: ingress_str,
+                        body: s.clone(),
                         status: None,
                     },
                     true,
                 );
             }
-            if let Ok(egress_str) = serde_json::to_string(&anthropic_req) {
+            if let Some(ref s) = egress_str {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
                         request_id,
@@ -313,7 +450,7 @@ impl AnthropicHandler {
                         direction: "request".into(),
                         model: openai_req.model.clone(),
                         headers: Vec::new(),
-                        body: egress_str,
+                        body: s.clone(),
                         status: None,
                     },
                     true,
@@ -410,6 +547,63 @@ impl AnthropicHandler {
                 }
             },
         );
+
+        // Success diagnostics: recorded before returning the stream.
+        let request_id = self.diagnostics.new_request_id();
+        self.diagnostics.record_stats(&StatsEvent {
+            request_id: request_id.clone(),
+            ts: crate::diagnostics::ts_string(),
+            direction: "openai->anthropic".into(),
+            model: openai_req.model.clone(),
+            upstream: anthropic_endpoint.into(),
+            status: 200,
+            duration_ms: 0,
+            request_size_bytes: request_size,
+            response_size_bytes: None,
+            streaming: true,
+            input_messages: Some(openai_req.messages.len()),
+            max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
+            messages_detail_ingress,
+            messages_detail_egress,
+            error: None,
+        });
+        if let Some(ingress_str) = ingress_str {
+            self.diagnostics.record_dump(
+                &crate::diagnostics::DumpEvent {
+                    request_id: request_id.clone(),
+                    ts: crate::diagnostics::ts_string(),
+                    stage: "ingress".into(),
+                    direction: "request".into(),
+                    model: openai_req.model.clone(),
+                    headers: request_headers
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            v.to_str()
+                                .ok()
+                                .map(|val| (k.as_str().to_string(), val.to_string()))
+                        })
+                        .collect(),
+                    body: ingress_str,
+                    status: None,
+                },
+                false,
+            );
+        }
+        if let Some(egress_str) = egress_str {
+            self.diagnostics.record_dump(
+                &crate::diagnostics::DumpEvent {
+                    request_id,
+                    ts: crate::diagnostics::ts_string(),
+                    stage: "egress".into(),
+                    direction: "request".into(),
+                    model: openai_req.model.clone(),
+                    headers: Vec::new(),
+                    body: egress_str,
+                    status: None,
+                },
+                false,
+            );
+        }
 
         sse::sse_response(request_headers, sse_stream)
     }

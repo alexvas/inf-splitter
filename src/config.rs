@@ -77,27 +77,9 @@ const DEFAULT_MAX_REQUEST_BODY: &str = "2m";
 struct DiagnosticsConfigRaw {
     stats_output: Option<String>,
     dump_output: Option<String>,
-    stats_mode: Option<DiagnosticModeField>,
-    dump_mode: Option<DiagnosticModeField>,
+    stats_mode: Option<DiagnosticMode>,
+    dump_mode: Option<DiagnosticMode>,
     flush_period: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum DiagnosticModeField {
-    Off,
-    Error,
-    All,
-}
-
-impl From<DiagnosticModeField> for DiagnosticMode {
-    fn from(f: DiagnosticModeField) -> Self {
-        match f {
-            DiagnosticModeField::Off => DiagnosticMode::Off,
-            DiagnosticModeField::Error => DiagnosticMode::Error,
-            DiagnosticModeField::All => DiagnosticMode::All,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,14 +182,8 @@ impl Config {
             Some(raw) => DiagnosticsConfig {
                 stats_output: sink_from_str(raw.stats_output.as_deref()),
                 dump_output: sink_from_str(raw.dump_output.as_deref()),
-                stats_mode: raw
-                    .stats_mode
-                    .map(DiagnosticMode::from)
-                    .unwrap_or(DiagnosticMode::Off),
-                dump_mode: raw
-                    .dump_mode
-                    .map(DiagnosticMode::from)
-                    .unwrap_or(DiagnosticMode::Off),
+                stats_mode: raw.stats_mode.unwrap_or(DiagnosticMode::Off),
+                dump_mode: raw.dump_mode.unwrap_or(DiagnosticMode::Off),
                 flush_period: raw
                     .flush_period
                     .as_deref()
@@ -503,7 +479,7 @@ fn parse_models(name: &str, models: ModelsField) -> Result<(bool, HashSet<String
 }
 
 fn sink_from_str(raw: Option<&str>) -> Sink {
-    match raw {
+    match raw.map(str::trim) {
         Some("stdout") => Sink::Stdout,
         Some("stderr") | None => Sink::Stderr,
         Some(path) => Sink::File(path.into()),

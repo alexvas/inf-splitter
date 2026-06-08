@@ -18,8 +18,10 @@ use reqwest::RequestBuilder;
 
 use crate::auth::forward_request_headers;
 use crate::config::RouteTarget;
-use crate::diagnostics::{Diagnostics, StatsEvent};
+use crate::diagnostics::{Diagnostics, DumpEvent, StatsEvent};
 use crate::error::AppError;
+use crate::relay::cap_openai_max_tokens;
+use crate::relay::{DiagnosticStream, RelayContext};
 use crate::sse;
 
 #[derive(Clone)]
@@ -153,9 +155,17 @@ impl AnthropicHandler {
                 .body(axum::body::Body::from(error_body))
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
-        let relayed = relay_upstream_response(upstream).await?;
-        let is_streaming = sse::is_event_stream(relayed.headers());
         let request_id = self.diagnostics.new_request_id();
+        let relayed = relay_upstream_response(
+            upstream,
+            Some(RelayContext {
+                diagnostics: &self.diagnostics,
+                request_id: request_id.clone(),
+                model: model.clone(),
+            }),
+        )
+        .await?;
+        let is_streaming = sse::is_event_stream(relayed.headers());
         self.diagnostics.record_stats(&StatsEvent {
             request_id: request_id.clone(),
             ts: crate::diagnostics::ts_string(),
@@ -710,7 +720,10 @@ fn relay_error_body(
         .map_err(|err| AppError::Internal(err.to_string()))
 }
 
-async fn relay_upstream_response(upstream: reqwest::Response) -> Result<Response, AppError> {
+async fn relay_upstream_response(
+    upstream: reqwest::Response,
+    ctx: Option<RelayContext<'_>>,
+) -> Result<Response, AppError> {
     let status = upstream.status();
     let response_headers = copy_response_headers(upstream.headers());
 
@@ -718,34 +731,89 @@ async fn relay_upstream_response(upstream: reqwest::Response) -> Result<Response
         let stream = upstream
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
-        let mut response = Response::builder().status(status);
-        for (name, value) in &response_headers {
-            response = response.header(name.as_str(), value.as_str());
+        if let Some(ctx) = ctx {
+            let stream = DiagnosticStream {
+                inner: stream,
+                buffer: Vec::new(),
+                diagnostics: ctx.diagnostics.clone(),
+                request_id: ctx.request_id,
+                model: ctx.model,
+                response_headers: response_headers.clone(),
+                status: status.as_u16(),
+                dumped: false,
+            };
+            let mut response = Response::builder().status(status);
+            for (name, value) in &response_headers {
+                response = response.header(name.as_str(), value.as_str());
+            }
+            if !response_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            {
+                response = response.header(header::CONTENT_TYPE, "text/event-stream");
+            }
+            if !response_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+            {
+                response = response.header(header::CACHE_CONTROL, "no-cache");
+            }
+            if !response_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+            {
+                response = response.header(header::CONNECTION, "keep-alive");
+            }
+            return response
+                .body(Body::from_stream(stream))
+                .map_err(|err| AppError::Internal(err.to_string()));
+        } else {
+            let mut response = Response::builder().status(status);
+            for (name, value) in &response_headers {
+                response = response.header(name.as_str(), value.as_str());
+            }
+            if !response_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            {
+                response = response.header(header::CONTENT_TYPE, "text/event-stream");
+            }
+            if !response_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+            {
+                response = response.header(header::CACHE_CONTROL, "no-cache");
+            }
+            if !response_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+            {
+                response = response.header(header::CONNECTION, "keep-alive");
+            }
+            return response
+                .body(Body::from_stream(stream))
+                .map_err(|err| AppError::Internal(err.to_string()));
         }
-        if !response_headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        {
-            response = response.header(header::CONTENT_TYPE, "text/event-stream");
-        }
-        if !response_headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
-        {
-            response = response.header(header::CACHE_CONTROL, "no-cache");
-        }
-        if !response_headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
-        {
-            response = response.header(header::CONNECTION, "keep-alive");
-        }
-        return response
-            .body(Body::from_stream(stream))
-            .map_err(|err| AppError::Internal(err.to_string()));
     }
 
     let body = upstream.bytes().await?;
+    if let Some(ctx) = ctx {
+        if let Ok(body_str) = String::from_utf8(body.to_vec()) {
+            ctx.diagnostics.record_dump(
+                &DumpEvent {
+                    request_id: ctx.request_id,
+                    ts: crate::diagnostics::ts_string(),
+                    stage: "egress".into(),
+                    direction: "response".into(),
+                    model: ctx.model,
+                    headers: response_headers.clone(),
+                    body: body_str,
+                    status: Some(status.as_u16()),
+                },
+                false,
+            );
+        }
+    }
     let mut response = Response::builder().status(status);
     for (name, value) in response_headers {
         response = response.header(name, value);
@@ -782,140 +850,9 @@ fn copy_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Apply per-route token caps to an OpenAI `ChatCompletionRequest`.
-///
-/// Only for **OpenAI egress paths**: passthrough to an OpenAI upstream, or
-/// Anthropic-to-OpenAI translation. Mutates the request in place, clamping or
-/// setting `max_tokens`, `max_completion_tokens`, and `max_output_tokens`
-/// (via `extra`) to the route's configured limits.
-pub(crate) fn cap_openai_max_tokens(req: &mut ChatCompletionRequest, route: &RouteTarget) {
-    if let Some(limit) = route.max_tokens {
-        match req.max_tokens {
-            Some(existing) if existing > limit => req.max_tokens = Some(limit),
-            None => req.max_tokens = Some(limit),
-            _ => {}
-        }
-    }
-    if let Some(limit) = route.max_completion_tokens {
-        match req.max_completion_tokens {
-            Some(existing) if existing > limit => req.max_completion_tokens = Some(limit),
-            None => req.max_completion_tokens = Some(limit),
-            _ => {}
-        }
-    }
-    if let Some(limit) = route.max_output_tokens {
-        match req.extra.get("max_output_tokens").and_then(|v| v.as_u64()) {
-            Some(existing) if existing > limit as u64 => {
-                req.extra
-                    .insert("max_output_tokens".to_string(), serde_json::json!(limit));
-            }
-            None => {
-                req.extra
-                    .insert("max_output_tokens".to_string(), serde_json::json!(limit));
-            }
-            _ => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-
-    fn empty_route() -> RouteTarget {
-        RouteTarget {
-            section: "test".into(),
-            endpoint_openai: None,
-            endpoint_anthropic: None,
-            api_key: None,
-            max_tokens: None,
-            max_output_tokens: None,
-            max_completion_tokens: None,
-            model_names: HashSet::new(),
-        }
-    }
-
-    fn make_openai_req() -> ChatCompletionRequest {
-        serde_json::from_value(serde_json::json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn cap_openai_max_tokens_sets_missing() {
-        let mut req = make_openai_req();
-        let mut route = empty_route();
-        route.max_tokens = Some(1024);
-        cap_openai_max_tokens(&mut req, &route);
-        assert_eq!(req.max_tokens, Some(1024));
-    }
-
-    #[test]
-    fn cap_openai_max_tokens_clamps_exceeding() {
-        let mut req = make_openai_req();
-        req.max_tokens = Some(4096);
-        let mut route = empty_route();
-        route.max_tokens = Some(1024);
-        cap_openai_max_tokens(&mut req, &route);
-        assert_eq!(req.max_tokens, Some(1024));
-    }
-
-    #[test]
-    fn cap_openai_max_tokens_leaves_below() {
-        let mut req = make_openai_req();
-        req.max_tokens = Some(512);
-        let mut route = empty_route();
-        route.max_tokens = Some(1024);
-        cap_openai_max_tokens(&mut req, &route);
-        assert_eq!(req.max_tokens, Some(512));
-    }
-
-    #[test]
-    fn cap_openai_max_completion_tokens_sets_missing() {
-        let mut req = make_openai_req();
-        let mut route = empty_route();
-        route.max_completion_tokens = Some(2048);
-        cap_openai_max_tokens(&mut req, &route);
-        assert_eq!(req.max_completion_tokens, Some(2048));
-    }
-
-    #[test]
-    fn cap_openai_max_output_tokens_sets_missing_via_extra() {
-        let mut req = make_openai_req();
-        let mut route = empty_route();
-        route.max_output_tokens = Some(500);
-        cap_openai_max_tokens(&mut req, &route);
-        assert_eq!(
-            req.extra.get("max_output_tokens").and_then(|v| v.as_u64()),
-            Some(500)
-        );
-    }
-
-    #[test]
-    fn cap_openai_max_output_tokens_clamps_exceeding() {
-        let mut req = make_openai_req();
-        req.extra
-            .insert("max_output_tokens".into(), serde_json::json!(1000u64));
-        let mut route = empty_route();
-        route.max_output_tokens = Some(500);
-        cap_openai_max_tokens(&mut req, &route);
-        assert_eq!(
-            req.extra.get("max_output_tokens").and_then(|v| v.as_u64()),
-            Some(500)
-        );
-    }
-
-    #[test]
-    fn cap_openai_no_limits_leaves_unchanged() {
-        let mut req = make_openai_req();
-        req.max_tokens = Some(4096);
-        let route = empty_route();
-        cap_openai_max_tokens(&mut req, &route);
-        assert_eq!(req.max_tokens, Some(4096));
-    }
 
     #[test]
     fn copy_response_headers_filters_to_whitelist() {

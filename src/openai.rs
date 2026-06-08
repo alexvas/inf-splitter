@@ -11,11 +11,12 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
-use crate::anthropic::cap_openai_max_tokens;
 use crate::auth::forward_request_headers;
 use crate::config::{Config, RouteTarget};
-use crate::diagnostics::{Diagnostics, StatsEvent};
+use crate::diagnostics::{Diagnostics, DumpEvent, StatsEvent};
 use crate::error::AppError;
+use crate::relay::cap_openai_max_tokens;
+use crate::relay::{DiagnosticStream, RelayContext};
 use crate::sse;
 
 #[derive(Clone)]
@@ -201,9 +202,17 @@ impl OpenAiHandler {
                 .body(Body::from(error_body))
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
-        let relayed = relay_openai_upstream(upstream).await?;
-        let is_streaming = sse::is_event_stream(relayed.headers());
         let request_id = self.diagnostics.new_request_id();
+        let relayed = relay_openai_upstream(
+            upstream,
+            Some(RelayContext {
+                diagnostics: &self.diagnostics,
+                request_id: request_id.clone(),
+                model: model.clone(),
+            }),
+        )
+        .await?;
+        let is_streaming = sse::is_event_stream(relayed.headers());
         self.diagnostics.record_stats(&StatsEvent {
             request_id: request_id.clone(),
             ts: crate::diagnostics::ts_string(),
@@ -729,7 +738,10 @@ fn relay_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, AppError> {
+async fn relay_openai_upstream(
+    upstream: reqwest::Response,
+    ctx: Option<RelayContext<'_>>,
+) -> Result<Response, AppError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let relay_headers = relay_response_headers(&headers);
@@ -738,6 +750,43 @@ async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, 
         let stream = upstream
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
+        if let Some(ctx) = ctx {
+            let stream = DiagnosticStream {
+                inner: stream,
+                buffer: Vec::new(),
+                diagnostics: ctx.diagnostics.clone(),
+                request_id: ctx.request_id,
+                model: ctx.model,
+                response_headers: relay_headers.clone(),
+                status: status.as_u16(),
+                dumped: false,
+            };
+            let mut response = Response::builder().status(status);
+            for (name, value) in &relay_headers {
+                response = response.header(name.as_str(), value.as_str());
+            }
+            if !relay_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            {
+                response = response.header(header::CONTENT_TYPE, "text/event-stream");
+            }
+            if !relay_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+            {
+                response = response.header(header::CACHE_CONTROL, "no-cache");
+            }
+            if !relay_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+            {
+                response = response.header(header::CONNECTION, "keep-alive");
+            }
+            return response
+                .body(Body::from_stream(stream))
+                .map_err(|err| AppError::Internal(err.to_string()));
+        }
         let mut response = Response::builder().status(status);
         for (name, value) in &relay_headers {
             response = response.header(name.as_str(), value.as_str());
@@ -766,6 +815,23 @@ async fn relay_openai_upstream(upstream: reqwest::Response) -> Result<Response, 
     }
 
     let body = upstream.bytes().await?;
+    if let Some(ctx) = ctx {
+        if let Ok(body_str) = String::from_utf8(body.to_vec()) {
+            ctx.diagnostics.record_dump(
+                &DumpEvent {
+                    request_id: ctx.request_id,
+                    ts: crate::diagnostics::ts_string(),
+                    stage: "egress".into(),
+                    direction: "response".into(),
+                    model: ctx.model,
+                    headers: relay_headers.clone(),
+                    body: body_str,
+                    status: Some(status.as_u16()),
+                },
+                false,
+            );
+        }
+    }
     let mut response = Response::builder().status(status);
     for (name, value) in relay_headers {
         response = response.header(name, value);

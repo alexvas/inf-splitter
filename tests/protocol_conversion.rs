@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use anyllm_translate::anthropic::{Content, MessageCreateRequest};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
 use common::{
-    anthropic_upstream_response, openai_upstream_response, spawn_error_upstream, spawn_router,
-    spawn_router_with_diagnostics, spawn_router_with_dump, spawn_sse_upstream_with_headers,
-    spawn_stream_upstream, spawn_upstream, wait_for_file,
+    anthropic_upstream_response, openai_upstream_response, spawn_delayed_upstream,
+    spawn_error_upstream, spawn_router, spawn_router_with_diagnostics, spawn_router_with_dump,
+    spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream, wait_for_file,
 };
 use inf_splitter::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
@@ -614,7 +614,10 @@ models = "test-model"
     assert_eq!(line["direction"], "openai->openai");
     assert_eq!(line["model"], "test-model");
     assert_eq!(line["status"], 200);
-    assert!(line["duration_ms"].as_u64().is_some());
+    assert!(
+        line["duration_ms"].as_u64().is_some(),
+        "duration_ms must be present (may be 0 for in-process mock upstreams)"
+    );
     assert!(line["messages_detail_egress"].is_array());
     assert!(line.get("error").is_none());
 }
@@ -764,6 +767,15 @@ models = "fail-model"
     let line: serde_json::Value = serde_json::from_str(lines[0]).expect("valid NDJSON");
     assert_eq!(line["model"], "fail-model");
     assert!(line["error"].is_string());
+    assert!(
+        line["duration_ms"].as_u64().is_some(),
+        "duration_ms must be present (may be 0 for in-process mock upstreams)"
+    );
+    assert!(
+        line["response_size_bytes"].as_u64().is_some(),
+        "response_size_bytes must be populated on error, got {:?}",
+        line["response_size_bytes"]
+    );
 }
 
 /// With `dump_mode = "error"` and file output, a successful request writes
@@ -934,7 +946,14 @@ models = "trans-model"
         stats["messages_detail_egress"].is_array(),
         "translation stats must have messages_detail_egress"
     );
-
+    assert!(
+        stats["duration_ms"].as_u64().is_some(),
+        "translation error stats must have duration_ms populated"
+    );
+    assert!(
+        stats["response_size_bytes"].as_u64().is_some(),
+        "translation error stats must have response_size_bytes set"
+    );
     // Check dump: must have both ingress and egress stage entries.
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
     let dump_content = wait_for_file(&dump_path).await;
@@ -1009,6 +1028,14 @@ models = "trans-model"
     assert_eq!(stats["direction"], "openai->anthropic");
     assert!(stats["messages_detail_ingress"].is_array());
     assert!(stats["messages_detail_egress"].is_array());
+    assert!(
+        stats["duration_ms"].as_u64().is_some(),
+        "translation error stats must have duration_ms populated"
+    );
+    assert!(
+        stats["response_size_bytes"].as_u64().is_some(),
+        "translation error stats must have response_size_bytes set"
+    );
 
     // Dump: must have ingress stage.
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
@@ -1085,6 +1112,10 @@ models = "ap-model"
     assert_eq!(stats["model"], "ap-model");
     assert_eq!(stats["status"], 200);
     assert!(stats.get("error").is_none());
+    assert!(
+        stats["duration_ms"].as_u64().is_some(),
+        "success stats must have duration_ms populated"
+    );
 
     // Dump
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
@@ -1161,6 +1192,14 @@ models = "ape-model"
     );
     let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
     assert!(stats["error"].is_string());
+    assert!(
+        stats["duration_ms"].as_u64().is_some(),
+        "duration_ms must be present (may be 0 for in-process mock upstreams)"
+    );
+    assert!(
+        stats["response_size_bytes"].as_u64().is_some(),
+        "error stats must have response_size_bytes set"
+    );
 
     // Dump: must have at least egress
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
@@ -1241,6 +1280,10 @@ models = "oa-model"
     assert_eq!(stats["direction"], "openai->anthropic");
     assert_eq!(stats["status"], 200);
     assert!(stats.get("error").is_none());
+    assert!(
+        stats["duration_ms"].as_u64().is_some(),
+        "translation success stats must have duration_ms populated"
+    );
     assert!(
         stats["messages_detail_ingress"].is_array(),
         "translation stats must have messages_detail_ingress"
@@ -1330,6 +1373,10 @@ models = "ao-model"
     assert_eq!(stats["direction"], "anthropic->openai");
     assert_eq!(stats["status"], 200);
     assert!(stats.get("error").is_none());
+    assert!(
+        stats["duration_ms"].as_u64().is_some(),
+        "translation success stats must have duration_ms populated"
+    );
     assert!(
         stats["messages_detail_ingress"].is_array(),
         "translation stats must have messages_detail_ingress"
@@ -1427,6 +1474,68 @@ models = "stream-model"
         line["streaming"], true,
         "streaming field must be true for SSE response"
     );
+    assert!(
+        line["duration_ms"].as_u64().is_some(),
+        "streaming stats must have duration_ms populated"
+    );
+}
+
+// ── Timing test ──
+
+/// With a delayed upstream, `duration_ms` must be strictly positive,
+/// proving the timing instrumentation is actually wired up (not just
+/// the field exists with a zero sentinel).
+#[tokio::test]
+async fn delayed_upstream_produces_nonzero_duration_ms() {
+    let upstream_addr = spawn_delayed_upstream(
+        "/v1/chat/completions",
+        std::time::Duration::from_millis(5),
+        openai_upstream_response("timed-model", "slow reply"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-timing-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+port = 0
+
+[local]
+endpoint_openai = "http://{upstream_addr}"
+models = "timed-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "timed-model",
+            "messages": [{"role": "user", "content": "ping"}]
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let content = wait_for_file(&tmp).await;
+    let _ = std::fs::remove_file(&tmp);
+    let stats: serde_json::Value =
+        serde_json::from_str(content.trim().lines().next().unwrap()).expect("valid NDJSON");
+
+    let duration = stats["duration_ms"]
+        .as_u64()
+        .expect("duration_ms must be present");
+    assert!(
+        duration > 0,
+        "duration_ms must be > 0 with a 5 ms delayed upstream, got {duration}"
+    );
 }
 
 // ── Duplicate headers test ──
@@ -1486,6 +1595,116 @@ models = "dup-model"
         conn_vals.len(),
         1,
         "connection must not be duplicated, got {conn_vals:?}"
+    );
+}
+
+/// OpenAI passthrough error must produce an ingress dump (not just egress).
+#[tokio::test]
+async fn openai_passthrough_error_produces_ingress_dump() {
+    let upstream_addr = spawn_error_upstream(
+        "/v1/chat/completions",
+        reqwest::StatusCode::BAD_GATEWAY,
+        serde_json::json!({"error": "ingress-test"}),
+    )
+    .await;
+
+    let tmp =
+        std::env::temp_dir().join(format!("inf-splitter-oi-ingress-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+port = 0
+
+[local]
+endpoint_openai = "http://{upstream_addr}"
+models = "oi-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::Error,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+    let _resp = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "oi-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    let content = wait_for_file(&tmp).await;
+    let _ = std::fs::remove_file(&tmp);
+    let has_ingress = content.lines().any(|l| {
+        serde_json::from_str::<serde_json::Value>(l)
+            .ok()
+            .and_then(|v| v["stage"].as_str().map(|s| s == "ingress"))
+            .unwrap_or(false)
+    });
+    assert!(
+        has_ingress,
+        "openai passthrough error must produce ingress dump"
+    );
+}
+
+/// Anthropic passthrough success must produce an ingress dump (not just egress).
+#[tokio::test]
+async fn anthropic_passthrough_success_produces_ingress_dump() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("ap-ingress-model", "reply"),
+    )
+    .await;
+
+    let tmp =
+        std::env::temp_dir().join(format!("inf-splitter-aps-ingress-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "ap-ingress-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+    let _resp = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "ap-ingress-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(_resp.status(), reqwest::StatusCode::OK);
+
+    let content = wait_for_file(&tmp).await;
+    let _ = std::fs::remove_file(&tmp);
+    let has_ingress = content.lines().any(|l| {
+        serde_json::from_str::<serde_json::Value>(l)
+            .ok()
+            .and_then(|v| v["stage"].as_str().map(|s| s == "ingress"))
+            .unwrap_or(false)
+    });
+    assert!(
+        has_ingress,
+        "anthropic passthrough success must produce ingress dump"
     );
 }
 

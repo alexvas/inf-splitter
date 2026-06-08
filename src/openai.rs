@@ -90,9 +90,19 @@ impl OpenAiHandler {
         endpoint: &str,
     ) -> Result<Response, AppError> {
         let request_size = body.len();
-        let model = crate::peek_model_from_json(body);
-        let messages_detail = crate::diagnostics::messages_detail_from_bytes(body);
-        let body = crate::apply_token_caps(body, route)?;
+        let original_body = body.to_vec();
+        // Single JSON parse: extract model, ingress detail, apply caps, then egress detail.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let model = value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| "?".to_string());
+        let messages_detail_ingress = crate::diagnostics::messages_detail_from_value(&value);
+        crate::apply_token_caps_to_value(&mut value, route);
+        let messages_detail_egress = crate::diagnostics::messages_detail_from_value(&value);
+        let body = serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?;
         let backend_url = format!("{endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
             self.http
@@ -102,7 +112,14 @@ impl OpenAiHandler {
             route.api_key.as_deref(),
         );
 
-        let upstream = builder.body(body.clone()).send().await?;
+        let downstream_body = if self.diagnostics.dump_enabled() {
+            Some(body.clone())
+        } else {
+            None
+        };
+        let start = std::time::Instant::now();
+        let upstream = builder.body(body).send().await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
         let is_err = !upstream.status().is_success() && !sse::is_event_stream(upstream.headers());
         if is_err {
             let status = upstream.status();
@@ -116,22 +133,23 @@ impl OpenAiHandler {
                 model: model.clone(),
                 upstream: endpoint.to_string(),
                 status: status.as_u16(),
-                duration_ms: 0,
+                duration_ms,
                 request_size_bytes: request_size,
-                response_size_bytes: None,
+                response_size_bytes: Some(error_body.len()),
                 streaming: false,
                 input_messages: None,
                 max_tokens: None,
-                messages_detail_ingress: None,
-                messages_detail_egress: messages_detail.clone(),
+                messages_detail_ingress: messages_detail_ingress.clone(),
+                messages_detail_egress: messages_detail_egress.clone(),
                 error: Some(error_body.clone()),
             });
-            if let Ok(body_str) = String::from_utf8(body.to_vec()) {
+            // Ingress dump: original client body before token caps.
+            if let Ok(body_str) = String::from_utf8(original_body.clone()) {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
-                        request_id,
+                        request_id: request_id.clone(),
                         ts: crate::diagnostics::ts_string(),
-                        stage: "egress".into(),
+                        stage: "ingress".into(),
                         direction: "request".into(),
                         model: model.clone(),
                         headers: request_headers
@@ -147,6 +165,30 @@ impl OpenAiHandler {
                     },
                     true,
                 );
+            }
+            if let Some(ref body_bytes) = downstream_body {
+                if let Ok(body_str) = String::from_utf8(body_bytes.to_vec()) {
+                    self.diagnostics.record_dump(
+                        &crate::diagnostics::DumpEvent {
+                            request_id,
+                            ts: crate::diagnostics::ts_string(),
+                            stage: "egress".into(),
+                            direction: "request".into(),
+                            model: model.clone(),
+                            headers: request_headers
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    v.to_str()
+                                        .ok()
+                                        .map(|val| (k.as_str().to_string(), val.to_string()))
+                                })
+                                .collect(),
+                            body: body_str,
+                            status: None,
+                        },
+                        true,
+                    );
+                }
             }
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = Response::builder()
@@ -169,23 +211,23 @@ impl OpenAiHandler {
             model: model.clone(),
             upstream: endpoint.to_string(),
             status: relayed.status().as_u16(),
-            duration_ms: 0,
+            duration_ms,
             request_size_bytes: request_size,
             response_size_bytes: None,
             streaming: is_streaming,
             input_messages: None,
             max_tokens: None,
-            messages_detail_ingress: None,
-            messages_detail_egress: messages_detail.clone(),
+            messages_detail_ingress,
+            messages_detail_egress,
             error: None,
         });
-        // Dump the egress request body.
-        if let Ok(body_str) = String::from_utf8(body.to_vec()) {
+        // Ingress dump: original client body before token caps.
+        if let Ok(body_str) = String::from_utf8(original_body) {
             self.diagnostics.record_dump(
                 &crate::diagnostics::DumpEvent {
-                    request_id,
+                    request_id: request_id.clone(),
                     ts: crate::diagnostics::ts_string(),
-                    stage: "egress".into(),
+                    stage: "ingress".into(),
                     direction: "request".into(),
                     model: model.clone(),
                     headers: request_headers
@@ -201,6 +243,31 @@ impl OpenAiHandler {
                 },
                 false,
             );
+        }
+        // Dump the egress request body.
+        if let Some(ref body_bytes) = downstream_body {
+            if let Ok(body_str) = String::from_utf8(body_bytes.to_vec()) {
+                self.diagnostics.record_dump(
+                    &crate::diagnostics::DumpEvent {
+                        request_id,
+                        ts: crate::diagnostics::ts_string(),
+                        stage: "egress".into(),
+                        direction: "request".into(),
+                        model: model.clone(),
+                        headers: request_headers
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                v.to_str()
+                                    .ok()
+                                    .map(|val| (k.as_str().to_string(), val.to_string()))
+                            })
+                            .collect(),
+                        body: body_str,
+                        status: None,
+                    },
+                    false,
+                );
+            }
         }
         Ok(relayed)
     }
@@ -227,10 +294,26 @@ impl OpenAiHandler {
         openai_req.stream_options = None;
 
         let request_size = serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0);
-        let messages_detail_ingress = Some(crate::diagnostics::anthropic_messages_detail(req));
-        let messages_detail_egress = Some(crate::diagnostics::openai_messages_detail(&openai_req));
-        let ingress_str = serde_json::to_string(req).ok();
-        let egress_str = serde_json::to_string(&openai_req).ok();
+        let messages_detail_ingress = if self.diagnostics.stats_enabled() {
+            Some(crate::diagnostics::anthropic_messages_detail(req))
+        } else {
+            None
+        };
+        let messages_detail_egress = if self.diagnostics.stats_enabled() {
+            Some(crate::diagnostics::openai_messages_detail(&openai_req))
+        } else {
+            None
+        };
+        let ingress_str = if self.diagnostics.dump_enabled() {
+            serde_json::to_string(req).ok()
+        } else {
+            None
+        };
+        let egress_str = if self.diagnostics.dump_enabled() {
+            serde_json::to_string(&openai_req).ok()
+        } else {
+            None
+        };
 
         let backend_url = format!("{openai_endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
@@ -241,7 +324,9 @@ impl OpenAiHandler {
             route.api_key.as_deref(),
         );
 
+        let start = std::time::Instant::now();
         let upstream = builder.json(&openai_req).send().await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
             let status = upstream.status();
@@ -257,9 +342,9 @@ impl OpenAiHandler {
                 model: req.model.clone(),
                 upstream: openai_endpoint.into(),
                 status: status.as_u16(),
-                duration_ms: 0,
+                duration_ms,
                 request_size_bytes: request_size,
-                response_size_bytes: None,
+                response_size_bytes: Some(error_body.len()),
                 streaming: false,
                 input_messages: Some(req.messages.len()),
                 max_tokens: Some(req.max_tokens),
@@ -327,7 +412,7 @@ impl OpenAiHandler {
             model: req.model.clone(),
             upstream: openai_endpoint.into(),
             status: 200,
-            duration_ms: 0,
+            duration_ms,
             request_size_bytes: request_size,
             response_size_bytes: None,
             streaming: false,
@@ -392,10 +477,26 @@ impl OpenAiHandler {
         openai_req.stream_options = None;
 
         let request_size = serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0);
-        let messages_detail_ingress = Some(crate::diagnostics::anthropic_messages_detail(req));
-        let messages_detail_egress = Some(crate::diagnostics::openai_messages_detail(&openai_req));
-        let ingress_str = serde_json::to_string(req).ok();
-        let egress_str = serde_json::to_string(&openai_req).ok();
+        let messages_detail_ingress = if self.diagnostics.stats_enabled() {
+            Some(crate::diagnostics::anthropic_messages_detail(req))
+        } else {
+            None
+        };
+        let messages_detail_egress = if self.diagnostics.stats_enabled() {
+            Some(crate::diagnostics::openai_messages_detail(&openai_req))
+        } else {
+            None
+        };
+        let ingress_str = if self.diagnostics.dump_enabled() {
+            serde_json::to_string(req).ok()
+        } else {
+            None
+        };
+        let egress_str = if self.diagnostics.dump_enabled() {
+            serde_json::to_string(&openai_req).ok()
+        } else {
+            None
+        };
 
         let backend_url = format!("{openai_endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
@@ -406,7 +507,9 @@ impl OpenAiHandler {
             route.api_key.as_deref(),
         );
 
+        let start = std::time::Instant::now();
         let upstream = builder.json(&openai_req).send().await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
             let status = upstream.status();
@@ -422,9 +525,9 @@ impl OpenAiHandler {
                 model: req.model.clone(),
                 upstream: openai_endpoint.into(),
                 status: status.as_u16(),
-                duration_ms: 0,
+                duration_ms,
                 request_size_bytes: request_size,
-                response_size_bytes: None,
+                response_size_bytes: Some(error_body.len()),
                 streaming: true,
                 input_messages: Some(req.messages.len()),
                 max_tokens: Some(req.max_tokens),
@@ -550,7 +653,7 @@ impl OpenAiHandler {
             model: req.model.clone(),
             upstream: openai_endpoint.into(),
             status: 200,
-            duration_ms: 0,
+            duration_ms,
             request_size_bytes: request_size,
             response_size_bytes: None,
             streaming: true,

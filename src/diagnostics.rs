@@ -157,6 +157,18 @@ impl Diagnostics {
         &self.dump_mode
     }
 
+    /// Returns true if stats recording is active (mode is `Error` or `All`).
+    /// Use this to skip expensive stats computation when diagnostics are off.
+    pub fn stats_enabled(&self) -> bool {
+        !matches!(self.stats_mode, DiagnosticMode::Off)
+    }
+
+    /// Returns true if dump recording is active (mode is `Error` or `All`).
+    /// Use this to skip expensive dump serialization when diagnostics are off.
+    pub fn dump_enabled(&self) -> bool {
+        !matches!(self.dump_mode, DiagnosticMode::Off)
+    }
+
     /// Generate a new unique request id: `{startup_secs}-{counter}`.
     pub fn new_request_id(&self) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
@@ -168,7 +180,9 @@ impl Diagnostics {
     /// - `Error` → only if `event.error` is Some
     /// - `All` → always
     ///
-    /// Dropped if channel is full.
+    /// Uses `try_send` and silently drops the event when the channel is full.
+    /// This is intentional: diagnostics are best-effort and must never block
+    /// request processing or add backpressure to the data path.
     pub fn record_stats(&self, event: &StatsEvent) {
         match &self.stats_mode {
             DiagnosticMode::Off => return,
@@ -183,7 +197,10 @@ impl Diagnostics {
 
     /// Non-blocking send of a dump line. Respects `dump_mode`.
     /// `is_error` indicates whether this dump is for an error request.
-    /// Dropped if channel is full.
+    ///
+    /// Same best-effort semantics as `record_stats`: uses `try_send` and
+    /// silently drops the event when the channel is full. This is intentional
+    /// to avoid backpressure on request processing.
     pub fn record_dump(&self, event: &DumpEvent, is_error: bool) {
         match &self.dump_mode {
             DiagnosticMode::Off => return,
@@ -349,7 +366,17 @@ pub fn openai_messages_detail(req: &anyllm_translate::openai::ChatCompletionRequ
 /// Best-effort message detail from raw JSON bytes (passthrough paths).
 pub fn messages_detail_from_bytes(body: &[u8]) -> Option<Value> {
     let v: Value = serde_json::from_slice(body).ok()?;
-    let arr = v.get("messages")?.as_array()?;
+    messages_detail_from_value(&v)
+}
+
+/// Like `messages_detail_from_bytes` but works on an already-parsed `Value`,
+/// avoiding a second deserialization when the body is already in memory.
+pub fn messages_detail_from_value(body: &Value) -> Option<Value> {
+    let arr = body.get("messages")?.as_array()?;
+    Some(messages_detail_from_array(arr))
+}
+
+fn messages_detail_from_array(arr: &[Value]) -> Value {
     let detail: Vec<Value> = arr
         .iter()
         .map(|msg| {
@@ -410,7 +437,7 @@ pub fn messages_detail_from_bytes(body: &[u8]) -> Option<Value> {
             serde_json::json!({"role": role, "parts": parts})
         })
         .collect();
-    Some(serde_json::json!(detail))
+    serde_json::json!(detail)
 }
 
 fn text_part_detail(text: &str) -> Value {

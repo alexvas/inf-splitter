@@ -46,7 +46,17 @@ pub fn format_openai_sse_chunk(chunk: &ChatCompletionChunk) -> String {
 
 pub fn format_sse_event_str(event: &StreamEvent) -> String {
     let payload = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
-    format!("event: message\ndata: {payload}\n\n")
+    let event_name = match event {
+        StreamEvent::MessageStart { .. } => "message_start",
+        StreamEvent::ContentBlockStart { .. } => "content_block_start",
+        StreamEvent::ContentBlockDelta { .. } => "content_block_delta",
+        StreamEvent::ContentBlockStop { .. } => "content_block_stop",
+        StreamEvent::MessageDelta { .. } => "message_delta",
+        StreamEvent::MessageStop { .. } => "message_stop",
+        StreamEvent::Ping { .. } => "ping",
+        StreamEvent::Error { .. } => "error",
+    };
+    format!("event: {event_name}\ndata: {payload}\n\n")
 }
 
 pub fn format_sse_event(event: &StreamEvent) -> bytes::Bytes {
@@ -111,24 +121,69 @@ mod tests {
     }
 
     #[test]
-    fn format_sse_event_str_produces_valid_sse() {
-        let event: StreamEvent = serde_json::from_value(serde_json::json!({
+    fn format_sse_event_str_uses_correct_event_names() {
+        // Construct variants via JSON deserialization (internally tagged on "type").
+        let message_start: StreamEvent = serde_json::from_value(serde_json::json!({
             "type": "message_start",
             "message": {
-                "id": "msg_1",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude",
-                "content": [],
-                "stop_reason": null,
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "claude", "content": [], "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {"input_tokens":0,"output_tokens":0}
+                "usage": {"input_tokens": 0, "output_tokens": 0}
             }
         }))
         .unwrap();
-        let result = format_sse_event_str(&event);
-        assert!(result.starts_with("event: message\ndata: "));
-        assert!(result.ends_with("\n\n"));
+
+        let content_block_start: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }))
+        .unwrap();
+
+        let content_block_delta: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"}
+        }))
+        .unwrap();
+
+        let content_block_stop = StreamEvent::ContentBlockStop { index: 0 };
+        let message_stop = StreamEvent::MessageStop {};
+        let ping = StreamEvent::Ping {};
+
+        let message_delta: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": 5}
+        }))
+        .unwrap();
+
+        let error_event: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "busy"}
+        }))
+        .unwrap();
+
+        let cases: &[(&StreamEvent, &str)] = &[
+            (&message_start, "message_start"),
+            (&content_block_start, "content_block_start"),
+            (&content_block_delta, "content_block_delta"),
+            (&content_block_stop, "content_block_stop"),
+            (&message_delta, "message_delta"),
+            (&message_stop, "message_stop"),
+            (&ping, "ping"),
+            (&error_event, "error"),
+        ];
+
+        for (event, expected_name) in cases {
+            let result = format_sse_event_str(event);
+            assert!(
+                result.starts_with(&format!("event: {expected_name}\ndata: ")),
+                "expected event: {expected_name}, got: {result:?}"
+            );
+            assert!(result.ends_with("\n\n"));
+        }
     }
 
     #[test]
@@ -143,23 +198,29 @@ mod tests {
             .and_then(|v| v.to_str().ok());
         assert_eq!(ct, Some("text/event-stream"));
     }
+
+    #[test]
+    fn sse_response_does_not_echo_accept_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/json".parse().unwrap());
+        let stream = futures::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+        let response = sse_response(&headers, stream).expect("should build SSE response");
+        assert!(
+            response.headers().get(header::ACCEPT).is_none(),
+            "Accept header must not be echoed on SSE response"
+        );
+    }
 }
 
-pub fn sse_response<S>(request_headers: &HeaderMap, body: S) -> Result<Response, AppError>
+pub fn sse_response<S>(_request_headers: &HeaderMap, body: S) -> Result<Response, AppError>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
 {
-    let accept = request_headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("text/event-stream");
-
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
-        .header(header::ACCEPT, accept)
         .body(Body::from_stream(body))
         .map_err(|err| AppError::Internal(err.to_string()))
 }

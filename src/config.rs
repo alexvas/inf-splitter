@@ -478,6 +478,11 @@ fn parse_models(name: &str, models: ModelsField) -> Result<(bool, HashSet<String
     }
 }
 
+/// Parse a diagnostics sink from a user-supplied string.
+///
+/// The strings "stdout" and "stderr" are reserved for console sinks.
+/// A file literally named "stdout" or "stderr" cannot be used — use a
+/// relative path like "./stdout" instead.
 fn sink_from_str(raw: Option<&str>) -> Sink {
     match raw.map(str::trim) {
         Some("stdout") => Sink::Stdout,

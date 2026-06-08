@@ -10,6 +10,7 @@ use inf_splitter::config::Config;
 use inf_splitter::diagnostics::{DiagnosticMode, Diagnostics, DiagnosticsConfig};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
 struct CaptureState {
@@ -111,6 +112,23 @@ pub async fn spawn_error_upstream(
         path,
         post(move |Json(_): Json<serde_json::Value>| async move {
             (status, Json(body)).into_response()
+        }),
+    );
+    bind_and_serve(app).await.0
+}
+
+/// Spawn an upstream that sleeps for `delay` before returning a fixed JSON
+/// response.  Useful for verifying that `duration_ms` timing is wired up.
+pub async fn spawn_delayed_upstream(
+    path: &'static str,
+    delay: Duration,
+    response: serde_json::Value,
+) -> SocketAddr {
+    let app = Router::new().route(
+        path,
+        post(move |Json(_): Json<serde_json::Value>| async move {
+            sleep(delay).await;
+            Json(response)
         }),
     );
     bind_and_serve(app).await.0

@@ -54,13 +54,25 @@ impl AnthropicHandler {
         anthropic_endpoint: &str,
     ) -> Result<Response, AppError> {
         let request_size = body.len();
-        let model = crate::peek_model_from_json(&body);
-        let messages_detail = crate::diagnostics::messages_detail_from_bytes(&body);
         let original_body = body.clone();
-        let body = Bytes::from(crate::apply_token_caps(&body, route)?);
+        // Single JSON parse: extract model, ingress detail, apply caps, then egress detail.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let model = value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| "?".to_string());
+        let messages_detail_ingress = crate::diagnostics::messages_detail_from_value(&value);
+        crate::apply_token_caps_to_value(&mut value, route);
+        let messages_detail_egress = crate::diagnostics::messages_detail_from_value(&value);
+        let body =
+            Bytes::from(serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?);
         let egress_body = body.clone();
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
+        let start = std::time::Instant::now();
         let upstream = builder.body(body).send().await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
         if !upstream.status().is_success() && !sse::is_event_stream(upstream.headers()) {
             let status = upstream.status();
             let response_headers = copy_response_headers(upstream.headers());
@@ -73,14 +85,14 @@ impl AnthropicHandler {
                 model: model.clone(),
                 upstream: anthropic_endpoint.into(),
                 status: status.as_u16(),
-                duration_ms: 0,
+                duration_ms,
                 request_size_bytes: request_size,
-                response_size_bytes: None,
+                response_size_bytes: Some(error_body.len()),
                 streaming: false,
                 input_messages: None,
                 max_tokens: None,
-                messages_detail_ingress: None,
-                messages_detail_egress: messages_detail.clone(),
+                messages_detail_ingress: messages_detail_ingress.clone(),
+                messages_detail_egress: messages_detail_egress.clone(),
                 error: Some(error_body.clone()),
             });
             // Egress dump: body sent upstream after token caps.
@@ -151,16 +163,39 @@ impl AnthropicHandler {
             model: model.clone(),
             upstream: anthropic_endpoint.into(),
             status: relayed.status().as_u16(),
-            duration_ms: 0,
+            duration_ms,
             request_size_bytes: request_size,
             response_size_bytes: None,
             streaming: is_streaming,
             input_messages: None,
             max_tokens: None,
-            messages_detail_ingress: None,
-            messages_detail_egress: messages_detail,
+            messages_detail_ingress,
+            messages_detail_egress,
             error: None,
         });
+        // Ingress dump: original client body before token caps.
+        if let Ok(body_str) = String::from_utf8(original_body.to_vec()) {
+            self.diagnostics.record_dump(
+                &crate::diagnostics::DumpEvent {
+                    request_id: request_id.clone(),
+                    ts: crate::diagnostics::ts_string(),
+                    stage: "ingress".into(),
+                    direction: "request".into(),
+                    model: model.clone(),
+                    headers: request_headers
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            v.to_str()
+                                .ok()
+                                .map(|val| (k.as_str().to_string(), val.to_string()))
+                        })
+                        .collect(),
+                    body: body_str,
+                    status: Some(relayed.status().as_u16()),
+                },
+                false,
+            );
+        }
         // Egress dump: body sent upstream after token caps.
         if let Ok(body_str) = String::from_utf8(egress_body.to_vec()) {
             self.diagnostics.record_dump(
@@ -235,15 +270,33 @@ impl AnthropicHandler {
         let anthropic_req = translate_openai_to_anthropic_request(&openai_req, &mut warnings)
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
 
-        let messages_detail_ingress = Some(crate::diagnostics::openai_messages_detail(&openai_req));
-        let messages_detail_egress = Some(crate::diagnostics::anthropic_messages_detail(
-            &anthropic_req,
-        ));
-        let ingress_str = serde_json::to_string(&openai_req).ok();
-        let egress_str = serde_json::to_string(&anthropic_req).ok();
+        let messages_detail_ingress = if self.diagnostics.stats_enabled() {
+            Some(crate::diagnostics::openai_messages_detail(&openai_req))
+        } else {
+            None
+        };
+        let messages_detail_egress = if self.diagnostics.stats_enabled() {
+            Some(crate::diagnostics::anthropic_messages_detail(
+                &anthropic_req,
+            ))
+        } else {
+            None
+        };
+        let ingress_str = if self.diagnostics.dump_enabled() {
+            serde_json::to_string(&openai_req).ok()
+        } else {
+            None
+        };
+        let egress_str = if self.diagnostics.dump_enabled() {
+            serde_json::to_string(&anthropic_req).ok()
+        } else {
+            None
+        };
 
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
+        let start = std::time::Instant::now();
         let upstream = builder.json(&anthropic_req).send().await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
             let status = upstream.status();
@@ -259,9 +312,9 @@ impl AnthropicHandler {
                 model: openai_req.model.clone(),
                 upstream: anthropic_endpoint.into(),
                 status: status.as_u16(),
-                duration_ms: 0,
+                duration_ms,
                 request_size_bytes: request_size,
-                response_size_bytes: None,
+                response_size_bytes: Some(error_body.len()),
                 streaming: false,
                 input_messages: Some(openai_req.messages.len()),
                 max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
@@ -322,7 +375,7 @@ impl AnthropicHandler {
             model: openai_req.model.clone(),
             upstream: anthropic_endpoint.into(),
             status: 200,
-            duration_ms: 0,
+            duration_ms,
             request_size_bytes: request_size,
             response_size_bytes: None,
             streaming: false,
@@ -385,15 +438,33 @@ impl AnthropicHandler {
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
         anthropic_req.stream = Some(true);
 
-        let messages_detail_ingress = Some(crate::diagnostics::openai_messages_detail(openai_req));
-        let messages_detail_egress = Some(crate::diagnostics::anthropic_messages_detail(
-            &anthropic_req,
-        ));
-        let ingress_str = serde_json::to_string(openai_req).ok();
-        let egress_str = serde_json::to_string(&anthropic_req).ok();
+        let messages_detail_ingress = if self.diagnostics.stats_enabled() {
+            Some(crate::diagnostics::openai_messages_detail(openai_req))
+        } else {
+            None
+        };
+        let messages_detail_egress = if self.diagnostics.stats_enabled() {
+            Some(crate::diagnostics::anthropic_messages_detail(
+                &anthropic_req,
+            ))
+        } else {
+            None
+        };
+        let ingress_str = if self.diagnostics.dump_enabled() {
+            serde_json::to_string(openai_req).ok()
+        } else {
+            None
+        };
+        let egress_str = if self.diagnostics.dump_enabled() {
+            serde_json::to_string(&anthropic_req).ok()
+        } else {
+            None
+        };
 
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
+        let start = std::time::Instant::now();
         let upstream = builder.json(&anthropic_req).send().await?;
+        let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
             let status = upstream.status();
@@ -409,9 +480,9 @@ impl AnthropicHandler {
                 model: openai_req.model.clone(),
                 upstream: anthropic_endpoint.into(),
                 status: status.as_u16(),
-                duration_ms: 0,
+                duration_ms,
                 request_size_bytes: request_size,
-                response_size_bytes: None,
+                response_size_bytes: Some(error_body.len()),
                 streaming: true,
                 input_messages: Some(openai_req.messages.len()),
                 max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
@@ -557,7 +628,7 @@ impl AnthropicHandler {
             model: openai_req.model.clone(),
             upstream: anthropic_endpoint.into(),
             status: 200,
-            duration_ms: 0,
+            duration_ms,
             request_size_bytes: request_size,
             response_size_bytes: None,
             streaming: true,
@@ -711,6 +782,12 @@ fn copy_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Apply per-route token caps to an OpenAI `ChatCompletionRequest`.
+///
+/// Only for **OpenAI egress paths**: passthrough to an OpenAI upstream, or
+/// Anthropic-to-OpenAI translation. Mutates the request in place, clamping or
+/// setting `max_tokens`, `max_completion_tokens`, and `max_output_tokens`
+/// (via `extra`) to the route's configured limits.
 pub(crate) fn cap_openai_max_tokens(req: &mut ChatCompletionRequest, route: &RouteTarget) {
     if let Some(limit) = route.max_tokens {
         match req.max_tokens {

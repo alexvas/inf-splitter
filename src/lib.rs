@@ -48,6 +48,7 @@ pub(crate) fn append_size_hint(
 }
 
 /// Apply token limits from the route config to a raw JSON body (passthrough path).
+#[allow(dead_code)]
 pub(crate) fn apply_token_caps(body: &[u8], route: &RouteTarget) -> Result<Vec<u8>, AppError> {
     let has_caps = route.max_tokens.is_some()
         || route.max_output_tokens.is_some()
@@ -57,19 +58,26 @@ pub(crate) fn apply_token_caps(body: &[u8], route: &RouteTarget) -> Result<Vec<u
     }
     let mut value: Value =
         serde_json::from_slice(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
-    if let Some(limit) = route.max_tokens {
-        cap_numeric_field(&mut value, "max_tokens", limit);
-    }
-    if let Some(limit) = route.max_output_tokens {
-        cap_numeric_field(&mut value, "max_output_tokens", limit);
-    }
-    if let Some(limit) = route.max_completion_tokens {
-        cap_numeric_field(&mut value, "max_completion_tokens", limit);
-    }
+    apply_token_caps_to_value(&mut value, route);
     serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))
 }
 
+/// Like `apply_token_caps` but works on an already-parsed `Value`,
+/// avoiding a second deserialization when the body is already in memory.
+pub(crate) fn apply_token_caps_to_value(value: &mut Value, route: &RouteTarget) {
+    if let Some(limit) = route.max_tokens {
+        cap_numeric_field(value, "max_tokens", limit);
+    }
+    if let Some(limit) = route.max_output_tokens {
+        cap_numeric_field(value, "max_output_tokens", limit);
+    }
+    if let Some(limit) = route.max_completion_tokens {
+        cap_numeric_field(value, "max_completion_tokens", limit);
+    }
+}
+
 /// Extract the `model` field from a JSON byte slice. Returns `"?"` on failure.
+#[allow(dead_code)]
 pub(crate) fn peek_model_from_json(body: &[u8]) -> String {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()

@@ -321,6 +321,7 @@ impl Diagnostics {
     ///
     /// `headers` comes from the request HeaderMap; `body` accepts `DumpBody` or
     /// plain `String` (always UTF-8).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_request_dump(
         &self,
         request_id: &str,

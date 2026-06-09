@@ -189,7 +189,47 @@ async fn dispatch_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let peek: MessagePeek = serde_json::from_slice(&body).map_err(|err| {
+    let body_str = std::str::from_utf8(&body).map_err(|_| {
+        let request_id = state.diagnostics.new_request_id();
+        tracing::warn!(
+            request_id = %request_id,
+            direction = %ingress,
+            body_len = body.len(),
+            "non-utf8 client request body"
+        );
+        state
+            .diagnostics
+            .record_stats(&crate::diagnostics::StatsEvent {
+                request_id: request_id.clone(),
+                ts: crate::diagnostics::ts_string(),
+                direction: ingress.to_string(),
+                model: "?".into(),
+                upstream: String::new(),
+                status: 400,
+                duration_ms: 0,
+                request_size_bytes: body.len(),
+                response_size_bytes: None,
+                streaming: false,
+                input_messages: None,
+                max_tokens: None,
+                messages_detail_ingress: None,
+                messages_detail_egress: None,
+                error: Some("non-utf8".into()),
+            });
+        // Record a dump of the non-UTF8 body
+        let body = crate::diagnostics::dump_body_from_bytes(&body);
+        state.diagnostics.record_request_dump(
+            &request_id,
+            "ingress",
+            "?",
+            &headers,
+            body,
+            None,
+            true,
+        );
+        AppError::BadRequest("non-utf8".into())
+    })?;
+    let peek: MessagePeek = serde_json::from_str(body_str).map_err(|err| {
         state
             .diagnostics
             .record_stats(&crate::diagnostics::StatsEvent {

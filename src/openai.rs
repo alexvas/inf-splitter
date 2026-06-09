@@ -13,7 +13,7 @@ use reqwest::Client as HttpClient;
 
 use crate::auth::forward_request_headers;
 use crate::config::{Config, RouteTarget};
-use crate::diagnostics::{Diagnostics, DumpEvent, StatsEvent};
+use crate::diagnostics::{Diagnostics, DumpBody, StatsEvent};
 use crate::error::AppError;
 use crate::relay::cap_openai_max_tokens;
 use crate::relay::{DiagnosticStream, RelayContext};
@@ -145,51 +145,34 @@ impl OpenAiHandler {
                 error: Some(error_body.clone()),
             });
             // Ingress dump: original client body before token caps.
-            if let Ok(body_str) = String::from_utf8(original_body.clone()) {
-                self.diagnostics.record_dump(
-                    &crate::diagnostics::DumpEvent {
-                        request_id: request_id.clone(),
-                        ts: crate::diagnostics::ts_string(),
-                        stage: "ingress".into(),
-                        direction: "request".into(),
-                        model: model.clone(),
-                        headers: request_headers
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.to_str()
-                                    .ok()
-                                    .map(|val| (k.as_str().to_string(), val.to_string()))
-                            })
-                            .collect(),
-                        body: body_str,
-                        status: None,
-                    },
-                    true,
+            let body = crate::diagnostics::dump_body_from_bytes(&original_body);
+            if body.is_base64() {
+                tracing::warn!(
+                    request_id = %request_id,
+                    direction = "request",
+                    body_len = original_body.len(),
+                    "non-utf8 in ingress request body"
                 );
             }
+            self.diagnostics.record_request_dump(
+                &request_id,
+                "ingress",
+                &model,
+                request_headers,
+                body,
+                None,
+                true,
+            );
             if let Some(ref body_bytes) = downstream_body {
-                if let Ok(body_str) = String::from_utf8(body_bytes.to_vec()) {
-                    self.diagnostics.record_dump(
-                        &crate::diagnostics::DumpEvent {
-                            request_id,
-                            ts: crate::diagnostics::ts_string(),
-                            stage: "egress".into(),
-                            direction: "request".into(),
-                            model: model.clone(),
-                            headers: request_headers
-                                .iter()
-                                .filter_map(|(k, v)| {
-                                    v.to_str()
-                                        .ok()
-                                        .map(|val| (k.as_str().to_string(), val.to_string()))
-                                })
-                                .collect(),
-                            body: body_str,
-                            status: None,
-                        },
-                        true,
-                    );
-                }
+                self.diagnostics.record_request_dump(
+                    &request_id,
+                    "egress",
+                    &model,
+                    request_headers,
+                    crate::diagnostics::dump_body_from_bytes(body_bytes),
+                    None,
+                    true,
+                );
             }
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = Response::builder()
@@ -205,11 +188,11 @@ impl OpenAiHandler {
         let request_id = self.diagnostics.new_request_id();
         let relayed = relay_openai_upstream(
             upstream,
-            Some(RelayContext {
+            RelayContext {
                 diagnostics: &self.diagnostics,
                 request_id: request_id.clone(),
                 model: model.clone(),
-            }),
+            },
         )
         .await?;
         let is_streaming = sse::is_event_stream(relayed.headers());
@@ -231,52 +214,26 @@ impl OpenAiHandler {
             error: None,
         });
         // Ingress dump: original client body before token caps.
-        if let Ok(body_str) = String::from_utf8(original_body) {
-            self.diagnostics.record_dump(
-                &crate::diagnostics::DumpEvent {
-                    request_id: request_id.clone(),
-                    ts: crate::diagnostics::ts_string(),
-                    stage: "ingress".into(),
-                    direction: "request".into(),
-                    model: model.clone(),
-                    headers: request_headers
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            v.to_str()
-                                .ok()
-                                .map(|val| (k.as_str().to_string(), val.to_string()))
-                        })
-                        .collect(),
-                    body: body_str,
-                    status: None,
-                },
-                false,
-            );
-        }
+        self.diagnostics.record_request_dump(
+            &request_id,
+            "ingress",
+            &model,
+            request_headers,
+            crate::diagnostics::dump_body_from_bytes(&original_body),
+            None,
+            false,
+        );
         // Dump the egress request body.
         if let Some(ref body_bytes) = downstream_body {
-            if let Ok(body_str) = String::from_utf8(body_bytes.to_vec()) {
-                self.diagnostics.record_dump(
-                    &crate::diagnostics::DumpEvent {
-                        request_id,
-                        ts: crate::diagnostics::ts_string(),
-                        stage: "egress".into(),
-                        direction: "request".into(),
-                        model: model.clone(),
-                        headers: request_headers
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.to_str()
-                                    .ok()
-                                    .map(|val| (k.as_str().to_string(), val.to_string()))
-                            })
-                            .collect(),
-                        body: body_str,
-                        status: None,
-                    },
-                    false,
-                );
-            }
+            self.diagnostics.record_request_dump(
+                &request_id,
+                "egress",
+                &model,
+                request_headers,
+                crate::diagnostics::dump_body_from_bytes(body_bytes),
+                None,
+                false,
+            );
         }
         Ok(relayed)
     }
@@ -378,7 +335,7 @@ impl OpenAiHandler {
                                     .map(|val| (k.as_str().to_string(), val.to_string()))
                             })
                             .collect(),
-                        body: s.clone(),
+                        body: DumpBody::Utf8(s.clone()),
                         status: None,
                     },
                     true,
@@ -394,7 +351,7 @@ impl OpenAiHandler {
                         direction: "request".into(),
                         model: req.model.clone(),
                         headers: Vec::new(),
-                        body: s.clone(),
+                        body: DumpBody::Utf8(s.clone()),
                         status: None,
                     },
                     true,
@@ -447,7 +404,7 @@ impl OpenAiHandler {
                                 .map(|val| (k.as_str().to_string(), val.to_string()))
                         })
                         .collect(),
-                    body: ingress_str,
+                    body: DumpBody::Utf8(ingress_str),
                     status: None,
                 },
                 false,
@@ -462,7 +419,7 @@ impl OpenAiHandler {
                     direction: "request".into(),
                     model: req.model.clone(),
                     headers: Vec::new(),
-                    body: egress_str,
+                    body: DumpBody::Utf8(egress_str),
                     status: None,
                 },
                 false,
@@ -560,7 +517,7 @@ impl OpenAiHandler {
                                     .map(|val| (k.as_str().to_string(), val.to_string()))
                             })
                             .collect(),
-                        body: s.clone(),
+                        body: DumpBody::Utf8(s.clone()),
                         status: None,
                     },
                     true,
@@ -575,7 +532,7 @@ impl OpenAiHandler {
                         direction: "request".into(),
                         model: req.model.clone(),
                         headers: Vec::new(),
-                        body: s.clone(),
+                        body: DumpBody::Utf8(s.clone()),
                         status: None,
                     },
                     true,
@@ -688,7 +645,7 @@ impl OpenAiHandler {
                                 .map(|val| (k.as_str().to_string(), val.to_string()))
                         })
                         .collect(),
-                    body: ingress_str,
+                    body: DumpBody::Utf8(ingress_str),
                     status: None,
                 },
                 false,
@@ -703,7 +660,7 @@ impl OpenAiHandler {
                     direction: "request".into(),
                     model: req.model.clone(),
                     headers: Vec::new(),
-                    body: egress_str,
+                    body: DumpBody::Utf8(egress_str),
                     status: None,
                 },
                 false,
@@ -740,7 +697,7 @@ fn relay_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 
 async fn relay_openai_upstream(
     upstream: reqwest::Response,
-    ctx: Option<RelayContext<'_>>,
+    ctx: RelayContext<'_>,
 ) -> Result<Response, AppError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -750,43 +707,16 @@ async fn relay_openai_upstream(
         let stream = upstream
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
-        if let Some(ctx) = ctx {
-            let stream = DiagnosticStream {
-                inner: stream,
-                buffer: Vec::new(),
-                diagnostics: ctx.diagnostics.clone(),
-                request_id: ctx.request_id,
-                model: ctx.model,
-                response_headers: relay_headers.clone(),
-                status: status.as_u16(),
-                dumped: false,
-            };
-            let mut response = Response::builder().status(status);
-            for (name, value) in &relay_headers {
-                response = response.header(name.as_str(), value.as_str());
-            }
-            if !relay_headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            {
-                response = response.header(header::CONTENT_TYPE, "text/event-stream");
-            }
-            if !relay_headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
-            {
-                response = response.header(header::CACHE_CONTROL, "no-cache");
-            }
-            if !relay_headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
-            {
-                response = response.header(header::CONNECTION, "keep-alive");
-            }
-            return response
-                .body(Body::from_stream(stream))
-                .map_err(|err| AppError::Internal(err.to_string()));
-        }
+        let stream = DiagnosticStream {
+            inner: stream,
+            buffer: Vec::new(),
+            diagnostics: ctx.diagnostics.clone(),
+            request_id: ctx.request_id,
+            model: ctx.model,
+            response_headers: relay_headers.clone(),
+            status: status.as_u16(),
+            dumped: false,
+        };
         let mut response = Response::builder().status(status);
         for (name, value) in &relay_headers {
             response = response.header(name.as_str(), value.as_str());
@@ -815,22 +745,24 @@ async fn relay_openai_upstream(
     }
 
     let body = upstream.bytes().await?;
-    if let Some(ctx) = ctx {
-        if let Ok(body_str) = String::from_utf8(body.to_vec()) {
-            ctx.diagnostics.record_dump(
-                &DumpEvent {
-                    request_id: ctx.request_id,
-                    ts: crate::diagnostics::ts_string(),
-                    stage: "egress".into(),
-                    direction: "response".into(),
-                    model: ctx.model,
-                    headers: relay_headers.clone(),
-                    body: body_str,
-                    status: Some(status.as_u16()),
-                },
-                false,
-            );
-        }
+    let dump_body = crate::diagnostics::dump_body_from_bytes(&body);
+    let is_base64 = dump_body.is_base64();
+    ctx.diagnostics.record_response_dump(
+        &ctx.request_id,
+        &ctx.model,
+        relay_headers.clone(),
+        dump_body,
+        status.as_u16(),
+        is_base64,
+    );
+    if is_base64 {
+        tracing::warn!(
+            request_id = %ctx.request_id,
+            direction = "response",
+            body_len = body.len(),
+            "non-utf8 upstream response body"
+        );
+        return Err(AppError::Internal("non-utf8 response from upstream".into()));
     }
     let mut response = Response::builder().status(status);
     for (name, value) in relay_headers {

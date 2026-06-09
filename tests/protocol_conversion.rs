@@ -2079,6 +2079,154 @@ models = "stream-oai-er-model"
     );
 }
 
+/// Non-UTF8 client request body must return HTTP 400 with "non-utf8" message.
+#[tokio::test]
+async fn non_utf8_client_body_returns_400() {
+    let config = r#"
+port = 0
+
+[local]
+endpoint_openai = "http://127.0.0.1:1"
+models = "known-model"
+"#;
+    let proxy_addr = spawn_router(config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .header("content-type", "application/json")
+        .body(vec![0xFF, 0xFE, 0x00, 0x01])
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert!(
+        body.to_string().contains("non-utf8"),
+        "error message should mention non-utf8, got: {body}"
+    );
+}
+
+/// Non-UTF8 upstream response body must return HTTP 500 (Anthropic passthrough).
+#[tokio::test]
+async fn non_utf8_upstream_response_returns_500_anthropic() {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::Response;
+
+    let upstream = {
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![0xFF, 0xFE, 0x00]))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    };
+
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream}"
+models = "test-model"
+"#
+    );
+    let proxy_addr = common::spawn_router(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert!(
+        body.to_string().contains("non-utf8"),
+        "error message should mention non-utf8, got: {body}"
+    );
+}
+
+/// Non-UTF8 upstream response body must return HTTP 500 (OpenAI passthrough).
+#[tokio::test]
+async fn non_utf8_upstream_response_returns_500_openai() {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::Response;
+
+    let upstream = {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![0xFF, 0xFE, 0x00]))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    };
+
+    let config = format!(
+        r#"
+port = 0
+
+[local]
+endpoint_openai = "http://{upstream}"
+models = "test-model"
+"#
+    );
+    let proxy_addr = common::spawn_router(&config).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert!(
+        body.to_string().contains("non-utf8"),
+        "error message should mention non-utf8, got: {body}"
+    );
+}
+
 fn uuid_suffix() -> String {
     use std::time::SystemTime;
     let ts = SystemTime::now()

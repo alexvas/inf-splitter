@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -87,7 +88,7 @@ pub struct StatsEvent {
 }
 
 /// Raw request or response body dump.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct DumpEvent {
     pub request_id: String,
     pub ts: String,
@@ -95,8 +96,75 @@ pub struct DumpEvent {
     pub direction: String,
     pub model: String,
     pub headers: Vec<(String, String)>,
-    pub body: String,
+    pub body: DumpBody,
     pub status: Option<u16>,
+}
+
+impl Serialize for DumpEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let fields = if self.body.is_base64() { 10 } else { 9 };
+        let mut s = serializer.serialize_struct("DumpEvent", fields)?;
+        s.serialize_field("request_id", &self.request_id)?;
+        s.serialize_field("ts", &self.ts)?;
+        s.serialize_field("stage", &self.stage)?;
+        s.serialize_field("direction", &self.direction)?;
+        s.serialize_field("model", &self.model)?;
+        s.serialize_field("headers", &self.headers)?;
+        match &self.body {
+            DumpBody::Utf8(v) => s.serialize_field("body", v)?,
+            DumpBody::Base64(v) => {
+                s.serialize_field("body", v)?;
+                s.serialize_field("encoding", "base64")?;
+            }
+        }
+        if let Some(status) = self.status {
+            s.serialize_field("status", &status)?;
+        }
+        s.end()
+    }
+}
+
+/// Maximum number of raw bytes to base64-encode for a dump of a non-UTF8 body.
+pub const MAX_NON_UTF8_DUMP_LEN: usize = 65536;
+
+/// Result of `dump_body_from_bytes`: either valid UTF-8 or base64-encoded binary.
+#[derive(Debug)]
+pub enum DumpBody {
+    Utf8(String),
+    Base64(String),
+}
+
+impl DumpBody {
+    pub(crate) fn is_base64(&self) -> bool {
+        matches!(self, Self::Base64(_))
+    }
+}
+
+impl From<String> for DumpBody {
+    fn from(s: String) -> Self {
+        DumpBody::Utf8(s)
+    }
+}
+
+/// Prepare a body string for a `DumpEvent`.
+///
+/// Valid UTF-8 → `DumpBody::Utf8(string)`. Binary → truncated to
+/// `MAX_NON_UTF8_DUMP_LEN`, base64-encoded → `DumpBody::Base64(string)`.
+/// Callers should emit `tracing::warn!` on `DumpBody::Base64`.
+pub fn dump_body_from_bytes(body: &[u8]) -> DumpBody {
+    match std::str::from_utf8(body) {
+        Ok(s) => DumpBody::Utf8(s.to_string()),
+        Err(_) => {
+            let truncated = if body.len() > MAX_NON_UTF8_DUMP_LEN {
+                &body[..MAX_NON_UTF8_DUMP_LEN]
+            } else {
+                body
+            };
+            let encoded = base64::engine::general_purpose::STANDARD.encode(truncated);
+            DumpBody::Base64(encoded)
+        }
+    }
 }
 
 impl Diagnostics {
@@ -211,6 +279,67 @@ impl Diagnostics {
             return;
         };
         let _ = self.dump_tx.try_send(json);
+    }
+
+    /// Record a request dump (ingress or egress).
+    ///
+    /// `headers` comes from the request HeaderMap; `body` accepts `DumpBody` or
+    /// plain `String` (always UTF-8).
+    pub fn record_request_dump(
+        &self,
+        request_id: &str,
+        stage: &str,
+        model: &str,
+        headers: &axum::http::HeaderMap,
+        body: impl Into<DumpBody>,
+        status: Option<u16>,
+        is_error: bool,
+    ) {
+        self.record_dump(
+            &DumpEvent {
+                request_id: request_id.to_string(),
+                ts: ts_string(),
+                stage: stage.into(),
+                direction: "request".into(),
+                model: model.to_string(),
+                headers: headers
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        v.to_str()
+                            .ok()
+                            .map(|val| (k.as_str().to_string(), val.to_string()))
+                    })
+                    .collect(),
+                body: body.into(),
+                status,
+            },
+            is_error,
+        );
+    }
+
+    /// Record an egress response dump.
+    pub fn record_response_dump(
+        &self,
+        request_id: &str,
+        model: &str,
+        headers: Vec<(String, String)>,
+        body: impl Into<DumpBody>,
+        status: u16,
+        is_error: bool,
+    ) {
+        self.record_dump(
+            &DumpEvent {
+                request_id: request_id.to_string(),
+                ts: ts_string(),
+                stage: "egress".into(),
+                direction: "response".into(),
+                model: model.to_string(),
+                headers,
+                body: body.into(),
+                status: Some(status),
+            },
+            is_error,
+        );
     }
 }
 
@@ -365,8 +494,18 @@ pub fn openai_messages_detail(req: &anyllm_translate::openai::ChatCompletionRequ
 
 /// Best-effort message detail from raw JSON bytes (passthrough paths).
 pub fn messages_detail_from_bytes(body: &[u8]) -> Option<Value> {
+    if std::str::from_utf8(body).is_err() {
+        return Some(serde_json::json!([{
+            "role": "?",
+            "parts": [non_utf8_part_detail(body.len())]
+        }]));
+    }
     let v: Value = serde_json::from_slice(body).ok()?;
     messages_detail_from_value(&v)
+}
+
+pub fn non_utf8_part_detail(len: usize) -> Value {
+    serde_json::json!({"type": "non-utf8", "len": len})
 }
 
 /// Like `messages_detail_from_bytes` but works on an already-parsed `Value`,
@@ -554,12 +693,45 @@ mod tests {
             direction: "request".into(),
             model: "claude".into(),
             headers: vec![("content-type".into(), "application/json".into())],
-            body: r#"{"model":"claude","max_tokens":100}"#.into(),
+            body: DumpBody::Utf8(r#"{"model":"claude","max_tokens":100}"#.into()),
             status: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"stage\":\"ingress\""));
         assert!(json.contains("\"direction\":\"request\""));
+    }
+
+    #[test]
+    fn dump_event_with_encoding_serializes() {
+        let event = DumpEvent {
+            request_id: "1234-0".into(),
+            ts: "1000".into(),
+            stage: "ingress".into(),
+            direction: "request".into(),
+            model: "model".into(),
+            headers: vec![],
+            body: DumpBody::Base64("aGVsbG8=".into()),
+            status: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"encoding\":\"base64\""));
+        assert!(json.contains("\"body\":\"aGVsbG8=\""));
+    }
+
+    #[test]
+    fn dump_event_without_encoding_skips_field() {
+        let event = DumpEvent {
+            request_id: "1234-0".into(),
+            ts: "1000".into(),
+            stage: "ingress".into(),
+            direction: "request".into(),
+            model: "model".into(),
+            headers: vec![],
+            body: DumpBody::Utf8("hello".into()),
+            status: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("encoding"));
     }
 
     // --- message detail builders ---
@@ -694,5 +866,57 @@ mod tests {
         assert!(messages_detail_from_bytes(br#"{"model":"x"}"#).is_none());
         assert!(messages_detail_from_bytes(br#"{"messages":"not_array"}"#).is_none());
         assert!(messages_detail_from_bytes(b"garbage").is_none());
+    }
+
+    #[test]
+    fn messages_detail_from_bytes_non_utf8() {
+        let body = vec![0xFF, 0xFE, 0x00, 0x01];
+        let detail = messages_detail_from_bytes(&body);
+        assert!(detail.is_some(), "should return detail for non-UTF8");
+        let detail = detail.unwrap();
+        let parts = detail[0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "non-utf8");
+        assert_eq!(parts[0]["len"], 4);
+    }
+
+    // --- dump_body_from_bytes ---
+
+    #[test]
+    fn dump_body_from_bytes_utf8() {
+        let result = dump_body_from_bytes(b"hello world");
+        match result {
+            DumpBody::Utf8(s) => assert_eq!(s, "hello world"),
+            DumpBody::Base64(_) => panic!("expected Utf8, got Base64"),
+        }
+    }
+
+    #[test]
+    fn dump_body_from_bytes_non_utf8_base64() {
+        let bytes = vec![0xFF, 0xFE, 0x00];
+        let result = dump_body_from_bytes(&bytes);
+        match result {
+            DumpBody::Base64(s) => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&s)
+                    .expect("must be valid base64");
+                assert_eq!(decoded, bytes);
+            }
+            DumpBody::Utf8(_) => panic!("expected Base64, got Utf8"),
+        }
+    }
+
+    #[test]
+    fn dump_body_from_bytes_truncates_large_non_utf8() {
+        let bytes = vec![0xFFu8; 70 * 1024];
+        let result = dump_body_from_bytes(&bytes);
+        match result {
+            DumpBody::Base64(s) => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&s)
+                    .expect("valid base64");
+                assert_eq!(decoded.len(), MAX_NON_UTF8_DUMP_LEN);
+            }
+            DumpBody::Utf8(_) => panic!("expected Base64, got Utf8"),
+        }
     }
 }

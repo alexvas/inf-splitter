@@ -591,6 +591,7 @@ version = "0.1.0"
 dependencies = [
  "anyllm_translate",
  "axum",
+ "base64",
  "bytes",
  "futures",
  "reqwest",

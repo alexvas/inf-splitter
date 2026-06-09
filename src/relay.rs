@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures::stream::Stream;
 
-use crate::diagnostics::{Diagnostics, DumpEvent};
+use crate::diagnostics::Diagnostics;
 
 pub(crate) const MAX_STREAMING_DUMP_BYTES: usize = 1024 * 1024;
 
@@ -34,7 +34,7 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
-                if self.buffer.len() < MAX_STREAMING_DUMP_BYTES {
+                if self.diagnostics.dump_enabled() && self.buffer.len() < MAX_STREAMING_DUMP_BYTES {
                     let remaining = MAX_STREAMING_DUMP_BYTES - self.buffer.len();
                     let to_take = std::cmp::min(chunk.len(), remaining);
                     self.buffer.extend_from_slice(&chunk[..to_take]);
@@ -45,19 +45,22 @@ where
             Poll::Ready(None) => {
                 if !self.dumped {
                     self.dumped = true;
-                    let body = String::from_utf8_lossy(&self.buffer).into_owned();
+                    let body = crate::diagnostics::dump_body_from_bytes(&self.buffer);
+                    if body.is_base64() {
+                        tracing::warn!(
+                            request_id = %self.request_id,
+                            direction = "response",
+                            body_len = self.buffer.len(),
+                            "non-utf8 streaming upstream response"
+                        );
+                    }
                     let headers = std::mem::take(&mut self.response_headers);
-                    self.diagnostics.record_dump(
-                        &DumpEvent {
-                            request_id: self.request_id.clone(),
-                            ts: crate::diagnostics::ts_string(),
-                            stage: "egress".into(),
-                            direction: "response".into(),
-                            model: self.model.clone(),
-                            headers,
-                            body,
-                            status: Some(self.status),
-                        },
+                    self.diagnostics.record_response_dump(
+                        &self.request_id,
+                        &self.model,
+                        headers,
+                        body,
+                        self.status,
                         false,
                     );
                 }
@@ -65,6 +68,32 @@ where
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl<S> Drop for DiagnosticStream<S> {
+    fn drop(&mut self) {
+        if self.dumped || !self.diagnostics.dump_enabled() || self.buffer.is_empty() {
+            return;
+        }
+        let body = crate::diagnostics::dump_body_from_bytes(&self.buffer);
+        if body.is_base64() {
+            tracing::warn!(
+                request_id = %self.request_id,
+                direction = "response",
+                body_len = self.buffer.len(),
+                "non-utf8 streaming upstream response (dropped before EOF)"
+            );
+        }
+        let headers = std::mem::take(&mut self.response_headers);
+        self.diagnostics.record_response_dump(
+            &self.request_id,
+            &self.model,
+            headers,
+            body,
+            self.status,
+            false,
+        );
     }
 }
 

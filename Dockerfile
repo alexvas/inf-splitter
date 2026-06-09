@@ -14,7 +14,7 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=bind,source=certs/ca-bundle.crt,target=/tmp/ca-bundle.crt \
     if [ -s /tmp/ca-bundle.crt ]; then \
-      cp /tmp/ca-bundle.crt /usr/local/share/ca-certificates/corp-ca.crt; \
+      cp /tmp/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt; \
     fi; \
     cargo build --locked --release
 

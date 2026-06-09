@@ -99,8 +99,14 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
                 let result = tokio::time::timeout(CHECK_TIMEOUT, client.head(&url).send()).await;
                 match result {
                     Ok(Ok(_)) => (name, "ok".to_string()),
-                    Ok(Err(_)) => (name, "unreachable".to_string()),
-                    Err(_) => (name, "timeout".to_string()),
+                    Ok(Err(e)) => {
+                        tracing::warn!(upstream = %name, url = %url, error = ?e, "health probe failed: unreachable");
+                        (name, "unreachable".to_string())
+                    },
+                    Err(_) => {
+                        tracing::warn!(upstream = %name, url = %url, "health probe failed: timeout");
+                        (name, "timeout".to_string())
+                    },
                 }
             }
         })

@@ -2227,6 +2227,97 @@ models = "test-model"
     );
 }
 
+/// When `max_file_size` is set, diagnostics output files must rotate when
+/// the current file exceeds the limit.
+#[tokio::test]
+async fn diagnostics_file_rotates_on_max_file_size() {
+    use common::wait_for_file;
+    use std::fs;
+
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("rot-model", "response-text"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-rot-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "rot-model"
+
+[diagnostics]
+dump_mode = "all"
+dump_output = "{dump_path}"
+max_file_size = "1k"
+"#,
+        dump_path = tmp.display()
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        max_file_size: Some(1024),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let client = reqwest::Client::new();
+
+    // Send multiple requests to fill the file past 1KB
+    for i in 0..5 {
+        let response = client
+            .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "rot-model",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": format!("msg-{}", i)}]
+            }))
+            .send()
+            .await
+            .expect("proxy request");
+        // Consume body to trigger dump recording
+        let _ = response.text().await;
+    }
+
+    let content = wait_for_file(&tmp).await;
+
+    // Verify the current file has some content (latest dumps)
+    assert!(
+        !content.trim().is_empty(),
+        "current file should have content"
+    );
+
+    // Verify a rotated file exists in the same directory
+    let dir = tmp.parent().unwrap();
+    let rotated: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("inf-splitter-rot-"))
+                && e.file_name().to_string_lossy() != tmp.file_name().unwrap().to_string_lossy()
+        })
+        .collect();
+
+    assert!(
+        !rotated.is_empty(),
+        "must have at least one rotated file in {:?}",
+        dir
+    );
+
+    // Clean up rotated files
+    for entry in rotated {
+        let _ = fs::remove_file(entry.path());
+    }
+    let _ = fs::remove_file(&tmp);
+}
+
 fn uuid_suffix() -> String {
     use std::time::SystemTime;
     let ts = SystemTime::now()

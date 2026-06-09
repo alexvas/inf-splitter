@@ -80,6 +80,9 @@ struct DiagnosticsConfigRaw {
     stats_mode: Option<DiagnosticMode>,
     dump_mode: Option<DiagnosticMode>,
     flush_period: Option<String>,
+    max_file_size: Option<String>,
+    max_rotated_size: Option<String>,
+    compression: Option<crate::diagnostics::Compression>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +192,19 @@ impl Config {
                     .as_deref()
                     .map(parse_duration_field)
                     .transpose()?,
+                max_file_size: raw
+                    .max_file_size
+                    .as_deref()
+                    .map(parse_byte_size_field)
+                    .transpose()?
+                    .map(|v| v as u64),
+                max_rotated_size: raw
+                    .max_rotated_size
+                    .as_deref()
+                    .map(parse_byte_size_field)
+                    .transpose()?
+                    .map(|v| v as u64),
+                compression: raw.compression,
             },
             None => DiagnosticsConfig::default(),
         };
@@ -404,31 +420,25 @@ pub fn parse_byte_size(raw: &str) -> Result<usize, String> {
     if raw.is_empty() {
         return Err("must not be empty".to_string());
     }
-    if let Some(k) = raw.strip_suffix('k') {
-        if k.is_empty() {
-            return Err("expected integer before 'k'".to_string());
+    for (suffix, multiplier) in [
+        ("k", 1024u64),
+        ("m", 1024 * 1024),
+        ("g", 1024 * 1024 * 1024),
+    ] {
+        if let Some(val) = raw.strip_suffix(suffix) {
+            if val.is_empty() {
+                return Err(format!("expected integer before '{suffix}'"));
+            }
+            let n: u64 = val
+                .parse()
+                .map_err(|_| format!("expected integer before '{suffix}'"))?;
+            let bytes = n
+                .checked_mul(multiplier)
+                .ok_or_else(|| "size overflow".to_string())?;
+            return usize::try_from(bytes).map_err(|_| "size too large".to_string());
         }
-        let n: u64 = k
-            .parse()
-            .map_err(|_| "expected integer before 'k'".to_string())?;
-        let bytes = n
-            .checked_mul(1024)
-            .ok_or_else(|| "size overflow".to_string())?;
-        return usize::try_from(bytes).map_err(|_| "size too large".to_string());
     }
-    if let Some(m) = raw.strip_suffix('m') {
-        if m.is_empty() {
-            return Err("expected integer before 'm'".to_string());
-        }
-        let n: u64 = m
-            .parse()
-            .map_err(|_| "expected integer before 'm'".to_string())?;
-        let bytes = n
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| "size overflow".to_string())?;
-        return usize::try_from(bytes).map_err(|_| "size too large".to_string());
-    }
-    Err("expected suffix 'k' or 'm' (e.g. 512k, 2m)".to_string())
+    Err("expected suffix 'k', 'm', or 'g' (e.g. 512k, 2m, 1g)".to_string())
 }
 
 fn parse_duration_field(raw: &str) -> Result<Duration, ConfigError> {
@@ -597,6 +607,12 @@ mod tests {
     fn parse_byte_size_accepts_k_and_m_suffixes() {
         assert_eq!(parse_byte_size("512k").unwrap(), 512 * 1024);
         assert_eq!(parse_byte_size("2m").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_g_suffix() {
+        assert_eq!(parse_byte_size("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("5g").unwrap(), 5 * 1024 * 1024 * 1024);
     }
 
     #[test]

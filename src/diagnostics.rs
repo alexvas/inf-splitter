@@ -1,5 +1,5 @@
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +19,12 @@ pub struct DiagnosticsConfig {
     /// When set, flush to disk at most this often (e.g. `10s`).
     /// When `None`, flush after every line.
     pub flush_period: Option<Duration>,
+    /// Rotate current file when it exceeds this size (applies to `Sink::File` only).
+    pub max_file_size: Option<u64>,
+    /// Delete oldest rotated files when total rotated size exceeds this.
+    pub max_rotated_size: Option<u64>,
+    /// Compress rotated files.
+    pub compression: Option<Compression>,
 }
 
 impl Default for DiagnosticsConfig {
@@ -29,6 +35,9 @@ impl Default for DiagnosticsConfig {
             stats_mode: DiagnosticMode::Off,
             dump_mode: DiagnosticMode::Off,
             flush_period: None,
+            max_file_size: None,
+            max_rotated_size: None,
+            compression: None,
         }
     }
 }
@@ -46,6 +55,15 @@ pub enum Sink {
     Stderr,
     Stdout,
     File(PathBuf),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    Zip,
+    Bz2,
+    #[serde(rename = "7z")]
+    SevenZ,
 }
 
 /// Handle for sending diagnostic events to the background writer task.
@@ -174,12 +192,30 @@ impl Diagnostics {
         let stats_mode = config.stats_mode.clone();
         let dump_mode = config.dump_mode.clone();
 
-        let stats_handle = tokio::task::spawn_blocking(move || {
-            writer_loop(stats_rx, config.stats_output, config.flush_period);
-        });
-        let dump_handle = tokio::task::spawn_blocking(move || {
-            writer_loop(dump_rx, config.dump_output, config.flush_period);
-        });
+        let stats_handle = {
+            let cfg = RotatingWriterConfig {
+                sink: config.stats_output,
+                flush_period: config.flush_period,
+                max_file_size: config.max_file_size,
+                max_rotated_size: config.max_rotated_size,
+                compression: config.compression.clone(),
+            };
+            tokio::task::spawn_blocking(move || {
+                writer_loop(stats_rx, cfg);
+            })
+        };
+        let dump_handle = {
+            let cfg = RotatingWriterConfig {
+                sink: config.dump_output,
+                flush_period: config.flush_period,
+                max_file_size: config.max_file_size,
+                max_rotated_size: config.max_rotated_size,
+                compression: config.compression,
+            };
+            tokio::task::spawn_blocking(move || {
+                writer_loop(dump_rx, cfg);
+            })
+        };
         // Supervisors: log panics from background writers.
         tokio::spawn(async move {
             if let Err(e) = stats_handle.await {
@@ -345,49 +381,378 @@ impl Diagnostics {
 
 // ── background writer ────────────────────────────────────────────
 
-fn open_sink(sink: &Sink) -> Box<dyn Write + Send> {
-    match sink {
-        Sink::Stderr => Box::new(std::io::stderr()),
-        Sink::Stdout => Box::new(std::io::stdout()),
-        Sink::File(path) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+fn open_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Generate a rotated filename: `{stem}-YYYY-MM-DD-NNN.{ext}`.
+/// Scans the directory for existing rotated files to determine the next sequence
+/// number for today.
+fn rotate_filename(path: &std::path::Path) -> PathBuf {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = path.extension().unwrap_or_default().to_string_lossy();
+
+    let today = chrono_now();
+    let prefix = format!("{stem}-{today}-");
+
+    // Find highest sequence number for today
+    let mut max_seq = 0u32;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(&prefix) {
+                continue;
             }
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                Ok(f) => Box::new(f),
-                Err(e) => {
-                    tracing::error!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to open diagnostics file, falling back to stderr"
-                    );
-                    Box::new(std::io::stderr())
+            // Try uncompressed (.ext) and compressed (.ext.zip, .ext.gz, etc.)
+            let suffixes: &[&str] = if ext.is_empty() {
+                &[]
+            } else {
+                &[&*ext, "gz", "zip", "bz2", "7z"]
+            };
+            for suffix in suffixes {
+                let full_suffix = if *suffix == ext.as_ref() {
+                    format!(".{}", suffix)
+                } else {
+                    format!(".{}.{}", ext, suffix)
+                };
+                if name.ends_with(&full_suffix) {
+                    let inner = &name[prefix.len()..name.len() - full_suffix.len()];
+                    if let Ok(n) = inner.parse::<u32>() {
+                        max_seq = max_seq.max(n);
+                    }
+                    break;
                 }
             }
         }
     }
+
+    let seq = max_seq + 1;
+    path.with_file_name(format!("{prefix}{seq:03}.{ext}"))
 }
 
-fn writer_loop(mut receiver: mpsc::Receiver<String>, sink: Sink, flush_period: Option<Duration>) {
-    let inner = open_sink(&sink);
+/// Return today's date as "YYYY-MM-DD".
+fn chrono_now() -> String {
+    // Avoid pulling in chrono — compute from SystemTime
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    // days since epoch
+    let days = secs / 86400;
+    // Approximate year/month/day from days since 1970-01-01.
+    // This is a simplified calendar — good enough for filenames.
+    let (y, m, d) = civil_from_days(days as i64 + 719468); // 719468 = days from 0000-01-01 to 1970-01-01
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Convert days since 0000-03-01 to (year, month, day).
+/// Based on Howard Hinnant's algorithm.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Compress a file in a background thread. Returns the compressed path on success.
+fn compress_file(src: PathBuf, compression: &Compression) -> tokio::task::JoinHandle<()> {
+    let comp = compression.clone();
+    tokio::task::spawn_blocking(move || {
+        let ext = match &comp {
+            Compression::Zip => "zip",
+            Compression::Bz2 => "bz2",
+            Compression::SevenZ => "7z",
+        };
+        let dst = src.with_extension(format!(
+            "{}.{}",
+            src.extension().unwrap_or_default().to_string_lossy(),
+            ext
+        ));
+
+        match &comp {
+            Compression::Zip => {
+                let input = match std::fs::File::open(&src) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!(src = %src.display(), error = %e, "compress: open failed");
+                        return;
+                    }
+                };
+                let output = match std::fs::File::create(&dst) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!(dst = %dst.display(), error = %e, "compress: create failed");
+                        return;
+                    }
+                };
+                let mut zipw = zip::ZipWriter::new(output);
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                let entry_name = src.file_name().unwrap_or_default().to_string_lossy();
+                if let Err(e) = zipw.start_file(entry_name.as_ref(), options) {
+                    tracing::error!(dst = %dst.display(), error = %e, "compress: zip start failed");
+                    let _ = std::fs::remove_file(&dst);
+                    return;
+                }
+                if let Err(e) = std::io::copy(&mut std::io::BufReader::new(input), &mut zipw) {
+                    tracing::error!(src = %src.display(), error = %e, "compress: zip write failed");
+                    let _ = std::fs::remove_file(&dst);
+                    return;
+                }
+                if let Err(e) = zipw.finish() {
+                    tracing::error!(dst = %dst.display(), error = %e, "compress: zip finish failed");
+                    let _ = std::fs::remove_file(&dst);
+                    return;
+                }
+                if let Err(e) = std::fs::remove_file(&src) {
+                    tracing::error!(src = %src.display(), error = %e, "compress: remove original failed");
+                }
+                tracing::debug!(src = %src.display(), dst = %dst.display(), "rotated file compressed");
+            }
+            Compression::Bz2 | Compression::SevenZ => {
+                tracing::warn!(
+                    compression = ?comp,
+                    "compression not yet implemented, leaving uncompressed"
+                );
+            }
+        }
+    })
+}
+
+/// Delete oldest rotated files until total size ≤ `max_size`.
+/// Rotated files match `{stem}-*{ext}[.{comp_ext}]`.
+fn cleanup_rotated_files(path: &Path, max_size: u64) {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = path.extension().unwrap_or_default().to_string_lossy();
+    let stem_prefix = format!("{}-", stem);
+
+    let mut rotated: Vec<(PathBuf, u64)> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let name = p.file_name()?.to_string_lossy();
+                let current = path.file_name()?.to_string_lossy();
+                if name != current && name.starts_with(&stem_prefix) {
+                    // Accept both uncompressed (.ndjson) and compressed (.ndjson.gz, etc.)
+                    if name.ends_with(&*ext) || name.contains(&format!(".{}.", ext)) {
+                        let meta = e.metadata().ok()?;
+                        return Some((p, meta.len()));
+                    }
+                }
+                None
+            })
+            .collect(),
+        Err(_) => return,
+    };
+
+    // Sort by name (which encodes date+seq), oldest first
+    rotated.sort_by(|a, b| a.0.file_name().cmp(&b.0.file_name()));
+
+    let total: u64 = rotated.iter().map(|(_, s)| s).sum();
+    let mut excess = total.saturating_sub(max_size);
+
+    for (path, size) in &rotated {
+        if excess == 0 {
+            break;
+        }
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::error!(path = %path.display(), error = %e, "cleanup: failed to remove");
+        } else {
+            excess = excess.saturating_sub(*size);
+        }
+    }
+}
+
+/// Rotation-aware writer for diagnostics files.
+struct RotatingWriter {
+    path: PathBuf,
+    writer: BufWriter<std::fs::File>,
+    bytes_written: u64,
+    max_file_size: Option<u64>,
+    compression: Option<Compression>,
+}
+
+impl RotatingWriter {
+    fn new(
+        path: PathBuf,
+        max_file_size: Option<u64>,
+        compression: Option<Compression>,
+    ) -> std::io::Result<Self> {
+        let max_file_size = max_file_size.filter(|&s| s > 0);
+        let file = open_file(&path)?;
+        let bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            path,
+            writer: BufWriter::new(file),
+            bytes_written,
+            max_file_size,
+            compression,
+        })
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        let line_bytes = line.as_bytes();
+        // +1 for newline
+        let total = line_bytes.len() as u64 + 1;
+
+        if let Some(limit) = self.max_file_size {
+            if self.bytes_written + total > limit {
+                self.rotate()?;
+            }
+        }
+
+        writeln!(self.writer, "{line}")?;
+        self.bytes_written += total;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.writer.flush()?;
+
+        let rotated_path = rotate_filename(&self.path);
+        std::fs::rename(&self.path, &rotated_path)?;
+
+        // Spawn compression in background if configured
+        if let Some(ref comp) = self.compression {
+            let handle = compress_file(rotated_path, comp);
+            tokio::spawn(async move {
+                if let Err(e) = handle.await {
+                    tracing::error!("compression task panicked: {:?}", e);
+                }
+            });
+        }
+
+        // Open new file
+        let file = open_file(&self.path)?;
+        self.writer = BufWriter::new(file);
+        self.bytes_written = 0;
+        Ok(())
+    }
+}
+
+/// Configuration passed to the writer loop.
+struct RotatingWriterConfig {
+    sink: Sink,
+    flush_period: Option<Duration>,
+    max_file_size: Option<u64>,
+    max_rotated_size: Option<u64>,
+    compression: Option<Compression>,
+}
+
+fn writer_loop(receiver: mpsc::Receiver<String>, config: RotatingWriterConfig) {
+    match config.sink {
+        Sink::File(path) => {
+            // Startup: cleanup old files and rotate current if needed
+            if let Some(max_rotated) = config.max_rotated_size {
+                cleanup_rotated_files(&path, max_rotated);
+            }
+            let mut rw = match RotatingWriter::new(path, config.max_file_size, config.compression) {
+                Ok(rw) => rw,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to open rotating writer, falling back to stderr");
+                    writer_loop_stderr(receiver, config.flush_period);
+                    return;
+                }
+            };
+            // Pre-rotate if existing file already exceeds limit
+            if let Some(limit) = config.max_file_size {
+                if rw.bytes_written >= limit {
+                    if let Err(e) = rw.rotate() {
+                        tracing::error!(error = %e, "startup rotate failed");
+                    }
+                }
+            }
+            writer_loop_rotating(receiver, rw, config.flush_period);
+        }
+        Sink::Stderr | Sink::Stdout => {
+            writer_loop_stream(receiver, &config.sink, config.flush_period);
+        }
+    }
+}
+
+fn writer_loop_rotating(
+    mut receiver: mpsc::Receiver<String>,
+    mut rw: RotatingWriter,
+    flush_period: Option<Duration>,
+) {
+    let period = match flush_period {
+        Some(p) => p,
+        None => {
+            while let Some(line) = receiver.blocking_recv() {
+                if let Err(e) = rw.write_line(&line) {
+                    tracing::error!(error = %e, "diagnostics write error, falling back to stderr");
+                    return writer_loop_stderr(receiver, None);
+                }
+                if let Err(e) = rw.flush() {
+                    tracing::error!(error = %e, "diagnostics flush error, falling back to stderr");
+                    return writer_loop_stderr(receiver, None);
+                }
+            }
+            return;
+        }
+    };
+
+    let mut last_flush = Instant::now();
+    while let Some(line) = receiver.blocking_recv() {
+        if let Err(e) = rw.write_line(&line) {
+            tracing::error!(error = %e, "diagnostics write error, falling back to stderr");
+            return writer_loop_stderr(receiver, Some(period));
+        }
+        if last_flush.elapsed() >= period {
+            if let Err(e) = rw.flush() {
+                tracing::error!(error = %e, "diagnostics flush error, falling back to stderr");
+                return writer_loop_stderr(receiver, Some(period));
+            }
+            last_flush = Instant::now();
+        }
+    }
+    if let Err(e) = rw.flush() {
+        tracing::error!(error = %e, "diagnostics final flush error");
+    }
+}
+
+fn writer_loop_stream(
+    mut receiver: mpsc::Receiver<String>,
+    sink: &Sink,
+    flush_period: Option<Duration>,
+) {
+    let inner: Box<dyn Write + Send> = match sink {
+        Sink::Stderr => Box::new(std::io::stderr()),
+        Sink::Stdout => Box::new(std::io::stdout()),
+        Sink::File(_) => unreachable!(),
+    };
     let mut writer = BufWriter::new(inner);
 
     let period = match flush_period {
         Some(p) => p,
         None => {
-            // Flush every line.
             while let Some(line) = receiver.blocking_recv() {
                 if let Err(e) = writeln!(writer, "{line}") {
-                    tracing::error!(error = %e, "diagnostics write error, reopening sink");
-                    writer = BufWriter::new(open_sink(&sink));
+                    tracing::error!(error = %e, "diagnostics write error");
                 }
                 if let Err(e) = writer.flush() {
-                    tracing::error!(error = %e, "diagnostics flush error, reopening sink");
-                    writer = BufWriter::new(open_sink(&sink));
+                    tracing::error!(error = %e, "diagnostics flush error");
                 }
             }
             return;
@@ -397,21 +762,22 @@ fn writer_loop(mut receiver: mpsc::Receiver<String>, sink: Sink, flush_period: O
     let mut last_flush = Instant::now();
     while let Some(line) = receiver.blocking_recv() {
         if let Err(e) = writeln!(writer, "{line}") {
-            tracing::error!(error = %e, "diagnostics write error, reopening sink");
-            writer = BufWriter::new(open_sink(&sink));
+            tracing::error!(error = %e, "diagnostics write error");
         }
         if last_flush.elapsed() >= period {
             if let Err(e) = writer.flush() {
-                tracing::error!(error = %e, "diagnostics periodic flush error, reopening sink");
-                writer = BufWriter::new(open_sink(&sink));
+                tracing::error!(error = %e, "diagnostics flush error");
             }
             last_flush = Instant::now();
         }
     }
-    // Final flush on shutdown.
     if let Err(e) = writer.flush() {
         tracing::error!(error = %e, "diagnostics final flush error");
     }
+}
+
+fn writer_loop_stderr(receiver: mpsc::Receiver<String>, flush_period: Option<Duration>) {
+    writer_loop_stream(receiver, &Sink::Stderr, flush_period);
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -877,6 +1243,20 @@ mod tests {
         let parts = detail[0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["type"], "non-utf8");
         assert_eq!(parts[0]["len"], 4);
+    }
+
+    // --- civil_from_days ---
+
+    #[test]
+    fn civil_from_days_epoch() {
+        // 1970-01-01 = epoch reference (day 0)
+        assert_eq!(civil_from_days(719468), (1970, 1, 1));
+        // Day 1 after epoch
+        assert_eq!(civil_from_days(719469), (1970, 1, 2));
+        // Internal consistency: consecutive days produce consecutive dates
+        let (y1, m1, d1) = civil_from_days(730000);
+        let (y2, m2, d2) = civil_from_days(730001);
+        assert!(y2 >= y1 && (y2 > y1 || m2 >= m1) && (y2 > y1 || m2 > m1 || d2 > d1));
     }
 
     // --- dump_body_from_bytes ---

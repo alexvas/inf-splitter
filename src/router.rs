@@ -200,6 +200,7 @@ async fn dispatch_messages(
         state
             .diagnostics
             .record_stats(&crate::diagnostics::StatsEvent {
+                section: "?".into(),
                 request_id: request_id.clone(),
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
@@ -220,6 +221,7 @@ async fn dispatch_messages(
         let body = crate::diagnostics::dump_body_from_bytes(&body);
         state.diagnostics.record_request_dump(
             &request_id,
+            "?",
             "ingress",
             "?",
             &headers,
@@ -233,6 +235,7 @@ async fn dispatch_messages(
         state
             .diagnostics
             .record_stats(&crate::diagnostics::StatsEvent {
+                section: "?".into(),
                 request_id: state.diagnostics.new_request_id(),
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
@@ -256,6 +259,7 @@ async fn dispatch_messages(
         state
             .diagnostics
             .record_stats(&crate::diagnostics::StatsEvent {
+                section: "?".into(),
                 request_id: state.diagnostics.new_request_id(),
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
@@ -279,6 +283,7 @@ async fn dispatch_messages(
         state
             .diagnostics
             .record_stats(&crate::diagnostics::StatsEvent {
+                section: "?".into(),
                 request_id: state.diagnostics.new_request_id(),
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),

@@ -50,3 +50,10 @@ dump_mode = "error"
 # Выполняется в отдельном потоке, не блокирует запись.
 # Отсутствие опции — без сжатия.
 #compression = "zip"
+
+# Разделять diagnostic-файлы по endpoint'ам (секциям конфига).
+# Вместо строки — таблица { per_section = "путь" }.
+# Будут создаваться файлы вида diag-ollama.ndjson,
+# dump-deepseek-2026-06-09-001.ndjson.zip и т.д.
+#stats_output = { per_section = "diag.ndjson" }
+#dump_output = { per_section = "dump.ndjson" }

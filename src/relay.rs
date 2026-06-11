@@ -12,6 +12,7 @@ pub(crate) struct RelayContext<'a> {
     pub(crate) diagnostics: &'a Diagnostics,
     pub(crate) request_id: String,
     pub(crate) model: String,
+    pub(crate) section: String,
 }
 
 pub(crate) struct DiagnosticStream<S> {
@@ -19,6 +20,7 @@ pub(crate) struct DiagnosticStream<S> {
     pub(crate) buffer: Vec<u8>,
     pub(crate) diagnostics: Diagnostics,
     pub(crate) request_id: String,
+    pub(crate) section: String,
     pub(crate) model: String,
     pub(crate) response_headers: Vec<(String, String)>,
     pub(crate) status: u16,
@@ -57,6 +59,7 @@ where
                     let headers = std::mem::take(&mut self.response_headers);
                     self.diagnostics.record_response_dump(
                         &self.request_id,
+                        &self.section,
                         &self.model,
                         headers,
                         body,
@@ -88,6 +91,7 @@ impl<S> Drop for DiagnosticStream<S> {
         let headers = std::mem::take(&mut self.response_headers);
         self.diagnostics.record_response_dump(
             &self.request_id,
+            &self.section,
             &self.model,
             headers,
             body,

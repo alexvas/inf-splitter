@@ -74,9 +74,16 @@ const DEFAULT_UPSTREAM_TIMEOUT: &str = "5m";
 const DEFAULT_MAX_REQUEST_BODY: &str = "2m";
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SinkRaw {
+    Simple(String),
+    PerSection { per_section: String },
+}
+
+#[derive(Debug, Deserialize)]
 struct DiagnosticsConfigRaw {
-    stats_output: Option<String>,
-    dump_output: Option<String>,
+    stats_output: Option<SinkRaw>,
+    dump_output: Option<SinkRaw>,
     stats_mode: Option<DiagnosticMode>,
     dump_mode: Option<DiagnosticMode>,
     flush_period: Option<String>,
@@ -183,8 +190,8 @@ impl Config {
         let listen_addr = resolve_listen_addr(file.port)?;
         let diagnostics = match file.diagnostics {
             Some(raw) => DiagnosticsConfig {
-                stats_output: sink_from_str(raw.stats_output.as_deref()),
-                dump_output: sink_from_str(raw.dump_output.as_deref()),
+                stats_output: sink_from_raw(raw.stats_output),
+                dump_output: sink_from_raw(raw.dump_output),
                 stats_mode: raw.stats_mode.unwrap_or(DiagnosticMode::Off),
                 dump_mode: raw.dump_mode.unwrap_or(DiagnosticMode::Off),
                 flush_period: raw
@@ -491,13 +498,15 @@ fn parse_models(name: &str, models: ModelsField) -> Result<(bool, HashSet<String
 /// Parse a diagnostics sink from a user-supplied string.
 ///
 /// The strings "stdout" and "stderr" are reserved for console sinks.
-/// A file literally named "stdout" or "stderr" cannot be used — use a
-/// relative path like "./stdout" instead.
-fn sink_from_str(raw: Option<&str>) -> Sink {
-    match raw.map(str::trim) {
-        Some("stdout") => Sink::Stdout,
-        Some("stderr") | None => Sink::Stderr,
-        Some(path) => Sink::File(path.into()),
+fn sink_from_raw(raw: Option<SinkRaw>) -> Sink {
+    match raw {
+        Some(SinkRaw::Simple(s)) => match s.trim() {
+            "stdout" => Sink::Stdout,
+            "stderr" => Sink::Stderr,
+            path => Sink::File(path.into()),
+        },
+        Some(SinkRaw::PerSection { per_section }) => Sink::FilePerSection(per_section.into()),
+        None => Sink::Stderr,
     }
 }
 

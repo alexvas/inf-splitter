@@ -52,6 +52,7 @@ impl OpenAiHandler {
         let body = strip_adaptive_thinking(body);
         let mut req: MessageCreateRequest = serde_json::from_slice(&body).map_err(|err| {
             self.diagnostics.record_stats(&StatsEvent {
+                section: route.section.clone(),
                 request_id: self.diagnostics.new_request_id(),
                 ts: crate::diagnostics::ts_string(),
                 direction: "anthropic->openai".into(),
@@ -128,6 +129,7 @@ impl OpenAiHandler {
             let error_body = upstream.text().await.unwrap_or_default();
             let request_id = self.diagnostics.new_request_id();
             self.diagnostics.record_stats(&StatsEvent {
+                section: route.section.clone(),
                 request_id: request_id.clone(),
                 ts: crate::diagnostics::ts_string(),
                 direction: "openai->openai".into(),
@@ -156,6 +158,7 @@ impl OpenAiHandler {
             }
             self.diagnostics.record_request_dump(
                 &request_id,
+                &route.section,
                 "ingress",
                 &model,
                 request_headers,
@@ -166,6 +169,7 @@ impl OpenAiHandler {
             if let Some(ref body_bytes) = downstream_body {
                 self.diagnostics.record_request_dump(
                     &request_id,
+                    &route.section,
                     "egress",
                     &model,
                     request_headers,
@@ -192,11 +196,13 @@ impl OpenAiHandler {
                 diagnostics: &self.diagnostics,
                 request_id: request_id.clone(),
                 model: model.clone(),
+                section: route.section.clone(),
             },
         )
         .await?;
         let is_streaming = sse::is_event_stream(relayed.headers());
         self.diagnostics.record_stats(&StatsEvent {
+            section: route.section.clone(),
             request_id: request_id.clone(),
             ts: crate::diagnostics::ts_string(),
             direction: "openai->openai".into(),
@@ -216,6 +222,7 @@ impl OpenAiHandler {
         // Ingress dump: original client body before token caps.
         self.diagnostics.record_request_dump(
             &request_id,
+            &route.section,
             "ingress",
             &model,
             request_headers,
@@ -227,6 +234,7 @@ impl OpenAiHandler {
         if let Some(ref body_bytes) = downstream_body {
             self.diagnostics.record_request_dump(
                 &request_id,
+                &route.section,
                 "egress",
                 &model,
                 request_headers,
@@ -302,6 +310,7 @@ impl OpenAiHandler {
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
             let request_id = self.diagnostics.new_request_id();
             self.diagnostics.record_stats(&StatsEvent {
+                section: route.section.clone(),
                 request_id: request_id.clone(),
                 ts: crate::diagnostics::ts_string(),
                 direction: "anthropic->openai".into(),
@@ -322,6 +331,7 @@ impl OpenAiHandler {
             if let Some(ref s) = ingress_str {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
+                        section: route.section.clone(),
                         request_id: request_id.clone(),
                         ts: crate::diagnostics::ts_string(),
                         stage: "ingress".into(),
@@ -345,6 +355,7 @@ impl OpenAiHandler {
             if let Some(ref s) = egress_str {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
+                        section: route.section.clone(),
                         request_id,
                         ts: crate::diagnostics::ts_string(),
                         stage: "egress".into(),
@@ -372,6 +383,7 @@ impl OpenAiHandler {
         // Success diagnostics.
         let request_id = self.diagnostics.new_request_id();
         self.diagnostics.record_stats(&StatsEvent {
+            section: route.section.clone(),
             request_id: request_id.clone(),
             ts: crate::diagnostics::ts_string(),
             direction: "anthropic->openai".into(),
@@ -391,6 +403,7 @@ impl OpenAiHandler {
         if let Some(ingress_str) = ingress_str {
             self.diagnostics.record_dump(
                 &crate::diagnostics::DumpEvent {
+                    section: route.section.clone(),
                     request_id: request_id.clone(),
                     ts: crate::diagnostics::ts_string(),
                     stage: "ingress".into(),
@@ -413,6 +426,7 @@ impl OpenAiHandler {
         if let Some(egress_str) = egress_str {
             self.diagnostics.record_dump(
                 &crate::diagnostics::DumpEvent {
+                    section: route.section.clone(),
                     request_id,
                     ts: crate::diagnostics::ts_string(),
                     stage: "egress".into(),
@@ -485,6 +499,7 @@ impl OpenAiHandler {
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
             let request_id = self.diagnostics.new_request_id();
             self.diagnostics.record_stats(&StatsEvent {
+                section: route.section.clone(),
                 request_id: request_id.clone(),
                 ts: crate::diagnostics::ts_string(),
                 direction: "anthropic->openai".into(),
@@ -504,6 +519,7 @@ impl OpenAiHandler {
             if let Some(ref s) = ingress_str {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
+                        section: route.section.clone(),
                         request_id: request_id.clone(),
                         ts: crate::diagnostics::ts_string(),
                         stage: "ingress".into(),
@@ -526,6 +542,7 @@ impl OpenAiHandler {
             if let Some(ref s) = egress_str {
                 self.diagnostics.record_dump(
                     &crate::diagnostics::DumpEvent {
+                        section: route.section.clone(),
                         request_id,
                         ts: crate::diagnostics::ts_string(),
                         stage: "egress".into(),
@@ -613,6 +630,7 @@ impl OpenAiHandler {
         // Success diagnostics: recorded before returning the stream.
         let request_id = self.diagnostics.new_request_id();
         self.diagnostics.record_stats(&StatsEvent {
+            section: route.section.clone(),
             request_id: request_id.clone(),
             ts: crate::diagnostics::ts_string(),
             direction: "anthropic->openai".into(),
@@ -632,6 +650,7 @@ impl OpenAiHandler {
         if let Some(ingress_str) = ingress_str {
             self.diagnostics.record_dump(
                 &crate::diagnostics::DumpEvent {
+                    section: route.section.clone(),
                     request_id: request_id.clone(),
                     ts: crate::diagnostics::ts_string(),
                     stage: "ingress".into(),
@@ -654,6 +673,7 @@ impl OpenAiHandler {
         if let Some(egress_str) = egress_str {
             self.diagnostics.record_dump(
                 &crate::diagnostics::DumpEvent {
+                    section: route.section.clone(),
                     request_id,
                     ts: crate::diagnostics::ts_string(),
                     stage: "egress".into(),
@@ -712,6 +732,7 @@ async fn relay_openai_upstream(
             buffer: Vec::new(),
             diagnostics: ctx.diagnostics.clone(),
             request_id: ctx.request_id,
+            section: ctx.section,
             model: ctx.model,
             response_headers: relay_headers.clone(),
             status: status.as_u16(),
@@ -749,6 +770,7 @@ async fn relay_openai_upstream(
     let is_base64 = dump_body.is_base64();
     ctx.diagnostics.record_response_dump(
         &ctx.request_id,
+        &ctx.section,
         &ctx.model,
         relay_headers.clone(),
         dump_body,

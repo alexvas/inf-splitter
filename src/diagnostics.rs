@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -55,6 +56,9 @@ pub enum Sink {
     Stderr,
     Stdout,
     File(PathBuf),
+    /// Write to per-section files derived from this base path.
+    /// `diag.ndjson` + section `ollama` → `diag-ollama.ndjson`.
+    FilePerSection(PathBuf),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,17 +75,35 @@ pub enum Compression {
 /// Cloning is cheap — all clones share the same channel sender.
 #[derive(Clone)]
 pub struct Diagnostics {
-    stats_tx: mpsc::Sender<String>,
-    dump_tx: mpsc::Sender<String>,
+    default_writers: SectionWriters,
     stats_mode: DiagnosticMode,
     dump_mode: DiagnosticMode,
     counter: Arc<AtomicU64>,
     start_secs: u64,
+    section_cfg: Option<Arc<SectionConfig>>,
+    section_channels: Arc<Mutex<HashMap<String, SectionWriters>>>,
+}
+
+/// Per-section writer configuration (stored for lazy writer creation).
+struct SectionConfig {
+    stats_output: Sink,
+    dump_output: Sink,
+    flush_period: Option<Duration>,
+    max_file_size: Option<u64>,
+    max_rotated_size: Option<u64>,
+    compression: Option<Compression>,
+}
+
+#[derive(Clone)]
+struct SectionWriters {
+    stats_tx: mpsc::Sender<String>,
+    dump_tx: mpsc::Sender<String>,
 }
 
 /// Per-request statistics (model, duration, token counts, message breakdown).
 #[derive(Debug, Serialize)]
 pub struct StatsEvent {
+    pub section: String,
     pub request_id: String,
     pub ts: String,
     pub direction: String,
@@ -108,6 +130,7 @@ pub struct StatsEvent {
 /// Raw request or response body dump.
 #[derive(Debug)]
 pub struct DumpEvent {
+    pub section: String,
     pub request_id: String,
     pub ts: String,
     pub stage: String,
@@ -121,8 +144,9 @@ pub struct DumpEvent {
 impl Serialize for DumpEvent {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let fields = if self.body.is_base64() { 10 } else { 9 };
-        let mut s = serializer.serialize_struct("DumpEvent", fields)?;
+        let extra = if self.body.is_base64() { 1 } else { 0 };
+        let mut s = serializer.serialize_struct("DumpEvent", 10 + extra)?;
+        s.serialize_field("section", &self.section)?;
         s.serialize_field("request_id", &self.request_id)?;
         s.serialize_field("ts", &self.ts)?;
         s.serialize_field("stage", &self.stage)?;
@@ -192,9 +216,32 @@ impl Diagnostics {
         let stats_mode = config.stats_mode.clone();
         let dump_mode = config.dump_mode.clone();
 
+        let per_section = matches!(config.stats_output, Sink::FilePerSection(_))
+            || matches!(config.dump_output, Sink::FilePerSection(_));
+        let section_cfg = per_section.then(|| {
+            Arc::new(SectionConfig {
+                stats_output: config.stats_output.clone(),
+                dump_output: config.dump_output.clone(),
+                flush_period: config.flush_period,
+                max_file_size: config.max_file_size,
+                max_rotated_size: config.max_rotated_size,
+                compression: config.compression.clone(),
+            })
+        });
+
+        // Default writer loops: never used when per_section is true (events
+        // route to per-section writers instead). Fall back to stderr so idle
+        // loops don't open a spurious file.
+        let default_sink = |sink: Sink| -> Sink {
+            match sink {
+                Sink::FilePerSection(_) => Sink::Stderr,
+                other => other,
+            }
+        };
+
         let stats_handle = {
             let cfg = RotatingWriterConfig {
-                sink: config.stats_output,
+                sink: default_sink(config.stats_output),
                 flush_period: config.flush_period,
                 max_file_size: config.max_file_size,
                 max_rotated_size: config.max_rotated_size,
@@ -206,7 +253,7 @@ impl Diagnostics {
         };
         let dump_handle = {
             let cfg = RotatingWriterConfig {
-                sink: config.dump_output,
+                sink: default_sink(config.dump_output),
                 flush_period: config.flush_period,
                 max_file_size: config.max_file_size,
                 max_rotated_size: config.max_rotated_size,
@@ -229,12 +276,13 @@ impl Diagnostics {
         });
 
         Self {
-            stats_tx,
-            dump_tx,
+            default_writers: SectionWriters { stats_tx, dump_tx },
             stats_mode,
             dump_mode,
             counter: Arc::new(AtomicU64::new(0)),
             start_secs: epoch_secs(),
+            section_cfg,
+            section_channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -244,12 +292,13 @@ impl Diagnostics {
         let (stats_tx, _rx) = mpsc::channel(1);
         let (dump_tx, _rx) = mpsc::channel(1);
         Self {
-            stats_tx,
-            dump_tx,
+            default_writers: SectionWriters { stats_tx, dump_tx },
             stats_mode: DiagnosticMode::Off,
             dump_mode: DiagnosticMode::Off,
             counter: Arc::new(AtomicU64::new(0)),
             start_secs: epoch_secs(),
+            section_cfg: None,
+            section_channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -279,6 +328,87 @@ impl Diagnostics {
         format!("{}-{}", self.start_secs, n)
     }
 
+    /// Derive a per-section file path from the base diagnostics path.
+    ///
+    /// `diag.ndjson` + `ollama` → `diag-ollama.ndjson`
+    /// `dump.ndjson` + `deepseek` → `dump-deepseek.ndjson`
+    fn section_path(base: &Sink, section: &str) -> Sink {
+        match base {
+            Sink::File(path) | Sink::FilePerSection(path) => {
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = path.extension().unwrap_or_default().to_string_lossy();
+                let sectioned = if ext.is_empty() {
+                    format!("{}-{}", stem, section)
+                } else {
+                    format!("{}-{}.{}", stem, section, ext)
+                };
+                Sink::File(path.with_file_name(sectioned))
+            }
+            Sink::Stderr => Sink::Stderr,
+            Sink::Stdout => Sink::Stdout,
+        }
+    }
+
+    /// Look up or create per-section writer channels.
+    fn get_or_create_section_writers(&self, cfg: &SectionConfig, section: &str) -> SectionWriters {
+        let mut map = self.section_channels.lock().unwrap();
+        if let Some(writers) = map.get(section) {
+            return writers.clone();
+        }
+        let writers = Self::spawn_section_writer(cfg, section);
+        map.insert(section.to_string(), writers.clone());
+        writers
+    }
+
+    /// Spawn background writer loops for a single section.
+    fn spawn_section_writer(cfg: &SectionConfig, section: &str) -> SectionWriters {
+        let (stats_tx, stats_rx) = mpsc::channel(1024);
+        let (dump_tx, dump_rx) = mpsc::channel(1024);
+
+        let stats_sink = Self::section_path(&cfg.stats_output, section);
+        let dump_sink = Self::section_path(&cfg.dump_output, section);
+        let section_owned = section.to_string();
+
+        let stats_handle = {
+            let writer_cfg = RotatingWriterConfig {
+                sink: stats_sink,
+                flush_period: cfg.flush_period,
+                max_file_size: cfg.max_file_size,
+                max_rotated_size: cfg.max_rotated_size,
+                compression: cfg.compression.clone(),
+            };
+            tokio::task::spawn_blocking(move || {
+                writer_loop(stats_rx, writer_cfg);
+            })
+        };
+        let dump_handle = {
+            let writer_cfg = RotatingWriterConfig {
+                sink: dump_sink,
+                flush_period: cfg.flush_period,
+                max_file_size: cfg.max_file_size,
+                max_rotated_size: cfg.max_rotated_size,
+                compression: cfg.compression.clone(),
+            };
+            tokio::task::spawn_blocking(move || {
+                writer_loop(dump_rx, writer_cfg);
+            })
+        };
+
+        let s1 = section_owned.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stats_handle.await {
+                tracing::error!(section = %s1, "stats writer panicked: {:?}", e);
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = dump_handle.await {
+                tracing::error!(section = %section_owned, "dump writer panicked: {:?}", e);
+            }
+        });
+
+        SectionWriters { stats_tx, dump_tx }
+    }
+
     /// Non-blocking send of a stats line. Respects `stats_mode`:
     /// - `Off` → nothing
     /// - `Error` → only if `event.error` is Some
@@ -296,7 +426,15 @@ impl Diagnostics {
         let Ok(json) = serde_json::to_string(event) else {
             return;
         };
-        let _ = self.stats_tx.try_send(json);
+        if let Some(ref cfg) = self.section_cfg {
+            let tx = self
+                .get_or_create_section_writers(cfg, &event.section)
+                .stats_tx
+                .clone();
+            let _ = tx.try_send(json);
+        } else {
+            let _ = self.default_writers.stats_tx.try_send(json);
+        }
     }
 
     /// Non-blocking send of a dump line. Respects `dump_mode`.
@@ -314,7 +452,15 @@ impl Diagnostics {
         let Ok(json) = serde_json::to_string(event) else {
             return;
         };
-        let _ = self.dump_tx.try_send(json);
+        if let Some(ref cfg) = self.section_cfg {
+            let tx = self
+                .get_or_create_section_writers(cfg, &event.section)
+                .dump_tx
+                .clone();
+            let _ = tx.try_send(json);
+        } else {
+            let _ = self.default_writers.dump_tx.try_send(json);
+        }
     }
 
     /// Record a request dump (ingress or egress).
@@ -325,6 +471,7 @@ impl Diagnostics {
     pub fn record_request_dump(
         &self,
         request_id: &str,
+        section: &str,
         stage: &str,
         model: &str,
         headers: &axum::http::HeaderMap,
@@ -334,6 +481,7 @@ impl Diagnostics {
     ) {
         self.record_dump(
             &DumpEvent {
+                section: section.to_string(),
                 request_id: request_id.to_string(),
                 ts: ts_string(),
                 stage: stage.into(),
@@ -355,9 +503,11 @@ impl Diagnostics {
     }
 
     /// Record an egress response dump.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_response_dump(
         &self,
         request_id: &str,
+        section: &str,
         model: &str,
         headers: Vec<(String, String)>,
         body: impl Into<DumpBody>,
@@ -366,6 +516,7 @@ impl Diagnostics {
     ) {
         self.record_dump(
             &DumpEvent {
+                section: section.to_string(),
                 request_id: request_id.to_string(),
                 ts: ts_string(),
                 stage: "egress".into(),
@@ -663,7 +814,7 @@ struct RotatingWriterConfig {
 
 fn writer_loop(receiver: mpsc::Receiver<String>, config: RotatingWriterConfig) {
     match config.sink {
-        Sink::File(path) => {
+        Sink::File(path) | Sink::FilePerSection(path) => {
             // Startup: cleanup old files and rotate current if needed
             if let Some(max_rotated) = config.max_rotated_size {
                 cleanup_rotated_files(&path, max_rotated);
@@ -741,7 +892,7 @@ fn writer_loop_stream(
     let inner: Box<dyn Write + Send> = match sink {
         Sink::Stderr => Box::new(std::io::stderr()),
         Sink::Stdout => Box::new(std::io::stdout()),
-        Sink::File(_) => unreachable!(),
+        Sink::File(_) | Sink::FilePerSection(_) => unreachable!(),
     };
     let mut writer = BufWriter::new(inner);
 
@@ -1027,6 +1178,7 @@ mod tests {
     #[test]
     fn stats_event_serializes_cleanly() {
         let event = StatsEvent {
+            section: "test".into(),
             request_id: "1234-0".into(),
             ts: "1000".into(),
             direction: "openai->openai".into(),
@@ -1054,6 +1206,7 @@ mod tests {
     #[test]
     fn dump_event_serializes_cleanly() {
         let event = DumpEvent {
+            section: "test".into(),
             request_id: "1234-0".into(),
             ts: "1000".into(),
             stage: "ingress".into(),
@@ -1071,6 +1224,7 @@ mod tests {
     #[test]
     fn dump_event_with_encoding_serializes() {
         let event = DumpEvent {
+            section: "test".into(),
             request_id: "1234-0".into(),
             ts: "1000".into(),
             stage: "ingress".into(),
@@ -1088,6 +1242,7 @@ mod tests {
     #[test]
     fn dump_event_without_encoding_skips_field() {
         let event = DumpEvent {
+            section: "test".into(),
             request_id: "1234-0".into(),
             ts: "1000".into(),
             stage: "ingress".into(),

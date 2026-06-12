@@ -56,7 +56,7 @@ models = "default"
 | 字段 | 描述 |
 |------|------|
 | `max_tokens` | 全局`max_tokens`限制（适用于所有上游，除非被覆盖） |
-| `max_output_tokens` | 全局`max_output_tokens`限制（Anthropic/Gemini兼容上游） |
+| `max_output_tokens` | 全局`max_output_tokens`限制（透传，非标准字段；OpenAI兼容上游请用`max_completion_tokens`） |
 | `max_completion_tokens` | 全局`max_completion_tokens`限制（OpenAI兼容上游） |
 
 ### 提供商段
@@ -68,7 +68,7 @@ models = "default"
 | `models` | 单个模型、模型列表或`"default"`（未匹配模型的回退） |
 | `api_key` | 可选；`${VAR}`从环境变量或`secrets/VAR`文件解析 |
 | `max_tokens` | 可选；限制出站请求中的`max_tokens`。如果客户端未设置或超出——代理注入限制 |
-| `max_output_tokens` | 可选；限制`max_output_tokens`（Anthropic/Gemini兼容上游） |
+| `max_output_tokens` | 可选；限制`max_output_tokens`（透传，非标准字段；OpenAI兼容上游请用`max_completion_tokens`） |
 | `max_completion_tokens` | 可选；限制`max_completion_tokens`（OpenAI兼容上游） |
 
 可以通过`INF_SPLITTER_CONFIG`覆盖配置路径。

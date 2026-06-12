@@ -56,7 +56,7 @@ models = "default"
 | Поле | Описание |
 |------|----------|
 | `max_tokens` | Глобальный лимит `max_tokens` (действует для всех upstream, если не переопределён) |
-| `max_output_tokens` | Глобальный лимит `max_output_tokens` (Anthropic/Gemini-совместимые upstream) |
+| `max_output_tokens` | Глобальный лимит `max_output_tokens` (passthrough, нестандартное поле; для OpenAI-совместимых upstream используйте `max_completion_tokens`) |
 | `max_completion_tokens` | Глобальный лимит `max_completion_tokens` (OpenAI-совместимые upstream) |
 
 ### Секции провайдеров
@@ -68,7 +68,7 @@ models = "default"
 | `models` | Одна модель, список моделей или `"default"` (fallback для несматчившихся) |
 | `api_key` | Опционально; `${VAR}` резолвится из env или файла `secrets/VAR` |
 | `max_tokens` | Опционально; лимит на `max_tokens` в исходящем запросе. Если клиент не задал или превысил — прокси подставляет лимит |
-| `max_output_tokens` | Опционально; лимит на `max_output_tokens` (Anthropic/Gemini-совместимые upstream) |
+| `max_output_tokens` | Опционально; лимит на `max_output_tokens` (passthrough, нестандартное поле; для OpenAI-совместимых upstream используйте `max_completion_tokens`) |
 | `max_completion_tokens` | Опционально; лимит на `max_completion_tokens` (OpenAI-совместимые upstream) |
 
 Путь к конфигу можно переопределить через `INF_SPLITTER_CONFIG`.

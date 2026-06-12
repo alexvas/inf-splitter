@@ -56,7 +56,7 @@ Global token limits for all providers. Individual providers can override these.
 | Field | Description |
 |-------|-------------|
 | `max_tokens` | Global `max_tokens` limit (applies to all upstreams unless overridden) |
-| `max_output_tokens` | Global `max_output_tokens` limit (Anthropic/Gemini-compatible upstreams) |
+| `max_output_tokens` | Global `max_output_tokens` limit (passthrough, non-standard; prefer `max_completion_tokens` for OpenAI-compatible upstreams) |
 | `max_completion_tokens` | Global `max_completion_tokens` limit (OpenAI-compatible upstreams) |
 
 ### Provider sections
@@ -68,7 +68,7 @@ Global token limits for all providers. Individual providers can override these.
 | `models` | A single model, a list of models, or `"default"` (fallback for unmatched models) |
 | `api_key` | Optional; `${VAR}` resolves from the environment or `secrets/VAR` file |
 | `max_tokens` | Optional; caps `max_tokens` in the outgoing request. If the client omits or exceeds it, the proxy injects the limit |
-| `max_output_tokens` | Optional; caps `max_output_tokens` (Anthropic/Gemini-compatible upstreams) |
+| `max_output_tokens` | Optional; caps `max_output_tokens` (passthrough, non-standard; prefer `max_completion_tokens` for OpenAI-compatible upstreams) |
 | `max_completion_tokens` | Optional; caps `max_completion_tokens` (OpenAI-compatible upstreams) |
 
 The config path can be overridden via `INF_SPLITTER_CONFIG`.

@@ -166,23 +166,26 @@ async fn poll_diagnostics_file(
     path: &std::path::Path,
     deadline_msg: &str,
     pred: impl Fn(&str) -> bool,
-) -> String {
+) -> Vec<String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if pred(&content) {
-                return content;
+    let content = loop {
+        if let Ok(c) = std::fs::read_to_string(path) {
+            if pred(&c) {
+                break c;
             }
         }
         if tokio::time::Instant::now() > deadline {
             panic!("{deadline_msg}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    };
+    let _ = std::fs::remove_file(path);
+    content.trim().lines().map(String::from).collect()
 }
 
 /// Poll a file until it exists and has non-empty content, with a timeout.
-pub async fn wait_for_file(path: &std::path::Path) -> String {
+/// Removes the file before returning its lines.
+pub async fn wait_for_file(path: &std::path::Path) -> Vec<String> {
     poll_diagnostics_file(
         path,
         &format!("timed out waiting for diagnostics file: {}", path.display()),
@@ -192,37 +195,46 @@ pub async fn wait_for_file(path: &std::path::Path) -> String {
 }
 
 /// Poll a diagnostics dump file until it contains at least one ingress
-/// line (stage="ingress").
-pub async fn wait_for_ingress_dump(path: &std::path::Path) -> String {
-    poll_diagnostics_file(
-        path,
-        &format!("timed out waiting for ingress dump in: {}", path.display()),
-        |c| {
-            c.lines().any(|line| {
-                serde_json::from_str(line)
-                    .ok()
-                    .map_or(false, |v: serde_json::Value| {
-                        v["stage"].as_str() == Some("ingress")
-                    })
-            })
-        },
-    )
-    .await
+/// line (stage="ingress"). Removes the file before returning its lines.
+pub async fn wait_for_ingress_dump(path: &std::path::Path) -> Vec<String> {
+    wait_for_stage(path, "ingress", None).await
 }
 
 /// Poll a diagnostics dump file until it contains at least one egress
-/// line (stage="egress"). Prevents a race where the file has the ingress
-/// dump but the egress dump hasn't been flushed yet by the background writer.
-pub async fn wait_for_egress_dump(path: &std::path::Path) -> String {
+/// line (stage="egress"). Removes the file before returning its lines.
+pub async fn wait_for_egress_dump(path: &std::path::Path) -> Vec<String> {
+    wait_for_stage(path, "egress", None).await
+}
+
+/// Poll a diagnostics dump file until it contains at least one egress
+/// response line (stage="egress", direction="response"). Removes the file
+/// before returning its lines.
+pub async fn wait_for_egress_response_dump(path: &std::path::Path) -> Vec<String> {
+    wait_for_stage(path, "egress", Some("response")).await
+}
+
+async fn wait_for_stage(
+    path: &std::path::Path,
+    stage: &str,
+    direction: Option<&str>,
+) -> Vec<String> {
     poll_diagnostics_file(
         path,
-        &format!("timed out waiting for egress dump in: {}", path.display()),
-        |c| {
+        &format!(
+            "timed out waiting for {} dump in: {}",
+            match direction {
+                Some(dir) => format!("stage={stage} direction={dir}"),
+                None => format!("stage={stage}"),
+            },
+            path.display()
+        ),
+        move |c| {
             c.lines().any(|line| {
                 serde_json::from_str(line)
                     .ok()
                     .map_or(false, |v: serde_json::Value| {
-                        v["stage"].as_str() == Some("egress")
+                        v["stage"].as_str() == Some(stage)
+                            && direction.map_or(true, |d| v["direction"].as_str() == Some(d))
                     })
             })
         },

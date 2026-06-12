@@ -8,7 +8,7 @@ use common::{
     anthropic_upstream_response, openai_upstream_response, spawn_delayed_upstream,
     spawn_error_upstream, spawn_router, spawn_router_with_diagnostics, spawn_router_with_dump,
     spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream, wait_for_egress_dump,
-    wait_for_file, wait_for_ingress_dump,
+    wait_for_egress_response_dump, wait_for_file, wait_for_ingress_dump,
 };
 use inf_splitter::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
@@ -604,14 +604,12 @@ models = "test-model"
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
     // Give the background writer a moment to flush.
-    let content = wait_for_file(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_file(&tmp).await;
 
-    let lines: Vec<&str> = content.trim().lines().collect();
     assert!(!lines.is_empty(), "expected at least one stats line");
     assert_unique_requests(&lines);
 
-    let line: serde_json::Value = serde_json::from_str(lines[0]).expect("valid NDJSON");
+    let line: serde_json::Value = serde_json::from_str(&lines[0]).expect("valid NDJSON");
     assert_eq!(line["direction"], "openai->openai");
     assert_eq!(line["model"], "test-model");
     assert_eq!(line["status"], 200);
@@ -667,11 +665,9 @@ models = "test-model"
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
-    let content = wait_for_file(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_file(&tmp).await;
 
-    assert!(!content.trim().is_empty(), "dump file should not be empty");
-    let lines: Vec<&str> = content.trim().lines().collect();
+    assert!(!lines.is_empty(), "dump file should not be empty");
     assert_unique_requests(&lines);
     for line_str in &lines {
         let line: serde_json::Value = serde_json::from_str(line_str).expect("valid NDJSON");
@@ -755,17 +751,15 @@ models = "fail-model"
         .expect("fail request");
     assert_eq!(err_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    let content = wait_for_file(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_file(&tmp).await;
 
-    let lines: Vec<&str> = content.trim().lines().collect();
     assert_eq!(
         lines.len(),
         1,
         "only the error request should produce a stats line, got {lines:?}"
     );
     assert_unique_requests(&lines);
-    let line: serde_json::Value = serde_json::from_str(lines[0]).expect("valid NDJSON");
+    let line: serde_json::Value = serde_json::from_str(&lines[0]).expect("valid NDJSON");
     assert_eq!(line["model"], "fail-model");
     assert!(line["error"].is_string());
     assert!(
@@ -849,29 +843,28 @@ models = "fail-model"
         .expect("fail request");
     assert_eq!(err_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    let content = wait_for_file(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_file(&tmp).await;
 
-    let lines: Vec<&str> = content.trim().lines().collect();
     assert!(
         !lines.is_empty(),
         "error request should produce at least one dump line"
     );
     assert_unique_requests(&lines);
-    for line_str in lines {
+    for line_str in &lines {
         let line: serde_json::Value = serde_json::from_str(line_str).expect("valid NDJSON");
         assert_eq!(line["model"], "fail-model");
     }
 }
 
 /// Assert that every NDJSON line has a unique `(request_id, stage, direction)` tuple.
-fn assert_unique_requests(lines: &[&str]) {
+fn assert_unique_requests(lines: &[String]) {
     let mut seen = std::collections::HashSet::new();
     for (i, line_str) in lines.iter().enumerate() {
         if line_str.trim().is_empty() {
             continue;
         }
-        let line: serde_json::Value = serde_json::from_str(line_str).expect("valid NDJSON");
+        let line: serde_json::Value =
+            serde_json::from_str(line_str.as_str()).expect("valid NDJSON");
         let key = (
             line["request_id"].as_str().unwrap_or("?").to_string(),
             line["stage"].as_str().unwrap_or("-").to_string(),
@@ -933,11 +926,9 @@ models = "trans-model"
 
     // Check stats: must have both ingress and egress message details.
     let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
-    let stats_content = wait_for_file(&stats_path).await;
-    let _ = std::fs::remove_file(&stats_path);
-    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    let stats_lines = wait_for_file(&stats_path).await;
     assert_eq!(stats_lines.len(), 1, "expected exactly one stats line");
-    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    let stats: serde_json::Value = serde_json::from_str(&stats_lines[0]).expect("valid NDJSON");
     assert_eq!(stats["direction"], "anthropic->openai");
     assert!(
         stats["messages_detail_ingress"].is_array(),
@@ -957,9 +948,7 @@ models = "trans-model"
     );
     // Check dump: must have both ingress and egress stage entries.
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_file(&dump_path).await;
-    let _ = std::fs::remove_file(&dump_path);
-    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    let dump_lines = wait_for_file(&dump_path).await;
     assert_unique_requests(&dump_lines);
     // We expect at least "ingress" stage (the original Anthropic body).
     let has_ingress = dump_lines.iter().any(|l| {
@@ -1021,11 +1010,9 @@ models = "trans-model"
 
     // Stats: must have ingress and egress details.
     let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
-    let stats_content = wait_for_file(&stats_path).await;
-    let _ = std::fs::remove_file(&stats_path);
-    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    let stats_lines = wait_for_file(&stats_path).await;
     assert_eq!(stats_lines.len(), 1, "expected exactly one stats line");
-    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    let stats: serde_json::Value = serde_json::from_str(&stats_lines[0]).expect("valid NDJSON");
     assert_eq!(stats["direction"], "openai->anthropic");
     assert!(stats["messages_detail_ingress"].is_array());
     assert!(stats["messages_detail_egress"].is_array());
@@ -1040,9 +1027,7 @@ models = "trans-model"
 
     // Dump: must have ingress stage.
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_file(&dump_path).await;
-    let _ = std::fs::remove_file(&dump_path);
-    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    let dump_lines = wait_for_file(&dump_path).await;
     assert_unique_requests(&dump_lines);
     let has_ingress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1104,11 +1089,9 @@ models = "ap-model"
 
     // Stats
     let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
-    let stats_content = wait_for_file(&stats_path).await;
-    let _ = std::fs::remove_file(&stats_path);
-    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    let stats_lines = wait_for_file(&stats_path).await;
     assert!(!stats_lines.is_empty(), "expected at least one stats line");
-    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    let stats: serde_json::Value = serde_json::from_str(&stats_lines[0]).expect("valid NDJSON");
     assert_eq!(stats["direction"], "anthropic->anthropic");
     assert_eq!(stats["model"], "ap-model");
     assert_eq!(stats["status"], 200);
@@ -1120,9 +1103,7 @@ models = "ap-model"
 
     // Dump
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_egress_dump(&dump_path).await;
-    let _ = std::fs::remove_file(&dump_path);
-    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    let dump_lines = wait_for_egress_dump(&dump_path).await;
     assert_unique_requests(&dump_lines);
     let has_egress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1180,14 +1161,12 @@ models = "ape-model"
 
     // Stats: must have error
     let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
-    let stats_content = wait_for_file(&stats_path).await;
-    let _ = std::fs::remove_file(&stats_path);
-    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    let stats_lines = wait_for_file(&stats_path).await;
     assert!(
         !stats_lines.is_empty(),
         "expected at least one stats line on error"
     );
-    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    let stats: serde_json::Value = serde_json::from_str(&stats_lines[0]).expect("valid NDJSON");
     assert!(stats["error"].is_string());
     assert!(
         stats["duration_ms"].as_u64().is_some(),
@@ -1200,9 +1179,7 @@ models = "ape-model"
 
     // Dump: must have at least egress
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_egress_dump(&dump_path).await;
-    let _ = std::fs::remove_file(&dump_path);
-    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    let dump_lines = wait_for_egress_dump(&dump_path).await;
     assert_unique_requests(&dump_lines);
     let has_egress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1262,14 +1239,12 @@ models = "oa-model"
 
     // Stats
     let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
-    let stats_content = wait_for_file(&stats_path).await;
-    let _ = std::fs::remove_file(&stats_path);
-    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    let stats_lines = wait_for_file(&stats_path).await;
     assert!(
         !stats_lines.is_empty(),
         "translation success must produce stats"
     );
-    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    let stats: serde_json::Value = serde_json::from_str(&stats_lines[0]).expect("valid NDJSON");
     assert_eq!(stats["direction"], "openai->anthropic");
     assert_eq!(stats["status"], 200);
     assert!(stats.get("error").is_none());
@@ -1288,9 +1263,7 @@ models = "oa-model"
 
     // Dump
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_egress_dump(&dump_path).await;
-    let _ = std::fs::remove_file(&dump_path);
-    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    let dump_lines = wait_for_egress_dump(&dump_path).await;
     assert_unique_requests(&dump_lines);
     let has_ingress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1351,14 +1324,12 @@ models = "ao-model"
 
     // Stats
     let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
-    let stats_content = wait_for_file(&stats_path).await;
-    let _ = std::fs::remove_file(&stats_path);
-    let stats_lines: Vec<&str> = stats_content.trim().lines().collect();
+    let stats_lines = wait_for_file(&stats_path).await;
     assert!(
         !stats_lines.is_empty(),
         "translation success must produce stats"
     );
-    let stats: serde_json::Value = serde_json::from_str(stats_lines[0]).expect("valid NDJSON");
+    let stats: serde_json::Value = serde_json::from_str(&stats_lines[0]).expect("valid NDJSON");
     assert_eq!(stats["direction"], "anthropic->openai");
     assert_eq!(stats["status"], 200);
     assert!(stats.get("error").is_none());
@@ -1377,9 +1348,7 @@ models = "ao-model"
 
     // Dump
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_egress_dump(&dump_path).await;
-    let _ = std::fs::remove_file(&dump_path);
-    let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
+    let dump_lines = wait_for_egress_dump(&dump_path).await;
     assert_unique_requests(&dump_lines);
     let has_ingress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1444,16 +1413,14 @@ models = "stream-model"
         .await
         .expect("proxy request");
 
-    let content = wait_for_file(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_file(&tmp).await;
 
-    let lines: Vec<&str> = content.trim().lines().collect();
     assert!(
         !lines.is_empty(),
         "streaming passthrough must produce stats"
     );
 
-    let line: serde_json::Value = serde_json::from_str(lines[0]).expect("valid NDJSON");
+    let line: serde_json::Value = serde_json::from_str(&lines[0]).expect("valid NDJSON");
     assert_eq!(line["direction"], "anthropic->anthropic");
     assert_eq!(
         line["streaming"], true,
@@ -1509,10 +1476,8 @@ models = "timed-model"
         .expect("request");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    let content = wait_for_file(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
-    let stats: serde_json::Value =
-        serde_json::from_str(content.trim().lines().next().unwrap()).expect("valid NDJSON");
+    let lines = wait_for_file(&tmp).await;
+    let stats: serde_json::Value = serde_json::from_str(&lines[0]).expect("valid NDJSON");
 
     let duration = stats["duration_ms"]
         .as_u64()
@@ -1623,9 +1588,8 @@ models = "oi-model"
         .expect("request");
     assert_eq!(_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    let content = wait_for_ingress_dump(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
-    let has_ingress = content.lines().any(|l| {
+    let lines = wait_for_ingress_dump(&tmp).await;
+    let has_ingress = lines.iter().any(|l| {
         serde_json::from_str::<serde_json::Value>(l)
             .ok()
             .and_then(|v| v["stage"].as_str().map(|s| s == "ingress"))
@@ -1679,9 +1643,8 @@ models = "ap-ingress-model"
         .expect("request");
     assert_eq!(_resp.status(), reqwest::StatusCode::OK);
 
-    let content = wait_for_ingress_dump(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
-    let has_ingress = content.lines().any(|l| {
+    let lines = wait_for_ingress_dump(&tmp).await;
+    let has_ingress = lines.iter().any(|l| {
         serde_json::from_str::<serde_json::Value>(l)
             .ok()
             .and_then(|v| v["stage"].as_str().map(|s| s == "ingress"))
@@ -1738,11 +1701,8 @@ models = "er-model"
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let _body = response.text().await.expect("response body");
 
-    let content = wait_for_file(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_egress_response_dump(&tmp).await;
 
-    let lines: Vec<&str> = content.trim().lines().collect();
-    assert!(!lines.is_empty(), "expected at least one dump line");
     assert_unique_requests(&lines);
 
     let egress_responses: Vec<serde_json::Value> = lines
@@ -1837,11 +1797,8 @@ models = "stream-er-model"
     // Must consume the SSE stream body to trigger DiagnosticStream termination and dump.
     let _body = response.text().await.expect("response body");
 
-    let content = wait_for_file(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_egress_response_dump(&tmp).await;
 
-    let lines: Vec<&str> = content.trim().lines().collect();
-    assert!(!lines.is_empty(), "expected at least one dump line");
     assert_unique_requests(&lines);
 
     let egress_responses: Vec<serde_json::Value> = lines
@@ -1925,10 +1882,8 @@ models = "oai-er-model"
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let _body = response.text().await.expect("response body");
 
-    let content = wait_for_egress_dump(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_egress_response_dump(&tmp).await;
 
-    let lines: Vec<&str> = content.trim().lines().collect();
     assert_unique_requests(&lines);
 
     let egress_responses: Vec<serde_json::Value> = lines
@@ -2020,10 +1975,8 @@ models = "stream-oai-er-model"
     // Must consume the SSE stream body to trigger DiagnosticStream termination and dump.
     let _body = response.text().await.expect("response body");
 
-    let content = wait_for_egress_dump(&tmp).await;
-    let _ = std::fs::remove_file(&tmp);
+    let lines = wait_for_egress_response_dump(&tmp).await;
 
-    let lines: Vec<&str> = content.trim().lines().collect();
     assert_unique_requests(&lines);
 
     let egress_responses: Vec<serde_json::Value> = lines
@@ -2267,13 +2220,10 @@ max_file_size = "1k"
         let _ = response.text().await;
     }
 
-    let content = wait_for_file(&tmp).await;
+    let lines = wait_for_file(&tmp).await;
 
     // Verify the current file has some content (latest dumps)
-    assert!(
-        !content.trim().is_empty(),
-        "current file should have content"
-    );
+    assert!(!lines.is_empty(), "current file should have content");
 
     // Verify a rotated file exists in the same directory
     let dir = tmp.parent().unwrap();

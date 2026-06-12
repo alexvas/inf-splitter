@@ -7,9 +7,11 @@ description = "HTTP router for inference requests to OpenAI- and Anthropic-compa
 readme = "README.md"
 
 [package.metadata.deb]
+maintainer = "Aleksandr Vasilev <a.a.vasiljev+infsplitter@yandex.ru>"
 maintainer-scripts = "debian/"
 systemd-units = { enable = true }
 assets = [
+    ["target/release/inf-splitter", "/usr/bin/inf-splitter", "755"],
     ["config/inf-splitter.toml.example", "/etc/inf-splitter/inf-splitter.toml", "644"],
     ["debian/inf-splitter.env.example", "/usr/share/inf-splitter/inf-splitter.env.example", "644"],
 ]

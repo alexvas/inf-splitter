@@ -2,7 +2,7 @@ upstream_timeout = "3m"
 max_request_body = "2m"
 
 [llama-local]
-endpoint_anthropic = "http://host.docker.internal:11345"
+endpoint_anthropic = "http://127.0.0.1:11345"
 models = "local-model"
 
 [deepseek]
@@ -20,11 +20,34 @@ max_output_tokens = 10_000
 max_completion_tokens = 10_000
 
 [diagnostics]
+
+# Опция раз:
 # Куда писать NDJSON статистики: "stderr" (по умолчанию), "stdout", или путь к файлу.
-stats_output = "/app/logs/diag.ndjson"
+# Linux (.deb):
+stats_output = "/var/log/inf-splitter/diag.ndjson"
+# Windows:
+#stats_output = "C:\\ProgramData\\inf-splitter\\logs\\diag.ndjson"
 
 # Куда писать NDJSON дампа: "stderr" (по умолчанию), "stdout", или путь к файлу.
-dump_output = "/app/logs/dump.ndjson"
+# Linux (.deb):
+dump_output = "/var/log/inf-splitter/dump.ndjson"
+# Windows:
+#dump_output = "C:\\ProgramData\\inf-splitter\\logs\\dump.ndjson"
+
+
+# Опция два:
+# Разделять diagnostic-файлы по endpoint'ам (секциям конфига).
+# Вместо строки — таблица { per_section = "путь" }.
+# Будут создаваться файлы вида diag-ollama.ndjson,
+# dump-deepseek-2026-06-09-001.ndjson.zip и т.д.
+#stats_output = { per_section = "/var/log/inf-splitter/diag.ndjson" }
+#dump_output = { per_section = "/var/log/inf-splitter/dump.ndjson" }
+# Windows:
+#stats_output = { per_section = "C:\\ProgramData\\inf-splitter\\logs\\diag.ndjson" }
+#dump_output = { per_section = "C:\\ProgramData\\inf-splitter\\logs\\dump.ndjson" }
+
+
+
 
 # Статистика (сводка по каждому запросу: модель, длительность, количество токенов, разбор сообщений):
 # "off" — не собирать; "error" — только при ошибках; "all" — каждый запрос.
@@ -47,10 +70,3 @@ dump_mode = "error"
 # Выполняется в отдельном потоке, не блокирует запись.
 # Отсутствие опции — без сжатия.
 #compression = "zip"
-
-# Разделять diagnostic-файлы по endpoint'ам (секциям конфига).
-# Вместо строки — таблица { per_section = "путь" }.
-# Будут создаваться файлы вида diag-ollama.ndjson,
-# dump-deepseek-2026-06-09-001.ndjson.zip и т.д.
-#stats_output = { per_section = "diag.ndjson" }
-#dump_output = { per_section = "dump.ndjson" }

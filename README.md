@@ -41,7 +41,8 @@ models = "default"
 
 | Поле | Описание |
 |------|----------|
-| `port` | TCP-порт; сервис слушает `127.0.0.1:{port}` (по умолчанию 3000) |
+| `listen_host` | IP-адрес для входящих подключений (по умолчанию `127.0.0.1`; для Docker — `0.0.0.0`) |
+| `listen_port` | TCP-порт (по умолчанию 3000) |
 | `upstream_timeout` | Таймаут исходящих запросов к upstream; суффиксы `s` (секунды) или `m` (минуты), напр. `15s`, `1m` (по умолчанию `5m`) |
 | `max_request_body` | Максимальный размер входящего тела запроса; суффиксы `k` (KiB) или `m` (MiB), напр. `512k`, `2m` (по умолчанию `2m`) |
 | `body_too_large_hint_statuses` | Опциональный список HTTP-статусов (числа), при которых к ошибке добавляется подсказка `Try reducing context size...` (по умолчанию `[413]`, пустой список = подсказка не добавляется) |
@@ -75,6 +76,7 @@ models = "default"
 | Переменная | Описание |
 |------------|----------|
 | `INF_SPLITTER_CONFIG` | Путь к TOML-конфигу (по умолчанию `config/inf-splitter.toml`) |
+| `INF_SPLITTER_LISTEN_HOST` | IP-адрес для входящих подключений (по умолчанию `127.0.0.1`; для Docker — `0.0.0.0`) |
 
 ### Секреты
 
@@ -176,9 +178,11 @@ flush_period = "10s"
 - `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}/anthropic` (внутри сети)
 - Для локальных моделей через OpenAI-протокол: `http://inf-splitter:${PROXY_PORT}/openai`
 
-Смонтируйте конфиг и секреты:
+Смонтируйте конфиг и секреты. Для работы в Docker задайте `INF_SPLITTER_LISTEN_HOST=0.0.0.0`:
 
 ```yaml
+environment:
+  - INF_SPLITTER_LISTEN_HOST=0.0.0.0
 volumes:
   - ./inf-splitter/config:/app/config:ro
   - ./inf-splitter/secrets:/app/secrets:ro

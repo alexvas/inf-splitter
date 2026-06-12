@@ -43,6 +43,7 @@ echo "Fake upstream: http://${HOST_IP}:${FAKE_PORT}"
 
 mkdir -p "$TMPDIR/config"
 cat > "$TMPDIR/config/inf-splitter.toml" <<EOF
+listen_host = "0.0.0.0"
 
 [local]
 endpoint_openai = "http://${HOST_IP}:${FAKE_PORT}"

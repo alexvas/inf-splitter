@@ -94,7 +94,8 @@ struct DiagnosticsConfigRaw {
 
 #[derive(Debug, Deserialize)]
 struct FileConfig {
-    port: Option<u16>,
+    listen_host: Option<String>,
+    listen_port: Option<u16>,
     upstream_timeout: Option<String>,
     max_request_body: Option<String>,
     defaults: Option<DefaultConfig>,
@@ -187,7 +188,7 @@ impl Config {
             return Err(ConfigError::NoProviders);
         }
 
-        let listen_addr = resolve_listen_addr(file.port)?;
+        let listen_addr = resolve_listen_addr(file.listen_host.as_deref(), file.listen_port)?;
         let diagnostics = match file.diagnostics {
             Some(raw) => DiagnosticsConfig {
                 stats_output: sink_from_raw(raw.stats_output),
@@ -517,11 +518,15 @@ fn config_path() -> PathBuf {
     PathBuf::from("config/inf-splitter.toml")
 }
 
-fn resolve_listen_addr(port: Option<u16>) -> Result<SocketAddr, ConfigError> {
+fn resolve_listen_addr(listen: Option<&str>, port: Option<u16>) -> Result<SocketAddr, ConfigError> {
+    let host = listen
+        .map(String::from)
+        .or_else(|| std::env::var("INF_SPLITTER_LISTEN_HOST").ok())
+        .unwrap_or_else(|| "127.0.0.1".into());
     let port = port.unwrap_or(3000);
-    format!("127.0.0.1:{port}")
+    format!("{host}:{port}")
         .parse()
-        .map_err(|err| ConfigError::Port(format!("127.0.0.1:{port}: {err}")))
+        .map_err(|err| ConfigError::Port(format!("{host}:{port}: {err}")))
 }
 
 /// Cap a numeric field in a JSON body: if missing, set to limit; if exceeding,
@@ -633,8 +638,10 @@ mod tests {
 
     #[test]
     fn load_config_with_timeout_and_limits() {
+        let _guard = env_lock();
+        std::env::remove_var("INF_SPLITTER_LISTEN_HOST");
         let raw = r#"
-port = 3001
+listen_port =3001
 upstream_timeout = "15s"
 max_request_body = "512k"
 
@@ -646,6 +653,63 @@ models = "test-model"
         assert_eq!(config.listen_addr, "127.0.0.1:3001".parse().unwrap());
         assert_eq!(config.upstream_timeout, Duration::from_secs(15));
         assert_eq!(config.max_request_body, 512 * 1024);
+    }
+
+    #[test]
+    fn listen_defaults_to_localhost() {
+        let _guard = env_lock();
+        std::env::remove_var("INF_SPLITTER_LISTEN_HOST");
+        let raw = r#"
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert_eq!(config.listen_addr, "127.0.0.1:3000".parse().unwrap());
+    }
+
+    #[test]
+    fn listen_via_config() {
+        let raw = r#"
+listen_host = "0.0.0.0"
+listen_port =8080
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert_eq!(config.listen_addr, "0.0.0.0:8080".parse().unwrap());
+    }
+
+    #[test]
+    fn listen_via_env() {
+        let _guard = env_lock();
+        std::env::set_var("INF_SPLITTER_LISTEN_HOST", "10.0.0.1");
+        let raw = r#"
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert_eq!(config.listen_addr, "10.0.0.1:3000".parse().unwrap());
+        std::env::remove_var("INF_SPLITTER_LISTEN_HOST");
+    }
+
+    #[test]
+    fn listen_config_overrides_env() {
+        let _guard = env_lock();
+        std::env::set_var("INF_SPLITTER_LISTEN_HOST", "10.0.0.1");
+        let raw = r#"
+listen_host = "192.168.1.1"
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert_eq!(config.listen_addr, "192.168.1.1:3000".parse().unwrap());
+        std::env::remove_var("INF_SPLITTER_LISTEN_HOST");
     }
 
     #[test]
@@ -736,7 +800,7 @@ models = "test-model"
     #[test]
     fn global_defaults_merge_with_per_provider_overrides() {
         let raw = r#"
-port = 3000
+listen_port =3000
 
 [defaults]
 max_tokens = 4096

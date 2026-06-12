@@ -47,7 +47,7 @@ Client → POST /openai/v1/messages  or  /anthropic/v1/messages
 
 ### Config model (TOML)
 
-Top-level: `port`, `upstream_timeout`, `max_request_body`, `body_too_large_hint_statuses` (default `[413]`), optional `[defaults]`.
+Top-level: `listen_host`, `listen_port`, `upstream_timeout`, `max_request_body`, `body_too_large_hint_statuses` (default `[413]`), optional `[defaults]`.
 
 Each provider section has:
 - `endpoint_openai` / `endpoint_anthropic` — at least one required; determines routing direction

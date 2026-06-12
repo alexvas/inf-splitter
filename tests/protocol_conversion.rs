@@ -26,7 +26,7 @@ async fn anthropic_ingress_openai_upstream_converts_both_ways() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{openai_addr}"
@@ -91,7 +91,7 @@ async fn openai_ingress_anthropic_upstream_converts_both_ways() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{anthropic_addr}"
@@ -148,7 +148,7 @@ models = "remote-anthropic-model"
 #[tokio::test]
 async fn unroutable_model_returns_400() {
     let config = r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://127.0.0.1:1"
@@ -174,7 +174,7 @@ models = "known-model"
 #[tokio::test]
 async fn empty_model_returns_400() {
     let config = r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://127.0.0.1:1"
@@ -200,7 +200,7 @@ models = "known-model"
 #[tokio::test]
 async fn invalid_json_body_returns_400() {
     let config = r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://127.0.0.1:1"
@@ -231,7 +231,7 @@ async fn upstream_error_relays_status() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -269,7 +269,7 @@ async fn openai_passthrough_no_conversion() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{openai_addr}"
@@ -307,7 +307,7 @@ async fn anthropic_passthrough_no_conversion() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{anthropic_addr}"
@@ -354,7 +354,7 @@ data: {\"type\":\"message_stop\"}
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{anthropic_addr}"
@@ -405,7 +405,7 @@ data: [DONE]
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{openai_addr}"
@@ -448,7 +448,7 @@ async fn dump_on_error_passthrough_does_not_break_response() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -489,7 +489,7 @@ async fn dump_on_error_conversion_does_not_break_response() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -531,7 +531,7 @@ async fn dump_on_error_stream_conversion_error_does_not_break_response() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -574,7 +574,7 @@ async fn stats_mode_all_writes_to_file_on_success() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-stats-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -636,7 +636,7 @@ async fn dump_mode_all_writes_to_file_on_success() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-dump-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -712,7 +712,7 @@ async fn stats_mode_error_writes_only_on_error() {
     // Two providers sharing the same diagnostics file.
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [ok]
 endpoint_openai = "http://{success_upstream}"
@@ -804,7 +804,7 @@ async fn dump_mode_error_writes_only_on_error() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [ok]
 endpoint_openai = "http://{success_upstream}"
@@ -901,7 +901,7 @@ async fn translation_anthropic_to_openai_produces_ingress_and_egress_events() {
     // Only endpoint_openai → Anthropic ingress forces translation.
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_openai = "http://{error_upstream}"
@@ -985,7 +985,7 @@ async fn translation_openai_to_anthropic_produces_ingress_and_egress_events() {
     // Only endpoint_anthropic → OpenAI ingress forces translation.
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{error_upstream}"
@@ -1056,7 +1056,7 @@ async fn anthropic_passthrough_success_produces_stats_and_dumps() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-ap-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -1128,7 +1128,7 @@ async fn anthropic_passthrough_error_produces_dumps() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-ape-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -1206,7 +1206,7 @@ async fn openai_to_anthropic_translation_success_produces_stats_and_dumps() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-oa-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -1291,7 +1291,7 @@ async fn anthropic_to_openai_translation_success_produces_stats_and_dumps() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-ao-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_openai = "http://{upstream_addr}"
@@ -1385,7 +1385,7 @@ data: {\"type\":\"message_stop\"}
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -1449,7 +1449,7 @@ async fn delayed_upstream_produces_nonzero_duration_ms() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-timing-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -1508,7 +1508,7 @@ async fn relay_openai_upstream_does_not_duplicate_sse_headers() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -1562,7 +1562,7 @@ async fn openai_passthrough_error_produces_ingress_dump() {
         std::env::temp_dir().join(format!("inf-splitter-oi-ingress-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -1616,7 +1616,7 @@ async fn anthropic_passthrough_success_produces_ingress_dump() {
         std::env::temp_dir().join(format!("inf-splitter-aps-ingress-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -1671,7 +1671,7 @@ async fn anthropic_passthrough_non_streaming_egress_response_dump() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-er-ns-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -1765,7 +1765,7 @@ data: {\"type\":\"message_stop\"}
     let tmp = std::env::temp_dir().join(format!("inf-splitter-er-stream-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"
@@ -1853,7 +1853,7 @@ async fn openai_passthrough_non_streaming_egress_response_dump() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-oai-er-ns-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -1944,7 +1944,7 @@ data: [DONE]
     ));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream_addr}"
@@ -2019,7 +2019,7 @@ models = "stream-oai-er-model"
 #[tokio::test]
 async fn non_utf8_client_body_returns_400() {
     let config = r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://127.0.0.1:1"
@@ -2072,7 +2072,7 @@ async fn non_utf8_upstream_response_returns_500_anthropic() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream}"
@@ -2132,7 +2132,7 @@ async fn non_utf8_upstream_response_returns_500_openai() {
 
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [local]
 endpoint_openai = "http://{upstream}"
@@ -2181,7 +2181,7 @@ async fn diagnostics_file_rotates_on_max_file_size() {
     let tmp = std::env::temp_dir().join(format!("inf-splitter-rot-{}.ndjson", uuid_suffix()));
     let config = format!(
         r#"
-port = 0
+listen_port = 0
 
 [remote]
 endpoint_anthropic = "http://{upstream_addr}"

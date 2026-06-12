@@ -78,6 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - name: Get package version
         id: pkg_version
@@ -96,17 +97,10 @@ jobs:
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           sed -i '/^name = "inf-splitter"/{n;s/version = ".*"/version = "'"${VERSION}"'"/}' Cargo.lock
 
-      - name: Download binary
-        uses: actions/download-artifact@v4
-        with:
-          name: inf-splitter
-          path: target/release/
-      - run: chmod +x target/release/inf-splitter
-
       - name: Build .deb package
         run: |
           cargo install cargo-deb --locked
-          cargo deb --no-build --locked
+          cargo deb --locked
           cp target/debian/inf-splitter_*.deb .
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4

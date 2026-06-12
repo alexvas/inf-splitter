@@ -8,6 +8,7 @@ Type=simple
 User=inf-splitter
 Group=inf-splitter
 ExecStart=/usr/bin/inf-splitter
+Environment=INF_SPLITTER_CONFIG=/etc/inf-splitter/inf-splitter.toml
 EnvironmentFile=-/etc/inf-splitter/environment
 ReadWritePaths=/var/log/inf-splitter
 ProtectSystem=strict

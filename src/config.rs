@@ -377,7 +377,7 @@ impl Config {
     #[cfg(test)]
     pub fn from_model_routes(model_routes: HashMap<String, String>) -> Self {
         Self {
-            listen_addr: "0.0.0.0:3000".parse().expect("test listen addr"),
+            listen_addr: "127.0.0.1:3000".parse().expect("test listen addr"),
             diagnostics: DiagnosticsConfig::default(),
             upstream_timeout: parse_duration(DEFAULT_UPSTREAM_TIMEOUT).expect("default timeout"),
             max_request_body: parse_byte_size(DEFAULT_MAX_REQUEST_BODY)
@@ -519,9 +519,9 @@ fn config_path() -> PathBuf {
 
 fn resolve_listen_addr(port: Option<u16>) -> Result<SocketAddr, ConfigError> {
     let port = port.unwrap_or(3000);
-    format!("0.0.0.0:{port}")
+    format!("127.0.0.1:{port}")
         .parse()
-        .map_err(|err| ConfigError::Port(format!("0.0.0.0:{port}: {err}")))
+        .map_err(|err| ConfigError::Port(format!("127.0.0.1:{port}: {err}")))
 }
 
 /// Cap a numeric field in a JSON body: if missing, set to limit; if exceeding,
@@ -643,7 +643,7 @@ endpoint_openai = "http://127.0.0.1:11434"
 models = "test-model"
 "#;
         let config = Config::load_from_str(raw).expect("config with limits");
-        assert_eq!(config.listen_addr, "0.0.0.0:3001".parse().unwrap());
+        assert_eq!(config.listen_addr, "127.0.0.1:3001".parse().unwrap());
         assert_eq!(config.upstream_timeout, Duration::from_secs(15));
         assert_eq!(config.max_request_body, 512 * 1024);
     }
@@ -697,13 +697,14 @@ models = "test-model"
         env::set_var("DEEPSEEK_API_KEY", "sk-deepseek-test");
         env::set_var("MAAS_API_KEY", "sk-maas-test");
 
-        let config = Config::load().expect("project config");
-        assert_eq!(config.listen_addr, "0.0.0.0:3000".parse().unwrap());
+        let config = Config::load_from_str(include_str!("../config/inf-splitter.toml.example"))
+            .expect("example config");
+        assert_eq!(config.listen_addr, "127.0.0.1:3000".parse().unwrap());
 
         let local = config.resolve_route("local-model").expect("local route");
         assert_eq!(
             local.endpoint_anthropic.as_deref(),
-            Some("http://host.docker.internal:11345")
+            Some("http://127.0.0.1:11345")
         );
         assert!(local.endpoint_openai.is_none());
         assert!(local.api_key.is_none());

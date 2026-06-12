@@ -78,6 +78,6 @@ Both streaming and non-streaming paths are handled. `stream_options` is always d
 ## Scope constraints
 
 - Ingress is **no-auth** by design; do not add authentication without explicit product decision
-- Default listen address is `0.0.0.0:{port}` from TOML (no `LISTEN_ADDR` env var)
+- Default listen address is `127.0.0.1:{port}` from TOML (no `LISTEN_ADDR` env var)
 - Limits use suffix notation: `s`/`m` for durations, `k`/`m` for byte sizes
 - The `openssl` crate uses `vendored` feature — compiles OpenSSL from source, no system `libssl-dev` needed

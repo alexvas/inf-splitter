@@ -2,13 +2,13 @@
 
 Тонкий HTTP-роутер для запросов инференса: маршрутизация по модели из TOML-конфигурации на OpenAI- и Anthropic-совместимые upstream.
 
-**Основное предназначение — запуск в контейнере.** Сервис по умолчанию слушает `0.0.0.0:{port}` (порт из TOML, по умолчанию 3000), чтобы быть доступным внутри Docker-сети без дополнительной настройки bind.
+**Основное предназначение — запуск на локальном хосте.** Сервис по умолчанию слушает `127.0.0.1:{port}` (порт из TOML, по умолчанию 3000).
 
 Заменяет `anyllm-proxy`: без LiteLLM YAML, admin UI и SSRF-обходов через `/etc/hosts`.
 
 ## Безопасность ingress (no-auth)
 
-**Входящие запросы к прокси не аутентифицируются.** Любой клиент в сети, имеющий доступ к порту сервиса, может отправлять запросы. Защиту на границе (сеть Docker, reverse proxy, firewall) обеспечивает оператор.
+**Входящие запросы к прокси не аутентифицируются.** Любой клиент в сети, имеющий доступ к порту сервиса, может отправлять запросы. Защиту на границе (сеть, reverse proxy, firewall) обеспечивает оператор.
 
 Аутентификация применяется только на стороне upstream-провайдеров: если в секции конфигурации задан `api_key`, прокси подставляет его в upstream-запрос; если `api_key` не задан, входящие auth-заголовки клиента передаются как есть.
 
@@ -41,7 +41,7 @@ models = "default"
 
 | Поле | Описание |
 |------|----------|
-| `port` | TCP-порт; сервис слушает `0.0.0.0:{port}` (по умолчанию 3000) |
+| `port` | TCP-порт; сервис слушает `127.0.0.1:{port}` (по умолчанию 3000) |
 | `upstream_timeout` | Таймаут исходящих запросов к upstream; суффиксы `s` (секунды) или `m` (минуты), напр. `15s`, `1m` (по умолчанию `5m`) |
 | `max_request_body` | Максимальный размер входящего тела запроса; суффиксы `k` (KiB) или `m` (MiB), напр. `512k`, `2m` (по умолчанию `2m`) |
 | `body_too_large_hint_statuses` | Опциональный список HTTP-статусов (числа), при которых к ошибке добавляется подсказка `Try reducing context size...` (по умолчанию `[413]`, пустой список = подсказка не добавляется) |
@@ -171,9 +171,9 @@ flush_period = "10s"
 
 ## Интеграция с docker-compose
 
-Контейнер `claude` использует роутер как upstream Anthropic API:
+Агент `Claude CLI` использует роутер как upstream Anthropic API:
 
-- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}/anthropic` (внутри Docker-сети)
+- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}/anthropic` (внутри сети)
 - Для локальных моделей через OpenAI-протокол: `http://inf-splitter:${PROXY_PORT}/openai`
 
 Смонтируйте конфиг и секреты:
@@ -292,13 +292,13 @@ env -u RUSTUP_TOOLCHAIN cargo test
 ## Устранение неполадок
 
 - **Config load failed: secret not found** — задайте env-переменную или скопируйте `secrets.example/` в `secrets/`.
-- **Ollama: Connection refused** — проверьте `[ollama].endpoint` и доступность Ollama с хоста/контейнера.
+- **llama: Connection refused** — проверьте `[llama-local].endpoint` и доступность llama с локального хоста.
 
 ## Лицензия
 
 Проект распространяется под [GNU General Public License v3.0 or later](LICENSE) (GPL-3.0-or-later).
 
-Зависимости Rust перечислены в [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES); тексты распространённых лицензий — в каталоге [licenses/](licenses/). После обновления `Cargo.lock` перегенерируйте список:
+Зависимости Rust перечислены в [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES); тексты распространённых лицензий — в каталоге [licenses/](licenses/). CI проверяет актуальность файла при каждом пуше. При обновлении `Cargo.lock` перегенерируйте список:
 
 ```bash
 python3 scripts/generate-third-party-notices.py

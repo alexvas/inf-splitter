@@ -33,6 +33,14 @@ jobs:
         run: cargo clippy --locked -- -D warnings
       - name: Build release binary
         run: cargo build --release --locked
+      - name: Check third-party notices
+        run: |
+          python3 scripts/generate-third-party-notices.py
+          git diff --exit-code THIRD_PARTY_NOTICES || {
+            echo "THIRD_PARTY_NOTICES is out of date."
+            echo "Run: python3 scripts/generate-third-party-notices.py"
+            exit 1
+          }
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -46,6 +54,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
+        env:
+          RUST_BACKTRACE: 1
         run: |
           cp config/inf-splitter.toml.example config/inf-splitter.toml
           cargo test --locked

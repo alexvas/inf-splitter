@@ -6,6 +6,14 @@ license = "GPL-3.0-or-later"
 description = "HTTP router for inference requests to OpenAI- and Anthropic-compatible upstreams"
 readme = "README.md"
 
+[package.metadata.deb]
+maintainer-scripts = "debian/"
+systemd-units = { enable = true }
+assets = [
+    ["config/inf-splitter.toml.example", "/etc/inf-splitter/inf-splitter.toml", "644"],
+    ["debian/inf-splitter.env.example", "/usr/share/inf-splitter/inf-splitter.env.example", "644"],
+]
+
 [dependencies]
 anyllm_translate = "0.9"
 axum = "0.8"

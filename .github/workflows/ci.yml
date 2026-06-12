@@ -28,6 +28,15 @@ jobs:
         with:
           name: inf-splitter
           path: target/release/inf-splitter
+      - name: Build .deb package
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --locked
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inf-splitter-deb
+          path: target/debian/inf-splitter_*.deb
 
   rust-test:
     needs: rust-build

@@ -1,0 +1,25 @@
+[Unit]
+Description=Inf-Splitter — LLM inference request router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=inf-splitter
+Group=inf-splitter
+ExecStart=/usr/bin/inf-splitter
+EnvironmentFile=-/etc/inf-splitter/environment
+ReadWritePaths=/var/log/inf-splitter
+ProtectSystem=strict
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

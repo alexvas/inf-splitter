@@ -1,0 +1,19 @@
+#!/bin/bash
+set -e
+
+if ! id -u inf-splitter >/dev/null 2>&1; then
+    adduser --system --no-create-home --group inf-splitter
+fi
+
+mkdir -p /var/log/inf-splitter
+chown inf-splitter:inf-splitter /var/log/inf-splitter
+
+if [ "$1" = "configure" ] && [ -z "$2" ]; then
+    if [ ! -f /etc/inf-splitter/environment ]; then
+        cp /usr/share/inf-splitter/inf-splitter.env.example /etc/inf-splitter/environment
+        chown root:inf-splitter /etc/inf-splitter/environment
+        chmod 640 /etc/inf-splitter/environment
+    fi
+fi
+
+#DEBHELPER#

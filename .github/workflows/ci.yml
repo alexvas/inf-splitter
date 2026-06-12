@@ -247,7 +247,9 @@ jobs:
             ### Linux (.deb)
 
             ```bash
-            sudo dpkg -i inf-splitter_*.deb
+            cd /tmp
+            wget https://github.com/alexvas/inf-splitter/releases/download/${{ env.TAG }}/inf-splitter_${{ env.VERSION }}-1_amd64.deb
+            sudo dpkg -i inf-splitter_${{ env.VERSION }}-1_amd64.deb
             ```
 
             После установки:
@@ -263,6 +265,8 @@ jobs:
             ### Linux (binary)
 
             ```bash
+            cd /tmp
+            wget https://github.com/alexvas/inf-splitter/releases/download/${{ env.TAG }}/inf-splitter
             chmod +x inf-splitter
             ./inf-splitter
             ```

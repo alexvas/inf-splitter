@@ -700,13 +700,13 @@ models = "test-model"
         let config = Config::load().expect("project config");
         assert_eq!(config.listen_addr, "0.0.0.0:3000".parse().unwrap());
 
-        let ollama = config.resolve_route("gemma4:31b").expect("ollama route");
+        let local = config.resolve_route("local-model").expect("local route");
         assert_eq!(
-            ollama.endpoint_anthropic.as_deref(),
-            Some("http://host.docker.internal:11434")
+            local.endpoint_anthropic.as_deref(),
+            Some("http://host.docker.internal:11345")
         );
-        assert!(ollama.endpoint_openai.is_none());
-        assert!(ollama.api_key.is_none());
+        assert!(local.endpoint_openai.is_none());
+        assert!(local.api_key.is_none());
 
         let deepseek = config
             .resolve_route("deepseek-v4-pro")

@@ -3,13 +3,24 @@ name: CI
 on:
   push:
     branches: [main, master]
+    tags:
+      - "v*.*.*"
   pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.0). Must be valid semver.'
+        required: true
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # --- Regular CI (every push to main, PR) ---
+
   rust-build:
+    if: github.ref_type != 'tag' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,18 +39,69 @@ jobs:
         with:
           name: inf-splitter
           path: target/release/inf-splitter
+
+  rust-test:
+    if: github.ref_type != 'tag' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: |
+          cp config/inf-splitter.toml.example config/inf-splitter.toml
+          cargo test --locked
+
+  smoke:
+    needs: rust-build
+    if: github.ref_type != 'tag' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: inf-splitter
+          path: target/release/
+      - run: chmod +x target/release/inf-splitter
+      - name: Build image from pre-built binary
+        run: |
+          cp target/release/inf-splitter ./inf-splitter.bin
+          docker build -f Dockerfile.ci -t inf-splitter:smoke-test .
+          rm -f ./inf-splitter.bin
+      - name: Smoke test
+        run: SKIP_BUILD=1 ./scripts/docker-smoke-test.sh
+
+  # --- Release jobs (tags, workflow_dispatch) ---
+
+  linux-release:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: inf-splitter-linux
+          path: target/release/inf-splitter
       - name: Build .deb package
         run: |
           cargo install cargo-deb --locked
           cargo deb --locked
+          cp target/debian/inf-splitter_*.deb .
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
           name: inf-splitter-deb
-          path: target/debian/inf-splitter_*.deb
+          path: inf-splitter_*.deb
 
-  windows-build:
-    runs-on: windows-latest
+  windows-release:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,33 +123,130 @@ jobs:
           name: inf-splitter-windows
           path: inf-splitter-windows.zip
 
-  rust-test:
-    needs: rust-build
+  create-release:
+    needs: [linux-release, windows-release]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test
-        run: |
-          cp config/inf-splitter.toml.example config/inf-splitter.toml
-          cargo test --locked
 
-  smoke:
-    needs: rust-build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download binary
+      - name: Validate version (semver)
+        if: github.event_name == 'workflow_dispatch'
+        uses: matt-usurp/validate-semver@v2
+        with:
+          version: ${{ github.event.inputs.version }}
+
+      - name: Get version from tag or input
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" == "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            TAG_NAME="v${VERSION}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/v}
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download Linux binary
         uses: actions/download-artifact@v4
         with:
-          name: inf-splitter
-          path: target/release/
-      - run: chmod +x target/release/inf-splitter
-      - name: Build image from pre-built binary
+          name: inf-splitter-linux
+
+      - name: Download .deb
+        uses: actions/download-artifact@v4
+        with:
+          name: inf-splitter-deb
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: inf-splitter-windows
+
+      - run: chmod +x inf-splitter
+
+      - name: Delete existing release if present
+        env:
+          TAG: ${{ steps.version.outputs.tag_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cp target/release/inf-splitter ./inf-splitter.bin
-          docker build -f Dockerfile.ci -t inf-splitter:smoke-test .
-          rm -f ./inf-splitter.bin
-      - name: Smoke test
-        run: SKIP_BUILD=1 ./scripts/docker-smoke-test.sh
+          echo "Checking for existing release: $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release exists, deleting..."
+            gh release delete "$TAG" --yes
+            echo "Release deleted successfully"
+          else
+            echo "Release does not exist, will create new one"
+          fi
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "Tag exists, deleting..."
+            git push origin --delete "refs/tags/$TAG" || true
+            echo "Tag deleted successfully"
+          else
+            echo "Tag does not exist, will create new one"
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Release ${{ env.VERSION }}
+          body: |
+            ## inf-splitter ${{ env.VERSION }}
+
+            Тонкий HTTP-роутер для запросов инференса: маршрутизация по модели на OpenAI- и Anthropic-совместимые upstream.
+
+            ### Linux (.deb)
+
+            ```bash
+            sudo dpkg -i inf-splitter_*.deb
+            ```
+
+            После установки:
+            1. Отредактируйте `/etc/inf-splitter/inf-splitter.toml` — укажите свои upstream
+            2. Заполните `/etc/inf-splitter/environment` — задайте API-ключи (формат `VAR=value`, по одной на строку)
+            3. Сервис уже запущен: `systemctl status inf-splitter`
+
+            ```bash
+            sudo systemctl restart inf-splitter   # после изменения конфига
+            journalctl -u inf-splitter -f          # логи
+            ```
+
+            ### Linux (binary)
+
+            ```bash
+            chmod +x inf-splitter
+            ./inf-splitter
+            ```
+
+            ### Windows
+
+            Скачайте `inf-splitter-windows.zip`, распакуйте и запустите `install.ps1` от имени администратора:
+
+            ```powershell
+            Expand-Archive inf-splitter-windows.zip -DestinationPath C:\temp\inf-splitter
+            cd C:\temp\inf-splitter\inf-splitter
+            .\install.ps1
+            ```
+
+            После установки:
+            1. Отредактируйте `%ProgramData%\inf-splitter\config.toml`
+            2. Задайте API-ключи: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
+            3. Перезапустите сервис: `Restart-Service inf-splitter`
+          files: |
+            inf-splitter
+            inf-splitter_*.deb
+            inf-splitter-windows.zip
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true

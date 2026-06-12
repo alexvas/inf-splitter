@@ -1,12 +1,9 @@
 upstream_timeout = "3m"
 max_request_body = "2m"
 
-[ollama]
-endpoint_anthropic = "http://host.docker.internal:11434"
-models = "gemma4:31b"
-max_tokens = 10_000
-max_output_tokens = 10_000
-max_completion_tokens = 10_000
+[llama-local]
+endpoint_anthropic = "http://host.docker.internal:11345"
+models = "local-model"
 
 [deepseek]
 endpoint_anthropic = "https://api.deepseek.com/anthropic"

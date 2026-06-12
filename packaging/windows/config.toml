@@ -1,0 +1,29 @@
+upstream_timeout = "3m"
+max_request_body = "2m"
+
+[llama-local]
+endpoint_anthropic = "http://host.docker.internal:11345"
+models = "local-model"
+
+[deepseek]
+endpoint_anthropic = "https://api.deepseek.com/anthropic"
+api_key = "${DEEPSEEK_API_KEY}"
+models = ["deepseek-v4-pro", "deepseek-v4-flash"]
+
+[etc]
+endpoint_openai = "https://api.modelarts-maas.com/openai/v1"
+api_key = "${MAAS_API_KEY}"
+models = "default"
+max_tokens = 10_000
+max_output_tokens = 10_000
+max_completion_tokens = 10_000
+
+[diagnostics]
+# "stderr" (default), "stdout", or a file path
+stats_output = "stderr"
+dump_output = "stderr"
+stats_mode = "all"
+dump_mode = "error"
+# To write to files, use absolute paths, e.g.:
+# stats_output = "C:\\ProgramData\\inf-splitter\\logs\\diag.ndjson"
+# dump_output = "C:\\ProgramData\\inf-splitter\\logs\\dump.ndjson"

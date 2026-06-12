@@ -38,6 +38,29 @@ jobs:
           name: inf-splitter-deb
           path: target/debian/inf-splitter_*.deb
 
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Bundle Windows package
+        shell: pwsh
+        run: |
+          $staging = "staging\inf-splitter"
+          New-Item -ItemType Directory -Force -Path "$staging\logs" | Out-Null
+          Copy-Item target\release\inf-splitter.exe $staging\
+          Copy-Item packaging\windows\winsw.xml $staging\
+          Copy-Item packaging\windows\config.toml $staging\
+          Copy-Item packaging\windows\install.ps1 $staging\
+          Compress-Archive -Path staging\* -DestinationPath inf-splitter-windows.zip
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inf-splitter-windows
+          path: inf-splitter-windows.zip
+
   rust-test:
     needs: rust-build
     runs-on: ubuntu-latest

@@ -210,6 +210,53 @@ docker run --rm \
   inf-splitter
 ```
 
+## Релизы
+
+Готовые сборки доступны в [GitHub Releases](https://github.com/) (артефакты CI для каждого пуша в `main`).
+
+### Linux (.deb)
+
+```bash
+sudo dpkg -i inf-splitter_*.deb
+```
+
+Пакет устанавливает бинарник в `/usr/bin/inf-splitter`, конфиг в `/etc/inf-splitter/inf-splitter.toml`, шаблон переменных окружения в `/etc/inf-splitter/environment` и systemd-сервис.
+
+После установки:
+1. Отредактируйте `/etc/inf-splitter/inf-splitter.toml` — укажите свои upstream
+2. Заполните `/etc/inf-splitter/environment` — задайте API-ключи (формат `VAR=value`, по одной на строку)
+3. Сервис уже запущен: `systemctl status inf-splitter`
+
+```bash
+# После изменения конфига или переменных окружения:
+sudo systemctl restart inf-splitter
+
+# Логи:
+journalctl -u inf-splitter -f
+```
+
+### Windows (zip)
+
+Скачайте `inf-splitter-windows.zip` из артефактов, распакуйте и запустите `install.ps1` от имени администратора:
+
+```powershell
+Expand-Archive inf-splitter-windows.zip -DestinationPath C:\temp\inf-splitter
+cd C:\temp\inf-splitter\inf-splitter
+.\install.ps1
+```
+
+Скрипт создаст `%ProgramData%\inf-splitter\`, установит и запустит Windows-сервис.
+
+После установки:
+1. Отредактируйте `%ProgramData%\inf-splitter\config.toml`
+2. Задайте API-ключи через WinSW: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
+3. Перезапустите сервис: `Restart-Service inf-splitter`
+
+```powershell
+Get-Service inf-splitter          # статус сервиса
+Get-EventLog -LogName Application -Source inf-splitter  # логи
+```
+
 ## Структура кода
 
 ```

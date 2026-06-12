@@ -81,3 +81,4 @@ Both streaming and non-streaming paths are handled. `stream_options` is always d
 - Default listen address is `127.0.0.1:{port}` from TOML (no `LISTEN_ADDR` env var)
 - Limits use suffix notation: `s`/`m` for durations, `k`/`m` for byte sizes
 - The `openssl` crate uses `vendored` feature — compiles OpenSSL from source, no system `libssl-dev` needed
+- **READMEs are trilingual.** Any change to one README (`README.md`, `README.en.md`, `README.zh.md`) must be reflected in all three. Keep structure (headings) and content in sync across languages. Pre-commit hook validates heading counts.

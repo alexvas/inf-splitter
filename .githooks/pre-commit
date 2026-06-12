@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+# Check READMEs are structurally in sync across all three languages
+RU=$(grep -c '^## ' README.md)
+EN=$(grep -c '^## ' README.en.md)
+ZH=$(grep -c '^## ' README.zh.md)
+
+if [ "$RU" != "$EN" ] || [ "$RU" != "$ZH" ]; then
+    echo "README heading count mismatch: RU=$RU EN=$EN ZH=$ZH" >&2
+    echo "Keep all three READMEs in sync." >&2
+    exit 1
+fi
+
+# Check THIRD_PARTY_NOTICES is up to date if Cargo.lock changed
+if git diff --cached --name-only | grep -q '^Cargo.lock$'; then
+    echo "Cargo.lock changed, regenerating THIRD_PARTY_NOTICES..."
+    python3 scripts/generate-third-party-notices.py
+    git add THIRD_PARTY_NOTICES
+fi

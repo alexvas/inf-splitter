@@ -41,6 +41,16 @@ jobs:
             echo "Run: python3 scripts/generate-third-party-notices.py"
             exit 1
           }
+      - name: Check README sync
+        run: |
+          RU=$(grep -c '^## ' README.md)
+          EN=$(grep -c '^## ' README.en.md)
+          ZH=$(grep -c '^## ' README.zh.md)
+          if [ "$RU" != "$EN" ] || [ "$RU" != "$ZH" ]; then
+            echo "README heading count mismatch: RU=$RU EN=$EN ZH=$ZH"
+            echo "Keep all three READMEs in sync."
+            exit 1
+          fi
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:

@@ -1,3 +1,5 @@
+**Русский** | [ English ](README.en.md) | [ 中文 ](README.zh.md)
+
 # inf-splitter
 
 Тонкий HTTP-роутер для запросов инференса: маршрутизация по модели из TOML-конфигурации на OpenAI- и Anthropic-совместимые upstream.

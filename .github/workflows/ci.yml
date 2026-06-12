@@ -17,10 +17,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  # --- Regular CI (every push to main, PR) ---
+  # --- Regular CI (every push) ---
 
   rust-build:
-    if: github.ref_type != 'tag' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +40,6 @@ jobs:
           path: target/release/inf-splitter
 
   rust-test:
-    if: github.ref_type != 'tag' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +52,6 @@ jobs:
 
   smoke:
     needs: rust-build
-    if: github.ref_type != 'tag' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,12 +72,12 @@ jobs:
   # --- Release jobs (tags, workflow_dispatch) ---
 
   linux-release:
+    needs: [rust-test, smoke]
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
 
       - name: Get package version
         id: pkg_version
@@ -99,17 +96,17 @@ jobs:
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           sed -i '/^name = "inf-splitter"/{n;s/version = ".*"/version = "'"${VERSION}"'"/}' Cargo.lock
 
-      - name: Build release binary
-        run: cargo build --release --locked
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
+      - name: Download binary
+        uses: actions/download-artifact@v4
         with:
-          name: inf-splitter-linux
-          path: target/release/inf-splitter
+          name: inf-splitter
+          path: target/release/
+      - run: chmod +x target/release/inf-splitter
+
       - name: Build .deb package
         run: |
           cargo install cargo-deb --locked
-          cargo deb --locked
+          cargo deb --no-build --locked
           cp target/debian/inf-splitter_*.deb .
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
@@ -118,6 +115,7 @@ jobs:
           path: inf-splitter_*.deb
 
   windows-release:
+    needs: rust-test
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: windows-2022
     steps:
@@ -195,7 +193,7 @@ jobs:
       - name: Download Linux binary
         uses: actions/download-artifact@v4
         with:
-          name: inf-splitter-linux
+          name: inf-splitter
 
       - name: Download .deb
         uses: actions/download-artifact@v4

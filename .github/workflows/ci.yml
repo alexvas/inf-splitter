@@ -235,37 +235,57 @@ jobs:
             ## inf-splitter ${{ env.VERSION }}
 
             Тонкий HTTP-роутер для запросов инференса: маршрутизация по модели на OpenAI- и Anthropic-совместимые upstream.
+            A thin HTTP router for inference requests: model-based routing to OpenAI- and Anthropic-compatible upstreams.
+            一个轻量级HTTP路由器，用于推理请求：基于模型的路由到OpenAI和Anthropic兼容的上游。
 
-            ### Linux (.deb)
+            ### Установка. Install. 安装。
+
+            #### Linux (.deb)
+
+            Скачайте `.deb` файл и установите. После установки отредактируйте конфиг и задайте API-ключи.
+            Download the `.deb` file and install. After installation, edit the config and set API keys.
+            下载`.deb`文件并安装。安装后编辑配置并设置API密钥。
 
             ```bash
             cd /tmp
-            wget https://github.com/alexvas/inf-splitter/releases/download/${{ env.TAG }}/inf-splitter_${{ env.VERSION }}-1_amd64.deb
+            wget https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/inf-splitter_${{ env.VERSION }}-1_amd64.deb
             sudo dpkg -i inf-splitter_${{ env.VERSION }}-1_amd64.deb
             ```
 
-            После установки:
-            1. Отредактируйте `/etc/inf-splitter/inf-splitter.toml` — укажите свои upstream
-            2. Заполните `/etc/inf-splitter/environment` — задайте API-ключи (формат `VAR=value`, по одной на строку)
-            3. Сервис уже запущен: `systemctl status inf-splitter`
+            После установки / After installation / 安装后:
+            1. Отредактируйте `/etc/inf-splitter/inf-splitter.toml` — укажите свои upstream.
+               Edit `/etc/inf-splitter/inf-splitter.toml` — configure your upstreams.
+               编辑 `/etc/inf-splitter/inf-splitter.toml` — 配置您的上游。
+            2. Заполните `/etc/inf-splitter/environment` — задайте API-ключи (формат `VAR=value`, по одной на строку).
+               Fill `/etc/inf-splitter/environment` — set API keys (format `VAR=value`, one per line).
+               填写 `/etc/inf-splitter/environment` — 设置API密钥（格式 `VAR=value`，每行一个）。
+            3. Сервис уже запущен: `systemctl status inf-splitter`.
+               The service is already running: `systemctl status inf-splitter`.
+               服务已启动: `systemctl status inf-splitter`.
 
             ```bash
-            sudo systemctl restart inf-splitter   # после изменения конфига
-            journalctl -u inf-splitter -f          # логи
+            sudo systemctl restart inf-splitter   # после изменения конфига / after config change / 配置更改后
+            journalctl -u inf-splitter -f          # логи / logs / 日志
             ```
 
-            ### Linux (binary)
+            #### Linux (binary)
+
+            Скачайте бинарник и запустите.
+            Download the binary and run it.
+            下载二进制文件并运行。
 
             ```bash
             cd /tmp
-            wget https://github.com/alexvas/inf-splitter/releases/download/${{ env.TAG }}/inf-splitter
+            wget https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/inf-splitter
             chmod +x inf-splitter
             ./inf-splitter
             ```
 
-            ### Windows
+            #### Windows
 
-            Скачайте `inf-splitter-windows.zip`, распакуйте и запустите `install.ps1` от имени администратора:
+            Скачайте `inf-splitter-windows.zip`, распакуйте и запустите `install.ps1` от имени администратора.
+            Download `inf-splitter-windows.zip`, unzip and run `install.ps1` as Administrator.
+            下载 `inf-splitter-windows.zip`，解压并以管理员身份运行 `install.ps1`。
 
             ```powershell
             Expand-Archive inf-splitter-windows.zip -DestinationPath C:\temp\inf-splitter
@@ -273,10 +293,16 @@ jobs:
             .\install.ps1
             ```
 
-            После установки:
-            1. Отредактируйте `%ProgramData%\inf-splitter\config.toml`
-            2. Задайте API-ключи: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
-            3. Перезапустите сервис: `Restart-Service inf-splitter`
+            После установки / After installation / 安装后:
+            1. Отредактируйте `%ProgramData%\inf-splitter\config.toml`.
+               Edit `%ProgramData%\inf-splitter\config.toml`.
+               编辑 `%ProgramData%\inf-splitter\config.toml`。
+            2. Задайте API-ключи: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`.
+               Set API keys: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`.
+               设置API密钥: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`。
+            3. Перезапустите сервис: `Restart-Service inf-splitter`.
+               Restart the service: `Restart-Service inf-splitter`.
+               重启服务: `Restart-Service inf-splitter`。
           files: |
             inf-splitter
             inf-splitter_*.deb

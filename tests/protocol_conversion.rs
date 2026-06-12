@@ -7,7 +7,8 @@ use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
 use common::{
     anthropic_upstream_response, openai_upstream_response, spawn_delayed_upstream,
     spawn_error_upstream, spawn_router, spawn_router_with_diagnostics, spawn_router_with_dump,
-    spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream, wait_for_file,
+    spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream, wait_for_egress_dump,
+    wait_for_file, wait_for_ingress_dump,
 };
 use inf_splitter::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
@@ -1119,13 +1120,9 @@ models = "ap-model"
 
     // Dump
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_file(&dump_path).await;
+    let dump_content = wait_for_egress_dump(&dump_path).await;
     let _ = std::fs::remove_file(&dump_path);
     let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
-    assert!(
-        !dump_lines.is_empty(),
-        "anthropic passthrough must produce dump lines"
-    );
     assert_unique_requests(&dump_lines);
     let has_egress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1203,13 +1200,9 @@ models = "ape-model"
 
     // Dump: must have at least egress
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_file(&dump_path).await;
+    let dump_content = wait_for_egress_dump(&dump_path).await;
     let _ = std::fs::remove_file(&dump_path);
     let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
-    assert!(
-        !dump_lines.is_empty(),
-        "anthropic passthrough error must produce dump lines"
-    );
     assert_unique_requests(&dump_lines);
     let has_egress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1295,13 +1288,9 @@ models = "oa-model"
 
     // Dump
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_file(&dump_path).await;
+    let dump_content = wait_for_egress_dump(&dump_path).await;
     let _ = std::fs::remove_file(&dump_path);
     let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
-    assert!(
-        !dump_lines.is_empty(),
-        "translation success must produce dump lines"
-    );
     assert_unique_requests(&dump_lines);
     let has_ingress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1388,13 +1377,9 @@ models = "ao-model"
 
     // Dump
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_content = wait_for_file(&dump_path).await;
+    let dump_content = wait_for_egress_dump(&dump_path).await;
     let _ = std::fs::remove_file(&dump_path);
     let dump_lines: Vec<&str> = dump_content.trim().lines().collect();
-    assert!(
-        !dump_lines.is_empty(),
-        "translation success must produce dump lines"
-    );
     assert_unique_requests(&dump_lines);
     let has_ingress = dump_lines.iter().any(|l| {
         let v: serde_json::Value = serde_json::from_str(l).unwrap();
@@ -1638,7 +1623,7 @@ models = "oi-model"
         .expect("request");
     assert_eq!(_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    let content = wait_for_file(&tmp).await;
+    let content = wait_for_ingress_dump(&tmp).await;
     let _ = std::fs::remove_file(&tmp);
     let has_ingress = content.lines().any(|l| {
         serde_json::from_str::<serde_json::Value>(l)
@@ -1694,7 +1679,7 @@ models = "ap-ingress-model"
         .expect("request");
     assert_eq!(_resp.status(), reqwest::StatusCode::OK);
 
-    let content = wait_for_file(&tmp).await;
+    let content = wait_for_ingress_dump(&tmp).await;
     let _ = std::fs::remove_file(&tmp);
     let has_ingress = content.lines().any(|l| {
         serde_json::from_str::<serde_json::Value>(l)
@@ -1940,11 +1925,10 @@ models = "oai-er-model"
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let _body = response.text().await.expect("response body");
 
-    let content = wait_for_file(&tmp).await;
+    let content = wait_for_egress_dump(&tmp).await;
     let _ = std::fs::remove_file(&tmp);
 
     let lines: Vec<&str> = content.trim().lines().collect();
-    assert!(!lines.is_empty(), "expected at least one dump line");
     assert_unique_requests(&lines);
 
     let egress_responses: Vec<serde_json::Value> = lines
@@ -2036,11 +2020,10 @@ models = "stream-oai-er-model"
     // Must consume the SSE stream body to trigger DiagnosticStream termination and dump.
     let _body = response.text().await.expect("response body");
 
-    let content = wait_for_file(&tmp).await;
+    let content = wait_for_egress_dump(&tmp).await;
     let _ = std::fs::remove_file(&tmp);
 
     let lines: Vec<&str> = content.trim().lines().collect();
-    assert!(!lines.is_empty(), "expected at least one dump line");
     assert_unique_requests(&lines);
 
     let egress_responses: Vec<serde_json::Value> = lines

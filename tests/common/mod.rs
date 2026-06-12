@@ -162,20 +162,72 @@ pub async fn spawn_stream_upstream(path: &'static str, sse_body: String) -> Sock
     bind_and_serve(app).await.0
 }
 
-/// Poll a file until it exists and has non-empty content, with a timeout.
-pub async fn wait_for_file(path: &std::path::Path) -> String {
+async fn poll_diagnostics_file(
+    path: &std::path::Path,
+    deadline_msg: &str,
+    pred: impl Fn(&str) -> bool,
+) -> String {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if let Ok(content) = std::fs::read_to_string(path) {
-            if !content.trim().is_empty() {
+            if pred(&content) {
                 return content;
             }
         }
         if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for diagnostics file: {}", path.display());
+            panic!("{deadline_msg}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// Poll a file until it exists and has non-empty content, with a timeout.
+pub async fn wait_for_file(path: &std::path::Path) -> String {
+    poll_diagnostics_file(
+        path,
+        &format!("timed out waiting for diagnostics file: {}", path.display()),
+        |c| !c.trim().is_empty(),
+    )
+    .await
+}
+
+/// Poll a diagnostics dump file until it contains at least one ingress
+/// line (stage="ingress").
+pub async fn wait_for_ingress_dump(path: &std::path::Path) -> String {
+    poll_diagnostics_file(
+        path,
+        &format!("timed out waiting for ingress dump in: {}", path.display()),
+        |c| {
+            c.lines().any(|line| {
+                serde_json::from_str(line)
+                    .ok()
+                    .map_or(false, |v: serde_json::Value| {
+                        v["stage"].as_str() == Some("ingress")
+                    })
+            })
+        },
+    )
+    .await
+}
+
+/// Poll a diagnostics dump file until it contains at least one egress
+/// line (stage="egress"). Prevents a race where the file has the ingress
+/// dump but the egress dump hasn't been flushed yet by the background writer.
+pub async fn wait_for_egress_dump(path: &std::path::Path) -> String {
+    poll_diagnostics_file(
+        path,
+        &format!("timed out waiting for egress dump in: {}", path.display()),
+        |c| {
+            c.lines().any(|line| {
+                serde_json::from_str(line)
+                    .ok()
+                    .map_or(false, |v: serde_json::Value| {
+                        v["stage"].as_str() == Some("egress")
+                    })
+            })
+        },
+    )
+    .await
 }
 
 /// Spawn an upstream that returns an SSE stream with custom headers.

@@ -95,8 +95,8 @@ cp secrets.example/* secrets/
 ## 路由
 
 ```
-Claude Code  --POST /openai/v1/messages-->     inf-splitter
-            --POST /anthropic/v1/messages-->
+Claude Code  --POST /v1/messages-->     inf-splitter
+OpenAI SDK  --POST /v1/chat/completions-->
                          |
               model + ingress protocol
                          |
@@ -110,18 +110,18 @@ Claude Code  --POST /openai/v1/messages-->     inf-splitter
 
 | 模型 | 段 | 推荐入口 |
 |------|-----|----------|
-| `gemma4:31b` | `[ollama]` | `POST /openai/v1/messages` |
-| `deepseek-v4-pro[1m]`、`deepseek-v4-flash` | `[deepseek]` | `POST /anthropic/v1/messages` |
-| 任何其他 | `[etc]`（`default`） | `POST /openai/v1/messages` |
+| `gemma4:31b` | `[ollama]` | `POST /v1/chat/completions` |
+| `deepseek-v4-pro[1m]`、`deepseek-v4-flash` | `[deepseek]` | `POST /v1/messages` |
+| 任何其他 | `[etc]`（`default`） | `POST /v1/chat/completions` |
 
 入口端点指定**传入请求格式和客户端响应格式**。TOML段通过`endpoint_openai`和/或`endpoint_anthropic`指定**目标上游**。当两者都设置时，`/openai`转到`endpoint_openai`，`/anthropic`转到`endpoint_anthropic`（直通）。当只设置一个时，相反的入口通过`anyllm_translate`进行转换。
 
 | 入口 | 端点可用性 | 行为 |
 |------|------------|------|
-| `/openai/v1/messages` | 设置了`endpoint_openai` | 直通→OpenAI上游 |
-| `/openai/v1/messages` | 仅`endpoint_anthropic` | OpenAI→Anthropic→OpenAI |
-| `/anthropic/v1/messages` | 设置了`endpoint_anthropic` | 直通→Anthropic上游 |
-| `/anthropic/v1/messages` | 仅`endpoint_openai` | Anthropic→OpenAI→Anthropic |
+| `/v1/chat/completions` | 设置了`endpoint_openai` | 直通→OpenAI上游 |
+| `/v1/chat/completions` | 仅`endpoint_anthropic` | OpenAI→Anthropic→OpenAI |
+| `/v1/messages` | 设置了`endpoint_anthropic` | 直通→Anthropic上游 |
+| `/v1/messages` | 仅`endpoint_openai` | Anthropic→OpenAI→Anthropic |
 
 ### API密钥
 
@@ -164,12 +164,11 @@ flush_period = "10s"
 | 方法 | 路径 | 描述 |
 |------|------|------|
 | `GET` | `/health` | 就绪探针：`{"status":"ok","upstreams":{...}}`或上游不可用时`{"status":"degraded",...}`（HTTP 503） |
-| `GET` | `/openai/v1/models` | OpenAI兼容的模型列表 |
-| `GET` | `/anthropic/v1/models` | Anthropic兼容的模型列表 |
-| `POST` | `/openai/v1/messages` | OpenAI格式；上游通过TOML中的`model`解析 |
-| `POST` | `/anthropic/v1/messages` | Anthropic格式；上游通过TOML中的`model`解析 |
+| `GET` | `/v1/models` | 模型列表 |
+| `POST` | `/v1/chat/completions` | OpenAI格式；上游通过TOML中的`model`解析 |
+| `POST` | `/v1/messages` | Anthropic格式；上游通过TOML中的`model`解析 |
 
-### `GET /openai/v1/models` 和 `GET /anthropic/v1/models`
+### `GET /v1/models`
 
 返回TOML中明确列出的所有模型ID（不包括`"default"`），按字典顺序排列。
 
@@ -177,8 +176,8 @@ flush_period = "10s"
 
 `Claude CLI`代理使用路由器作为上游Anthropic API：
 
-- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}/anthropic`（网络内）
-- 对于通过OpenAI协议的本地模型：`http://inf-splitter:${PROXY_PORT}/openai`
+- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}`（网络内）
+- 对于通过OpenAI协议的本地模型：`OPENAI_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}`
 
 挂载配置和密钥。在Docker中设置`INF_SPLITTER_LISTEN_HOST=0.0.0.0`：
 

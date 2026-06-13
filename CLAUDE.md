@@ -21,7 +21,7 @@ inf-splitter is an HTTP proxy that routes LLM inference requests to OpenAI- and 
 ### Request flow
 
 ```
-Client → POST /openai/v1/messages  or  /anthropic/v1/messages
+Client → POST /v1/chat/completions  or  /v1/messages
        → router::dispatch_messages:
            1. Peek `model` field from JSON body
            2. Config::resolve_route(&model) → RouteTarget

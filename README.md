@@ -95,8 +95,8 @@ cp secrets.example/* secrets/
 ## Маршрутизация
 
 ```
-Claude Code  --POST /openai/v1/messages-->     inf-splitter
-            --POST /anthropic/v1/messages-->
+Claude Code  --POST /v1/messages-->     inf-splitter
+OpenAI SDK  --POST /v1/chat/completions-->
                          |
               model + ingress protocol
                          |
@@ -110,18 +110,18 @@ Claude Code  --POST /openai/v1/messages-->     inf-splitter
 
 | Модель | Секция | Рекомендуемый ingress |
 |--------|--------|------------------------|
-| `gemma4:31b` | `[ollama]` | `POST /openai/v1/messages` |
-| `deepseek-v4-pro[1m]`, `deepseek-v4-flash` | `[deepseek]` | `POST /anthropic/v1/messages` |
-| любая другая | `[etc]` (`default`) | `POST /openai/v1/messages` |
+| `gemma4:31b` | `[ollama]` | `POST /v1/chat/completions` |
+| `deepseek-v4-pro[1m]`, `deepseek-v4-flash` | `[deepseek]` | `POST /v1/messages` |
+| любая другая | `[etc]` (`default`) | `POST /v1/chat/completions` |
 
 Ingress endpoint задаёт **формат входящего запроса и ответа клиенту**. Секция TOML задаёт **целевой upstream** через `endpoint_openai` и/или `endpoint_anthropic`. Если заданы оба — `/openai` идёт на `endpoint_openai`, `/anthropic` — на `endpoint_anthropic` (passthrough). Если задан только один — встречный ingress конвертируется через `anyllm_translate`.
 
 | Ingress | Наличие endpoint | Поведение |
 |---------|-------------------|-----------|
-| `/openai/v1/messages` | `endpoint_openai` задан | passthrough → OpenAI upstream |
-| `/openai/v1/messages` | только `endpoint_anthropic` | OpenAI → Anthropic → OpenAI |
-| `/anthropic/v1/messages` | `endpoint_anthropic` задан | passthrough → Anthropic upstream |
-| `/anthropic/v1/messages` | только `endpoint_openai` | Anthropic → OpenAI → Anthropic |
+| `/v1/chat/completions` | `endpoint_openai` задан | passthrough → OpenAI upstream |
+| `/v1/chat/completions` | только `endpoint_anthropic` | OpenAI → Anthropic → OpenAI |
+| `/v1/messages` | `endpoint_anthropic` задан | passthrough → Anthropic upstream |
+| `/v1/messages` | только `endpoint_openai` | Anthropic → OpenAI → Anthropic |
 
 ### API-ключи
 
@@ -164,21 +164,20 @@ flush_period = "10s"
 | Метод | Путь | Описание |
 |-------|------|----------|
 | `GET` | `/health` | Readiness probe: `{"status":"ok","upstreams":{...}}` или `{"status":"degraded",...}` (HTTP 503) при недоступных upstream |
-| `GET` | `/openai/v1/models` | OpenAI-совместимый список моделей |
-| `GET` | `/anthropic/v1/models` | Anthropic-совместимый список моделей |
-| `POST` | `/openai/v1/messages` | OpenAI-формат; upstream по `model` из TOML |
-| `POST` | `/anthropic/v1/messages` | Anthropic-формат; upstream по `model` из TOML |
+| `GET` | `/v1/models` | Список моделей |
+| `POST` | `/v1/chat/completions` | OpenAI-формат; upstream по `model` из TOML |
+| `POST` | `/v1/messages` | Anthropic-формат; upstream по `model` из TOML |
 
-### `GET /openai/v1/models` и `GET /anthropic/v1/models`
+### `GET /v1/models`
 
-Возвращают все явно перечисленные в TOML model id (без `"default"`), в лексикографическом порядке.
+Возвращает все явно перечисленные в TOML model id (без `"default"`), в лексикографическом порядке.
 
 ## Интеграция с docker-compose
 
 Агент `Claude CLI` использует роутер как upstream Anthropic API:
 
-- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}/anthropic` (внутри сети)
-- Для локальных моделей через OpenAI-протокол: `http://inf-splitter:${PROXY_PORT}/openai`
+- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}` (внутри сети)
+- Для локальных моделей через OpenAI-протокол: `OPENAI_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}`
 
 Смонтируйте конфиг и секреты. Для работы в Docker задайте `INF_SPLITTER_LISTEN_HOST=0.0.0.0`:
 

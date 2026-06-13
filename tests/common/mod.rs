@@ -48,6 +48,26 @@ pub fn anthropic_upstream_response(model: &str, text: &str) -> serde_json::Value
     })
 }
 
+/// Send a POST to `/v1/chat/completions` on the proxy with a JSON body.
+pub async fn post_openai(proxy_addr: &SocketAddr, body: serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .expect("proxy request")
+}
+
+/// Send a POST to `/v1/messages` on the proxy with a JSON body.
+pub async fn post_anthropic(proxy_addr: &SocketAddr, body: serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .expect("proxy request")
+}
+
 pub async fn spawn_upstream(
     path: &'static str,
     captured: Arc<Mutex<Option<serde_json::Value>>>,

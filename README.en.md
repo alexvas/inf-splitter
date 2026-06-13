@@ -95,8 +95,8 @@ The `secrets/` directory is in `.gitignore` — never commit real keys.
 ## Routing
 
 ```
-Claude Code  --POST /openai/v1/messages-->     inf-splitter
-            --POST /anthropic/v1/messages-->
+Claude Code  --POST /v1/messages-->     inf-splitter
+OpenAI SDK  --POST /v1/chat/completions-->
                          |
               model + ingress protocol
                          |
@@ -110,18 +110,18 @@ Claude Code  --POST /openai/v1/messages-->     inf-splitter
 
 | Model | Section | Recommended ingress |
 |-------|---------|---------------------|
-| `gemma4:31b` | `[ollama]` | `POST /openai/v1/messages` |
-| `deepseek-v4-pro[1m]`, `deepseek-v4-flash` | `[deepseek]` | `POST /anthropic/v1/messages` |
-| any other | `[etc]` (`default`) | `POST /openai/v1/messages` |
+| `gemma4:31b` | `[ollama]` | `POST /v1/chat/completions` |
+| `deepseek-v4-pro[1m]`, `deepseek-v4-flash` | `[deepseek]` | `POST /v1/messages` |
+| any other | `[etc]` (`default`) | `POST /v1/chat/completions` |
 
 The ingress endpoint specifies the **incoming request format and client response format**. The TOML section specifies the **target upstream** via `endpoint_openai` and/or `endpoint_anthropic`. When both are set, `/openai` goes to `endpoint_openai`, `/anthropic` goes to `endpoint_anthropic` (passthrough). When only one is set, the opposite ingress is converted via `anyllm_translate`.
 
 | Ingress | Endpoint availability | Behavior |
 |---------|----------------------|----------|
-| `/openai/v1/messages` | `endpoint_openai` set | passthrough → OpenAI upstream |
-| `/openai/v1/messages` | only `endpoint_anthropic` | OpenAI → Anthropic → OpenAI |
-| `/anthropic/v1/messages` | `endpoint_anthropic` set | passthrough → Anthropic upstream |
-| `/anthropic/v1/messages` | only `endpoint_openai` | Anthropic → OpenAI → Anthropic |
+| `/v1/chat/completions` | `endpoint_openai` set | passthrough → OpenAI upstream |
+| `/v1/chat/completions` | only `endpoint_anthropic` | OpenAI → Anthropic → OpenAI |
+| `/v1/messages` | `endpoint_anthropic` set | passthrough → Anthropic upstream |
+| `/v1/messages` | only `endpoint_openai` | Anthropic → OpenAI → Anthropic |
 
 ### API keys
 
@@ -164,12 +164,11 @@ When running in Docker with `stats_output = "stderr"`, stats lines appear in `do
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Readiness probe: `{"status":"ok","upstreams":{...}}` or `{"status":"degraded",...}` (HTTP 503) when upstreams are unavailable |
-| `GET` | `/openai/v1/models` | OpenAI-compatible model list |
-| `GET` | `/anthropic/v1/models` | Anthropic-compatible model list |
-| `POST` | `/openai/v1/messages` | OpenAI format; upstream resolved by `model` from TOML |
-| `POST` | `/anthropic/v1/messages` | Anthropic format; upstream resolved by `model` from TOML |
+| `GET` | `/v1/models` | Model list |
+| `POST` | `/v1/chat/completions` | OpenAI format; upstream resolved by `model` from TOML |
+| `POST` | `/v1/messages` | Anthropic format; upstream resolved by `model` from TOML |
 
-### `GET /openai/v1/models` and `GET /anthropic/v1/models`
+### `GET /v1/models`
 
 Return all model IDs explicitly listed in TOML (excluding `"default"`), in lexicographic order.
 
@@ -177,8 +176,8 @@ Return all model IDs explicitly listed in TOML (excluding `"default"`), in lexic
 
 The `Claude CLI` agent uses the router as an upstream Anthropic API:
 
-- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}/anthropic` (within the network)
-- For local models via OpenAI protocol: `http://inf-splitter:${PROXY_PORT}/openai`
+- `ANTHROPIC_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}` (within the network)
+- For local models via OpenAI protocol: `OPENAI_BASE_URL=http://inf-splitter:${PROXY_PORT:-3000}`
 
 Mount your config and secrets. For Docker, set `INF_SPLITTER_LISTEN_HOST=0.0.0.0`:
 

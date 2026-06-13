@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use anyllm_translate::anthropic::{Content, MessageCreateRequest};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
 use common::{
-    anthropic_upstream_response, openai_upstream_response, spawn_delayed_upstream,
-    spawn_error_upstream, spawn_router, spawn_router_with_diagnostics, spawn_router_with_dump,
-    spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream, wait_for_egress_dump,
-    wait_for_egress_response_dump, wait_for_file, wait_for_ingress_dump,
+    anthropic_upstream_response, openai_upstream_response, post_anthropic, post_openai,
+    spawn_delayed_upstream, spawn_error_upstream, spawn_router, spawn_router_with_diagnostics,
+    spawn_router_with_dump, spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream,
+    wait_for_egress_dump, wait_for_egress_response_dump, wait_for_file, wait_for_ingress_dump,
 };
 use inf_splitter::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
@@ -35,7 +35,6 @@ models = "local-openai-model"
     );
 
     let proxy_addr = spawn_router(&config).await;
-    let client = reqwest::Client::new();
 
     let anthropic_request = serde_json::json!({
         "model": "local-openai-model",
@@ -43,12 +42,7 @@ models = "local-openai-model"
         "messages": [{"role": "user", "content": CLIENT_PROMPT}]
     });
 
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&anthropic_request)
-        .send()
-        .await
-        .expect("proxy request");
+    let response = post_anthropic(&proxy_addr, anthropic_request).await;
 
     let status = response.status();
     let body_text = response.text().await.expect("response body");
@@ -100,7 +94,6 @@ models = "remote-anthropic-model"
     );
 
     let proxy_addr = spawn_router(&config).await;
-    let client = reqwest::Client::new();
 
     let openai_request = serde_json::json!({
         "model": "remote-anthropic-model",
@@ -108,12 +101,7 @@ models = "remote-anthropic-model"
         "messages": [{"role": "user", "content": CLIENT_PROMPT}]
     });
 
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&openai_request)
-        .send()
-        .await
-        .expect("proxy request");
+    let response = post_openai(&proxy_addr, openai_request).await;
 
     let status = response.status();
     let body_text = response.text().await.expect("response body");
@@ -155,18 +143,16 @@ endpoint_openai = "http://127.0.0.1:1"
 models = "known-model"
 "#;
     let proxy_addr = spawn_router(config).await;
-    let client = reqwest::Client::new();
 
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "unknown-model",
             "max_tokens": 10,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 }
@@ -181,18 +167,16 @@ endpoint_openai = "http://127.0.0.1:1"
 models = "known-model"
 "#;
     let proxy_addr = spawn_router(config).await;
-    let client = reqwest::Client::new();
 
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "",
             "max_tokens": 10,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 }
@@ -210,7 +194,7 @@ models = "known-model"
     let client = reqwest::Client::new();
 
     let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .post(format!("http://{proxy_addr}/v1/messages"))
         .header("content-type", "application/json")
         .body("not json")
         .send()
@@ -240,17 +224,15 @@ models = "test-model"
     );
 
     let proxy_addr = spawn_router(&config).await;
-    let client = reqwest::Client::new();
 
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     let body: serde_json::Value = response.json().await.expect("json body");
@@ -278,17 +260,15 @@ models = "passthrough-model"
     );
 
     let proxy_addr = spawn_router(&config).await;
-    let client = reqwest::Client::new();
 
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "passthrough-model",
             "messages": [{"role": "user", "content": "test"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert!(response.status().is_success());
     let body: serde_json::Value = response.json().await.expect("json body");
@@ -316,18 +296,16 @@ models = "passthrough-model"
     );
 
     let proxy_addr = spawn_router(&config).await;
-    let client = reqwest::Client::new();
 
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "passthrough-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "test"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert!(response.status().is_success());
     let body: serde_json::Value = response.json().await.expect("json body");
@@ -363,19 +341,17 @@ models = "stream-model"
     );
 
     let proxy_addr = spawn_router(&config).await;
-    let client = reqwest::Client::new();
 
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "stream-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     let status = response.status();
     let body = response.text().await.expect("response body");
@@ -414,19 +390,17 @@ models = "stream-model"
     );
 
     let proxy_addr = spawn_router(&config).await;
-    let client = reqwest::Client::new();
 
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "stream-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert!(response.status().is_success());
     let body = response.text().await.expect("response body");
@@ -458,19 +432,17 @@ models = "dump-model"
 
     let proxy_addr = spawn_router_with_dump(&config).await;
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "dump-model",
             "messages": [
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": "world"}
             ]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
     let body: serde_json::Value = response.json().await.expect("json body");
@@ -499,20 +471,18 @@ models = "dump-conv-model"
 
     let proxy_addr = spawn_router_with_dump(&config).await;
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "dump-conv-model",
             "max_tokens": 64,
             "messages": [
                 {"role": "user", "content": "hello"},
                 {"role": "user", "content": [{"type": "text", "text": "describe this"}]}
             ]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = response.json().await.expect("json body");
@@ -541,18 +511,16 @@ models = "dump-stream-model"
 
     let proxy_addr = spawn_router_with_dump(&config).await;
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "dump-stream-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
     let body: serde_json::Value = response.json().await.expect("json body");
@@ -589,17 +557,15 @@ models = "test-model"
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "test-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
@@ -651,17 +617,15 @@ models = "test-model"
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "test-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
@@ -725,30 +689,27 @@ models = "fail-model"
     );
 
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
 
     // Successful request — should NOT write stats.
-    let ok_resp = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let ok_resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "ok-model",
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("ok request");
+        }),
+    )
+    .await;
     assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
 
     // Error request — should write stats.
-    let err_resp = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let err_resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "fail-model",
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("fail request");
+        }),
+    )
+    .await;
     assert_eq!(err_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
     let lines = wait_for_file(&tmp).await;
@@ -817,30 +778,26 @@ models = "fail-model"
     );
 
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
     // Successful request — should NOT write dump.
-    let ok_resp = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let ok_resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "ok-model",
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("ok request");
+        }),
+    )
+    .await;
     assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
 
     // Error request — should write dump.
-    let err_resp = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let err_resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "fail-model",
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("fail request");
+        }),
+    )
+    .await;
     assert_eq!(err_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
     let lines = wait_for_file(&tmp).await;
@@ -910,18 +867,16 @@ models = "trans-model"
     );
 
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
 
-    let resp = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let resp = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "trans-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "translate me"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
     // Check stats: must have both ingress and egress message details.
@@ -994,18 +949,16 @@ models = "trans-model"
     );
 
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
 
-    let resp = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "trans-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "translate me"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
     // Stats: must have ingress and egress details.
@@ -1072,18 +1025,16 @@ models = "ap-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
 
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "ap-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
@@ -1144,18 +1095,15 @@ models = "ape-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "ape-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
 
@@ -1222,18 +1170,15 @@ models = "oa-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "oa-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "translate me"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
@@ -1307,18 +1252,15 @@ models = "ao-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "ao-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "translate me"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
@@ -1399,19 +1341,16 @@ models = "stream-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let _response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let _response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "stream-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     let lines = wait_for_file(&tmp).await;
 
@@ -1463,17 +1402,14 @@ models = "timed-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "timed-model",
             "messages": [{"role": "user", "content": "ping"}]
-        }))
-        .send()
-        .await
-        .expect("request");
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let lines = wait_for_file(&tmp).await;
@@ -1517,18 +1453,15 @@ models = "dup-model"
     );
 
     let proxy_addr = spawn_router(&config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "dup-model",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert!(response.status().is_success());
 
@@ -1576,16 +1509,14 @@ models = "oi-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-    let _resp = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let _resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "oi-model",
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("request");
+        }),
+    )
+    .await;
     assert_eq!(_resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
     let lines = wait_for_ingress_dump(&tmp).await;
@@ -1630,17 +1561,15 @@ models = "ap-ingress-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-    let _resp = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let _resp = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "ap-ingress-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("request");
+        }),
+    )
+    .await;
     assert_eq!(_resp.status(), reqwest::StatusCode::OK);
 
     let lines = wait_for_ingress_dump(&tmp).await;
@@ -1685,18 +1614,15 @@ models = "er-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "er-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let _body = response.text().await.expect("response body");
@@ -1779,19 +1705,16 @@ models = "stream-er-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "stream-er-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert!(response.status().is_success());
     // Must consume the SSE stream body to trigger DiagnosticStream termination and dump.
@@ -1867,17 +1790,14 @@ models = "oai-er-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "oai-er-model",
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let _body = response.text().await.expect("response body");
@@ -1958,18 +1878,15 @@ models = "stream-oai-er-model"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "stream-oai-er-model",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert!(response.status().is_success());
     // Must consume the SSE stream body to trigger DiagnosticStream termination and dump.
@@ -2029,7 +1946,7 @@ models = "known-model"
     let client = reqwest::Client::new();
 
     let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(vec![0xFF, 0xFE, 0x00, 0x01])
         .send()
@@ -2080,18 +1997,15 @@ models = "test-model"
 "#
     );
     let proxy_addr = common::spawn_router(&config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
             "model": "test-model",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status(),
@@ -2140,17 +2054,14 @@ models = "test-model"
 "#
     );
     let proxy_addr = common::spawn_router(&config).await;
-    let client = reqwest::Client::new();
-
-    let response = client
-        .post(format!("http://{proxy_addr}/openai/v1/messages"))
-        .json(&serde_json::json!({
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("proxy request");
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status(),
@@ -2202,20 +2113,18 @@ max_file_size = "1k"
         ..DiagnosticsConfig::default()
     };
     let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
-    let client = reqwest::Client::new();
 
     // Send multiple requests to fill the file past 1KB
     for i in 0..5 {
-        let response = client
-            .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
-            .json(&serde_json::json!({
+        let response = post_anthropic(
+            &proxy_addr,
+            serde_json::json!({
                 "model": "rot-model",
                 "max_tokens": 64,
                 "messages": [{"role": "user", "content": format!("msg-{}", i)}]
-            }))
-            .send()
-            .await
-            .expect("proxy request");
+            }),
+        )
+        .await;
         // Consume body to trigger dump recording
         let _ = response.text().await;
     }

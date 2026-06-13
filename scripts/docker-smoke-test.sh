@@ -85,11 +85,11 @@ if [[ "${response:-}" == "" ]]; then
   exit 1
 fi
 
-models="$(http_get "${BASE_URL}/openai/v1/models")"
+models="$(http_get "${BASE_URL}/v1/models")"
 if [[ "$models" != *"smoke-model"* ]]; then
-  echo "Smoke test failed: /openai/v1/models response unexpected: ${models}" >&2
+  echo "Smoke test failed: /v1/models response unexpected: ${models}" >&2
   exit 1
 fi
-echo "GET /openai/v1/models OK"
+echo "GET /v1/models OK"
 
 echo "Docker smoke test passed."

@@ -26,6 +26,8 @@ When Anthropic-format ingress must reach an OpenAI-compatible upstream, `OpenAiH
 - Request body is parsed, translated, serialized, and sent upstream
 - Response is translated back from OpenAI to Anthropic format
 
+Before translation, `strip_adaptive_thinking()` removes the `thinking` field when its type is `"adaptive"` — unsupported by `anyllm_translate` 0.9.x `ThinkingConfig`. Since the translation doesn't propagate thinking blocks anyway, removal is safe.
+
 ### Scenario: Non-streaming conversion
 - GIVEN `POST /v1/messages` with `"stream": false`
 - WHEN routing to an OpenAI-only section
@@ -85,3 +87,39 @@ Token limits (`max_tokens`, `max_output_tokens`, `max_completion_tokens`) are in
 - GIVEN `dump_mode = "all"` and a streaming request
 - WHEN the SSE stream completes
 - THEN the accumulated body is recorded as an egress response dump
+
+## Requirement: Drop Fields on Egress
+
+`drop_fields` are applied to outgoing request bodies on all four routing paths. The shared helper `apply_egress_transforms` handles passthrough paths (token caps + field drops on parsed `Value`). The helper `prepare_egress_body` handles conversion paths (serialize struct → Value → drop → bytes).
+
+### Scenario: Drop on passthrough
+- GIVEN `drop_fields = ["user"]` on a passthrough section
+- WHEN a request with `"user":"abc"` is processed
+- THEN the upstream receives the body without the `user` field
+
+### Scenario: Drop on conversion
+- GIVEN `drop_fields = ["logprobs"]` and an OpenAI→Anthropic conversion section
+- WHEN an OpenAI ingress request includes `"logprobs": true`
+- THEN the translated Anthropic request does not contain `logprobs`
+
+## Requirement: apply_egress_transforms
+
+`lib.rs` provides `apply_egress_transforms(value, model, route)` for passthrough paths — applies token caps via `apply_token_caps_to_value`, resolves `drop_fields` for the model, and removes them via `drop_fields_from_value`. Used by both `OpenAiHandler` and `AnthropicHandler` passthrough.
+
+## Requirement: prepare_egress_body
+
+`lib.rs` provides `prepare_egress_body(req, model, route, diagnostics)` for conversion paths — serializes a typed request struct to `serde_json::Value`, applies `drop_fields`, serializes to bytes, and returns `PreparedBody { bytes, value, egress_str }`. Used by all four conversion paths (both streaming and non-streaming in both files).
+
+## Requirement: Anthropic Response Header Whitelist
+
+`copy_response_headers()` in `anthropic.rs` forwards only these response headers from upstream to client:
+- `content-type`
+- `request-id`
+- `anthropic-ratelimit-requests-limit`
+- `anthropic-ratelimit-requests-remaining`
+- `anthropic-ratelimit-requests-reset`
+- `anthropic-ratelimit-tokens-limit`
+- `anthropic-ratelimit-tokens-remaining`
+- `anthropic-ratelimit-tokens-reset`
+
+All other upstream response headers are filtered out. The OpenAI response relay path applies its own header forwarding via `relay_response_headers`.

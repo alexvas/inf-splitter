@@ -109,3 +109,21 @@ All error responses follow the Anthropic API error shape: `{"type":"error","erro
 - GIVEN an upstream returns an error response
 - WHEN the proxy relays it to the client
 - THEN it uses the Anthropic error JSON format
+
+## Requirement: Body Too Large Hint
+
+When a request exceeds `max_request_body`, the proxy returns 413 with a JSON error. If the response status matches a code in `body_too_large_hint_statuses` (default `[413]`), the `append_size_hint()` function in `lib.rs` appends a hint: `"Try reducing context size or splitting into smaller requests."` to the error message. Set `body_too_large_hint_statuses = []` to disable hints.
+
+### Scenario: 413 with hint
+- GIVEN `body_too_large_hint_statuses = [413]` (default) and the body exceeds the limit
+- WHEN a 413 response is generated
+- THEN the error message includes the context-size hint
+
+### Scenario: 413 without hint
+- GIVEN `body_too_large_hint_statuses = []` and the body exceeds the limit
+- WHEN a 413 response is generated
+- THEN the error message does NOT include the hint
+
+## Requirement: Graceful Shutdown
+
+`main.rs` handles SIGTERM/SIGINT via `tokio::signal`. On shutdown signal, the server stops accepting new connections and drains in-flight requests before exiting. This is the standard Axum graceful shutdown pattern.

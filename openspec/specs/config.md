@@ -35,6 +35,13 @@ The proxy binds to `listen_host`:`listen_port` from the TOML config.
 - WHEN the proxy starts
 - THEN it listens on `0.0.0.0:{port}`
 
+### Environment Variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `INF_SPLITTER_CONFIG` | Path to TOML config file | `config/inf-splitter.toml` |
+| `INF_SPLITTER_LISTEN_HOST` | Override `listen_host` from config | `127.0.0.1` |
+
 ## Requirement: Provider Sections
 
 Each TOML section (except `[defaults]` and `[diagnostics]`) represents a provider. At least one of `endpoint_openai` or `endpoint_anthropic` must be set.
@@ -108,6 +115,46 @@ Models are matched against provider sections in order of definition. Supported m
 - GIVEN no `[defaults]` and no per-section `max_tokens`
 - WHEN a request is processed
 - THEN no token limit is injected
+
+## Requirement: Per-Section drop_fields
+
+Each provider section can specify `drop_fields` — top-level JSON keys removed from the request body before forwarding upstream. Two forms:
+
+**Flat list** — same fields for every model in the section:
+```toml
+drop_fields = ["thinking", "stream_options"]
+```
+
+**Per-model map** — `"all"` provides base fields, model-specific keys add extra fields:
+```toml
+[deepseek.drop_fields]
+all = ["thinking"]
+"deepseek-v4-pro" = ["context_management"]
+```
+
+`"all"` is a reserved key; model-specific keys are additive (merged with `"all"`, not replacing). Fields are removed after model extraction and token limit injection, before serialization upstream.
+
+### Scenario: Flat list applies to all models
+- GIVEN section has `drop_fields = ["thinking"]` and models `["a", "b"]`
+- WHEN a request arrives for model `"a"` or `"b"`
+- THEN `thinking` is dropped from the outgoing body
+
+### Scenario: Per-model merge with "all"
+- GIVEN `[s.drop_fields]` has `all = ["thinking"]` and `"deepseek-v4-pro" = ["context_management"]`
+- WHEN a request arrives for model `"deepseek-v4-pro"`
+- THEN both `thinking` and `context_management` are dropped
+- WHEN a request arrives for another model in the section
+- THEN only `thinking` is dropped (from `"all"`)
+
+### Scenario: drop_fields absent is a no-op
+- GIVEN section has no `drop_fields` key
+- WHEN a request body is forwarded
+- THEN all client fields are passed through unchanged
+
+### Scenario: Dropping non-existent field is silent
+- GIVEN `drop_fields = ["nonexistent"]`
+- WHEN a request body without `nonexistent` is processed
+- THEN the body is forwarded unchanged, no error raised
 
 ## Requirement: Global Settings
 

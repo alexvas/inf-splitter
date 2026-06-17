@@ -70,6 +70,7 @@ models = "default"
 | `max_tokens` | 可选；限制出站请求中的`max_tokens`。如果客户端未设置或超出——代理注入限制 |
 | `max_output_tokens` | 可选；限制`max_output_tokens`（透传，非标准字段；OpenAI兼容上游请用`max_completion_tokens`） |
 | `max_completion_tokens` | 可选；限制`max_completion_tokens`（OpenAI兼容上游） |
+| `drop_fields` | 可选；从发送上游的请求体中移除的顶级JSON键。形式：平面列表`["a","b"]`或`[section.drop_fields]`带`all = [...]`及`"model" = [...]` |
 
 可以通过`INF_SPLITTER_CONFIG`覆盖配置路径。
 

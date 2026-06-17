@@ -49,8 +49,9 @@ impl OpenAiHandler {
         route: &RouteTarget,
         openai_endpoint: &str,
     ) -> Result<Response, AppError> {
-        let body = strip_adaptive_thinking(body);
-        let mut req: MessageCreateRequest = serde_json::from_slice(&body).map_err(|err| {
+        let body_len = body.len();
+        let value = strip_adaptive_thinking(body);
+        let mut req: MessageCreateRequest = serde_json::from_value(value).map_err(|err| {
             self.diagnostics.record_stats(&StatsEvent {
                 section: route.section.clone(),
                 request_id: self.diagnostics.new_request_id(),
@@ -60,7 +61,7 @@ impl OpenAiHandler {
                 upstream: openai_endpoint.into(),
                 status: 400,
                 duration_ms: 0,
-                request_size_bytes: body.len(),
+                request_size_bytes: body_len,
                 response_size_bytes: None,
                 streaming: false,
                 input_messages: None,
@@ -102,7 +103,7 @@ impl OpenAiHandler {
             .map(String::from)
             .unwrap_or_else(|| "?".to_string());
         let messages_detail_ingress = crate::diagnostics::messages_detail_from_value(&value);
-        crate::apply_token_caps_to_value(&mut value, route);
+        crate::apply_egress_transforms(&mut value, &model, route);
         let messages_detail_egress = crate::diagnostics::messages_detail_from_value(&value);
         let body = serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?;
         let backend_url = format!("{endpoint}/v1/chat/completions");
@@ -267,6 +268,9 @@ impl OpenAiHandler {
         cap_openai_max_tokens(&mut openai_req, route);
         openai_req.stream_options = None;
 
+        let prepared =
+            crate::prepare_egress_body(&openai_req, &req.model, route, &self.diagnostics)?;
+
         let request_size = serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0);
         let messages_detail_ingress = if self.diagnostics.stats_enabled() {
             Some(crate::diagnostics::anthropic_messages_detail(req))
@@ -274,7 +278,7 @@ impl OpenAiHandler {
             None
         };
         let messages_detail_egress = if self.diagnostics.stats_enabled() {
-            Some(crate::diagnostics::openai_messages_detail(&openai_req))
+            crate::diagnostics::messages_detail_from_value(&prepared.value)
         } else {
             None
         };
@@ -283,11 +287,7 @@ impl OpenAiHandler {
         } else {
             None
         };
-        let egress_str = if self.diagnostics.dump_enabled() {
-            serde_json::to_string(&openai_req).ok()
-        } else {
-            None
-        };
+        let egress_str = prepared.egress_str;
 
         let backend_url = format!("{openai_endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
@@ -299,7 +299,7 @@ impl OpenAiHandler {
         );
 
         let start = std::time::Instant::now();
-        let upstream = builder.json(&openai_req).send().await?;
+        let upstream = builder.body(prepared.bytes).send().await?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
@@ -456,6 +456,9 @@ impl OpenAiHandler {
         openai_req.stream = Some(true);
         openai_req.stream_options = None;
 
+        let prepared =
+            crate::prepare_egress_body(&openai_req, &req.model, route, &self.diagnostics)?;
+
         let request_size = serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0);
         let messages_detail_ingress = if self.diagnostics.stats_enabled() {
             Some(crate::diagnostics::anthropic_messages_detail(req))
@@ -463,7 +466,7 @@ impl OpenAiHandler {
             None
         };
         let messages_detail_egress = if self.diagnostics.stats_enabled() {
-            Some(crate::diagnostics::openai_messages_detail(&openai_req))
+            crate::diagnostics::messages_detail_from_value(&prepared.value)
         } else {
             None
         };
@@ -472,11 +475,7 @@ impl OpenAiHandler {
         } else {
             None
         };
-        let egress_str = if self.diagnostics.dump_enabled() {
-            serde_json::to_string(&openai_req).ok()
-        } else {
-            None
-        };
+        let egress_str = prepared.egress_str;
 
         let backend_url = format!("{openai_endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
@@ -488,7 +487,7 @@ impl OpenAiHandler {
         );
 
         let start = std::time::Instant::now();
-        let upstream = builder.json(&openai_req).send().await?;
+        let upstream = builder.body(prepared.bytes).send().await?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
@@ -798,17 +797,17 @@ async fn relay_openai_upstream(
 /// Strip `thinking` field when it has type `adaptive` — not supported by
 /// anyllm_translate 0.9.x `ThinkingConfig` enum.  Since Anthropic→OpenAI
 /// translation doesn't propagate thinking blocks anyway, removal is safe.
-fn strip_adaptive_thinking(body: &[u8]) -> Vec<u8> {
+fn strip_adaptive_thinking(body: &[u8]) -> serde_json::Value {
     let mut value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(_) => return body.to_vec(),
+        Err(_) => return serde_json::Value::Null,
     };
     if let Some(thinking) = value.get("thinking") {
         if thinking.get("type").and_then(|t| t.as_str()) == Some("adaptive") {
             value.as_object_mut().and_then(|obj| obj.remove("thinking"));
         }
     }
-    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+    value
 }
 
 fn cap_anthropic_max_tokens(req: &mut MessageCreateRequest, limit: Option<u32>) {
@@ -836,17 +835,15 @@ mod tests {
     #[test]
     fn strip_adaptive_thinking_removes_field() {
         let body = br#"{"model":"x","max_tokens":1,"messages":[],"thinking":{"type":"adaptive"}}"#;
-        let cleaned = strip_adaptive_thinking(body);
-        let v: serde_json::Value = serde_json::from_slice(&cleaned).unwrap();
+        let v = strip_adaptive_thinking(body);
         assert!(v.get("thinking").is_none());
     }
 
     #[test]
     fn strip_adaptive_thinking_passes_through_other() {
         let body = br#"{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
-        let cleaned = strip_adaptive_thinking(body);
         let original: serde_json::Value = serde_json::from_slice(body).unwrap();
-        let cleaned: serde_json::Value = serde_json::from_slice(&cleaned).unwrap();
+        let cleaned = strip_adaptive_thinking(body);
         assert_eq!(cleaned, original);
     }
 

@@ -77,6 +77,58 @@ pub(crate) fn apply_token_caps_to_value(value: &mut Value, route: &RouteTarget) 
     }
 }
 
+/// Remove specified top-level keys from a JSON value. No-op on empty set
+/// or non-object values.
+pub(crate) fn drop_fields_from_value(value: &mut Value, fields: &HashSet<String>) {
+    if fields.is_empty() {
+        return;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        for field in fields {
+            obj.remove(field.as_str());
+        }
+    }
+}
+
+/// Apply token caps and drop_fields to a parsed request body (passthrough path).
+pub(crate) fn apply_egress_transforms(value: &mut Value, model: &str, route: &RouteTarget) {
+    apply_token_caps_to_value(value, route);
+    let drop_fields = route.drop_fields.for_model(model);
+    drop_fields_from_value(value, &drop_fields);
+}
+
+/// Result of `prepare_egress_body` — the serialized request body ready for
+/// sending, plus the Value for diagnostics.
+pub(crate) struct PreparedBody {
+    pub bytes: Vec<u8>,
+    pub value: Value,
+    pub egress_str: Option<String>,
+}
+
+/// Serialize a typed request, apply drop_fields, return bytes + diagnostics data.
+/// Used by conversion paths after translation.
+pub(crate) fn prepare_egress_body<T: serde::Serialize>(
+    req: &T,
+    model: &str,
+    route: &RouteTarget,
+    diagnostics: &Diagnostics,
+) -> Result<PreparedBody, AppError> {
+    let mut value = serde_json::to_value(req).map_err(|e| AppError::Internal(e.to_string()))?;
+    let drop_fields = route.drop_fields.for_model(model);
+    drop_fields_from_value(&mut value, &drop_fields);
+    let bytes = serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?;
+    let egress_str = if diagnostics.dump_enabled() {
+        String::from_utf8(bytes.clone()).ok()
+    } else {
+        None
+    };
+    Ok(PreparedBody {
+        bytes,
+        value,
+        egress_str,
+    })
+}
+
 /// Extract the `model` field from a JSON byte slice. Returns `"?"` on failure.
 #[allow(dead_code)]
 pub(crate) fn peek_model_from_json(body: &[u8]) -> String {
@@ -158,6 +210,7 @@ mod tests {
             max_output_tokens,
             max_completion_tokens,
             model_names: std::collections::HashSet::new(),
+            drop_fields: crate::config::DropFields::default(),
         }
     }
 
@@ -214,5 +267,31 @@ mod tests {
     #[test]
     fn peek_model_returns_question_on_garbage() {
         assert_eq!(peek_model_from_json(b"not json"), "?");
+    }
+
+    // --- drop_fields_from_value ---
+
+    #[test]
+    fn drop_fields_removes_specified_keys() {
+        let mut v: Value = serde_json::json!({"a": 1, "b": 2, "c": 3});
+        let fields: HashSet<String> = HashSet::from(["a".into(), "b".into()]);
+        drop_fields_from_value(&mut v, &fields);
+        assert_eq!(v, serde_json::json!({"c": 3}));
+    }
+
+    #[test]
+    fn drop_fields_empty_set_is_noop() {
+        let mut v: Value = serde_json::json!({"a": 1});
+        let fields: HashSet<String> = HashSet::new();
+        drop_fields_from_value(&mut v, &fields);
+        assert_eq!(v, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn drop_fields_nonexistent_key_is_noop() {
+        let mut v: Value = serde_json::json!({"a": 1});
+        let fields: HashSet<String> = HashSet::from(["nonexistent".into()]);
+        drop_fields_from_value(&mut v, &fields);
+        assert_eq!(v, serde_json::json!({"a": 1}));
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -27,6 +28,84 @@ impl std::fmt::Display for Protocol {
     }
 }
 
+/// Fields to drop from the request body before forwarding to upstream.
+///
+/// Deserialized from TOML as either a flat list `["a","b"]` or a per-model table
+/// `{ all = [...], "model-x" = [...] }` where `"all"` is a reserved base key.
+#[derive(Debug, Clone)]
+pub enum DropFields {
+    All(HashSet<String>),
+    PerModel {
+        all: HashSet<String>,
+        by_model: HashMap<String, HashSet<String>>,
+    },
+}
+
+impl Default for DropFields {
+    fn default() -> Self {
+        DropFields::All(HashSet::new())
+    }
+}
+
+impl DropFields {
+    /// Merge `all` + model-specific fields for the given model name.
+    pub fn for_model(&self, model: &str) -> HashSet<String> {
+        match self {
+            DropFields::All(fields) => fields.clone(),
+            DropFields::PerModel { all, by_model } => {
+                let mut merged = all.clone();
+                if let Some(extra) = by_model.get(model) {
+                    merged.extend(extra.iter().cloned());
+                }
+                merged
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            DropFields::All(fields) => fields.is_empty(),
+            DropFields::PerModel { all, by_model } => all.is_empty() && by_model.is_empty(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DropFieldsRaw {
+    Flat(Vec<String>),
+    PerModel(BTreeMap<String, Vec<String>>),
+}
+
+impl From<DropFieldsRaw> for DropFields {
+    fn from(raw: DropFieldsRaw) -> Self {
+        match raw {
+            DropFieldsRaw::Flat(list) => DropFields::All(list.into_iter().collect()),
+            DropFieldsRaw::PerModel(map) => {
+                let mut all = HashSet::new();
+                let mut by_model = HashMap::new();
+                for (key, fields) in map {
+                    if key == "all" {
+                        all = fields.into_iter().collect();
+                    } else {
+                        by_model.insert(key, fields.into_iter().collect());
+                    }
+                }
+                DropFields::PerModel { all, by_model }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DropFields {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        DropFieldsRaw::deserialize(deserializer).map(DropFields::from)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RouteTarget {
     pub section: String,
@@ -37,6 +116,7 @@ pub struct RouteTarget {
     pub max_output_tokens: Option<u32>,
     pub max_completion_tokens: Option<u32>,
     pub model_names: HashSet<String>,
+    pub drop_fields: DropFields,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +129,7 @@ struct ProviderSection {
     max_output_tokens: Option<u32>,
     max_completion_tokens: Option<u32>,
     model_names: HashSet<String>,
+    drop_fields: DropFields,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +202,8 @@ struct ProviderConfigRaw {
     max_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
     max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    drop_fields: DropFields,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +384,7 @@ impl Config {
                     max_output_tokens: raw_section.max_output_tokens,
                     max_completion_tokens: raw_section.max_completion_tokens,
                     model_names,
+                    drop_fields: raw_section.drop_fields,
                 },
             );
         }
@@ -347,6 +431,7 @@ impl Config {
                 .max_completion_tokens
                 .or(self.default_max_completion_tokens),
             model_names: section.model_names.clone(),
+            drop_fields: section.drop_fields.clone(),
         })
     }
 
@@ -853,5 +938,137 @@ max_tokens = 1024
         let mut body = serde_json::json!({"max_tokens": 1024});
         cap_numeric_field(&mut body, "max_tokens", 1024);
         assert_eq!(body["max_tokens"], 1024);
+    }
+
+    // --- drop_fields config parsing ---
+
+    #[test]
+    fn drop_fields_flat_list_parses() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+drop_fields = ["thinking", "stream_options"]
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        let route = config.resolve_route("test-model").expect("route");
+        match &route.drop_fields {
+            DropFields::All(fields) => {
+                assert!(fields.contains("thinking"));
+                assert!(fields.contains("stream_options"));
+                assert_eq!(fields.len(), 2);
+            }
+            other => panic!("expected All, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_fields_per_model_parses() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = ["model-a", "model-b"]
+
+[local.drop_fields]
+all = ["thinking"]
+"model-a" = ["context_management"]
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        let route = config.resolve_route("model-a").expect("route");
+        match &route.drop_fields {
+            DropFields::PerModel { all, by_model } => {
+                assert!(all.contains("thinking"));
+                assert_eq!(all.len(), 1);
+                let extra = by_model.get("model-a").expect("model-a entry");
+                assert!(extra.contains("context_management"));
+                assert_eq!(extra.len(), 1);
+            }
+            other => panic!("expected PerModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_fields_per_model_all_only() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+
+[local.drop_fields]
+all = ["thinking"]
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        let route = config.resolve_route("test-model").expect("route");
+        match &route.drop_fields {
+            DropFields::PerModel { all, by_model } => {
+                assert!(all.contains("thinking"));
+                assert!(by_model.is_empty());
+            }
+            other => panic!("expected PerModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_fields_absent_defaults_to_empty_all() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        let route = config.resolve_route("test-model").expect("route");
+        assert!(route.drop_fields.is_empty());
+    }
+
+    #[test]
+    fn drop_fields_empty_list_is_noop() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+drop_fields = []
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        let route = config.resolve_route("test-model").expect("route");
+        assert!(route.drop_fields.is_empty());
+    }
+
+    #[test]
+    fn drop_fields_for_model_flat() {
+        let fields = DropFields::All(HashSet::from(["a".into(), "b".into()]));
+        let result = fields.for_model("any-model");
+        assert_eq!(result, HashSet::from(["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn drop_fields_for_model_merges_all_and_specific() {
+        let fields = DropFields::PerModel {
+            all: HashSet::from(["all-field".into()]),
+            by_model: HashMap::from([("model-x".into(), HashSet::from(["specific-field".into()]))]),
+        };
+        let result = fields.for_model("model-x");
+        assert!(result.contains("all-field"));
+        assert!(result.contains("specific-field"));
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn drop_fields_for_model_all_only_no_match() {
+        let fields = DropFields::PerModel {
+            all: HashSet::from(["all-field".into()]),
+            by_model: HashMap::new(),
+        };
+        let result = fields.for_model("model-x");
+        assert_eq!(result, HashSet::from(["all-field".into()]));
     }
 }

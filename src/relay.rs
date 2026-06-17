@@ -155,6 +155,7 @@ mod tests {
             max_output_tokens: None,
             max_completion_tokens: None,
             model_names: HashSet::new(),
+            drop_fields: crate::config::DropFields::default(),
         }
     }
 

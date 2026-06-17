@@ -70,6 +70,7 @@ Global token limits for all providers. Individual providers can override these.
 | `max_tokens` | Optional; caps `max_tokens` in the outgoing request. If the client omits or exceeds it, the proxy injects the limit |
 | `max_output_tokens` | Optional; caps `max_output_tokens` (passthrough, non-standard; prefer `max_completion_tokens` for OpenAI-compatible upstreams) |
 | `max_completion_tokens` | Optional; caps `max_completion_tokens` (OpenAI-compatible upstreams) |
+| `drop_fields` | Optional; top-level JSON keys to remove from the request body before sending upstream. Forms: flat list `["a","b"]` or `[section.drop_fields]` with `all = [...]` and `"model" = [...]` |
 
 The config path can be overridden via `INF_SPLITTER_CONFIG`.
 

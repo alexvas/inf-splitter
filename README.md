@@ -70,6 +70,7 @@ models = "default"
 | `max_tokens` | Опционально; лимит на `max_tokens` в исходящем запросе. Если клиент не задал или превысил — прокси подставляет лимит |
 | `max_output_tokens` | Опционально; лимит на `max_output_tokens` (passthrough, нестандартное поле; для OpenAI-совместимых upstream используйте `max_completion_tokens`) |
 | `max_completion_tokens` | Опционально; лимит на `max_completion_tokens` (OpenAI-совместимые upstream) |
+| `drop_fields` | Опционально; список полей верхнего уровня, удаляемых из тела запроса перед отправкой в upstream. Формы: плоский список `["a","b"]` или `[section.drop_fields]` с `all = [...]` и `"модель" = [...]` |
 
 Путь к конфигу можно переопределить через `INF_SPLITTER_CONFIG`.
 

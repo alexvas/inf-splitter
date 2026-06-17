@@ -66,7 +66,7 @@ impl AnthropicHandler {
             .map(String::from)
             .unwrap_or_else(|| "?".to_string());
         let messages_detail_ingress = crate::diagnostics::messages_detail_from_value(&value);
-        crate::apply_token_caps_to_value(&mut value, route);
+        crate::apply_egress_transforms(&mut value, &model, route);
         let messages_detail_egress = crate::diagnostics::messages_detail_from_value(&value);
         let body =
             Bytes::from(serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?);
@@ -246,15 +246,20 @@ impl AnthropicHandler {
         let anthropic_req = translate_openai_to_anthropic_request(&openai_req, &mut warnings)
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
 
+        let prepared = crate::prepare_egress_body(
+            &anthropic_req,
+            &openai_req.model,
+            route,
+            &self.diagnostics,
+        )?;
+
         let messages_detail_ingress = if self.diagnostics.stats_enabled() {
             Some(crate::diagnostics::openai_messages_detail(&openai_req))
         } else {
             None
         };
         let messages_detail_egress = if self.diagnostics.stats_enabled() {
-            Some(crate::diagnostics::anthropic_messages_detail(
-                &anthropic_req,
-            ))
+            crate::diagnostics::messages_detail_from_value(&prepared.value)
         } else {
             None
         };
@@ -263,15 +268,11 @@ impl AnthropicHandler {
         } else {
             None
         };
-        let egress_str = if self.diagnostics.dump_enabled() {
-            serde_json::to_string(&anthropic_req).ok()
-        } else {
-            None
-        };
+        let egress_str = prepared.egress_str;
 
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let start = std::time::Instant::now();
-        let upstream = builder.json(&anthropic_req).send().await?;
+        let upstream = builder.body(prepared.bytes).send().await?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
@@ -420,15 +421,20 @@ impl AnthropicHandler {
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
         anthropic_req.stream = Some(true);
 
+        let prepared = crate::prepare_egress_body(
+            &anthropic_req,
+            &openai_req.model,
+            route,
+            &self.diagnostics,
+        )?;
+
         let messages_detail_ingress = if self.diagnostics.stats_enabled() {
             Some(crate::diagnostics::openai_messages_detail(openai_req))
         } else {
             None
         };
         let messages_detail_egress = if self.diagnostics.stats_enabled() {
-            Some(crate::diagnostics::anthropic_messages_detail(
-                &anthropic_req,
-            ))
+            crate::diagnostics::messages_detail_from_value(&prepared.value)
         } else {
             None
         };
@@ -437,15 +443,11 @@ impl AnthropicHandler {
         } else {
             None
         };
-        let egress_str = if self.diagnostics.dump_enabled() {
-            serde_json::to_string(&anthropic_req).ok()
-        } else {
-            None
-        };
+        let egress_str = prepared.egress_str;
 
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let start = std::time::Instant::now();
-        let upstream = builder.json(&anthropic_req).send().await?;
+        let upstream = builder.body(prepared.bytes).send().await?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {

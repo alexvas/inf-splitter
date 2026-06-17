@@ -19,6 +19,16 @@ max_tokens = 10_000
 max_output_tokens = 10_000
 max_completion_tokens = 10_000
 
+# Опционально: удаление полей из исходящего запроса (напр., для совместимости).
+# Две формы:
+# 1. Плоский список — одни и те же поля для всех моделей секции:
+# drop_fields = ["thinking", "stream_options"]
+#
+# 2. Набор по моделям — "all" задаёт базовый список, конкретные модели дополняют:
+# [etc.drop_fields]
+# all = ["thinking"]
+# "some-model" = ["context_management"]
+
 [diagnostics]
 
 # Опция раз:

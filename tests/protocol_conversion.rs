@@ -2168,3 +2168,402 @@ fn uuid_suffix() -> String {
         .unwrap_or(0);
     format!("{ts}")
 }
+
+// ── drop_fields integration tests ────────────────────────────────────
+
+#[tokio::test]
+async fn drop_fields_openai_passthrough() {
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_upstream(
+        "/v1/chat/completions",
+        captured.clone(),
+        openai_upstream_response("drop-model", "ok"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream}"
+models = "drop-model"
+drop_fields = ["user", "metadata"]
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "drop-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "should-be-removed",
+            "metadata": { "key": "val" }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("upstream captured body");
+    assert!(body.get("user").is_none(), "user field should be dropped");
+    assert!(
+        body.get("metadata").is_none(),
+        "metadata field should be dropped"
+    );
+    assert!(body.get("messages").is_some(), "messages should remain");
+}
+
+#[tokio::test]
+async fn drop_fields_anthropic_passthrough() {
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_upstream(
+        "/v1/messages",
+        captured.clone(),
+        anthropic_upstream_response("drop-model", "ok"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_anthropic = "http://{upstream}"
+models = "drop-model"
+drop_fields = ["metadata"]
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let resp = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "drop-model",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": { "user_id": "abc" }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("upstream captured body");
+    assert!(
+        body.get("metadata").is_none(),
+        "metadata field should be dropped"
+    );
+    assert!(body.get("messages").is_some(), "messages should remain");
+}
+
+#[tokio::test]
+async fn drop_fields_anthropic_to_openai_conversion() {
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_upstream(
+        "/v1/chat/completions",
+        captured.clone(),
+        openai_upstream_response("conv-model", "translated"),
+    )
+    .await;
+
+    // Only endpoint_openai → Anthropic ingress forces translation.
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_openai = "http://{upstream}"
+models = "conv-model"
+drop_fields = ["metadata"]
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let resp = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "conv-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "translate me"}],
+            "metadata": { "user_id": "123" }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("upstream captured body");
+    // After translation Anthropic→OpenAI, "metadata" should be dropped from the
+    // OpenAI-format body.
+    assert!(
+        body.get("metadata").is_none(),
+        "metadata should be dropped from translated body: {body:?}"
+    );
+    assert!(body.get("messages").is_some(), "messages should remain");
+}
+
+#[tokio::test]
+async fn drop_fields_openai_to_anthropic_conversion() {
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_upstream(
+        "/v1/messages",
+        captured.clone(),
+        anthropic_upstream_response("conv-model", "translated"),
+    )
+    .await;
+
+    // Only endpoint_anthropic → OpenAI ingress forces translation.
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream}"
+models = "conv-model"
+drop_fields = ["user"]
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "conv-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "user": "should-be-dropped"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("upstream captured body");
+    // After translation OpenAI→Anthropic, "user" should be dropped.
+    assert!(
+        body.get("user").is_none(),
+        "user should be dropped from translated body: {body:?}"
+    );
+    assert!(body.get("messages").is_some(), "messages should remain");
+}
+
+#[tokio::test]
+async fn drop_fields_per_model_all_and_specific() {
+    // model-a: all + specific → both dropped
+    // model-b: only all → only all dropped
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_upstream(
+        "/v1/chat/completions",
+        captured.clone(),
+        openai_upstream_response("model-a", "ok"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream}"
+models = ["model-a", "model-b"]
+
+[local.drop_fields]
+all = ["stream"]
+"model-a" = ["user"]
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    // Request for model-a: should drop both "stream" and "user"
+    let resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "user": "drop-me"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = captured.lock().unwrap().take().expect("model-a body");
+    assert!(
+        body.get("stream").is_none(),
+        "stream should be dropped (from all)"
+    );
+    assert!(
+        body.get("user").is_none(),
+        "user should be dropped (from model-a specific)"
+    );
+
+    // Request for model-b: should drop only "stream" (from all)
+    let captured_b = Arc::new(Mutex::new(None));
+    let upstream_b = spawn_upstream(
+        "/v1/chat/completions",
+        captured_b.clone(),
+        openai_upstream_response("model-b", "ok"),
+    )
+    .await;
+    let config_b = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream_b}"
+models = ["model-a", "model-b"]
+
+[local.drop_fields]
+all = ["stream"]
+"model-a" = ["user"]
+"#
+    );
+    let proxy_b = spawn_router(&config_b).await;
+    let resp = post_openai(
+        &proxy_b,
+        serde_json::json!({
+            "model": "model-b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "user": "keep-me"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = captured_b.lock().unwrap().take().expect("model-b body");
+    assert!(
+        body.get("stream").is_none(),
+        "stream should be dropped (from all)"
+    );
+    assert!(
+        body.get("user").is_some(),
+        "user should NOT be dropped for model-b"
+    );
+}
+
+#[tokio::test]
+async fn drop_fields_noop_when_absent() {
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_upstream(
+        "/v1/chat/completions",
+        captured.clone(),
+        openai_upstream_response("noop-model", "ok"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream}"
+models = "noop-model"
+# no drop_fields key
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "noop-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "keep-me"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = captured.lock().unwrap().take().expect("upstream body");
+    assert!(
+        body.get("user").is_some(),
+        "user should be present when drop_fields absent"
+    );
+}
+
+#[tokio::test]
+async fn drop_fields_noop_when_empty_list() {
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_upstream(
+        "/v1/chat/completions",
+        captured.clone(),
+        openai_upstream_response("noop-model", "ok"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream}"
+models = "noop-model"
+drop_fields = []
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "noop-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "keep-me"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = captured.lock().unwrap().take().expect("upstream body");
+    assert!(
+        body.get("user").is_some(),
+        "user should be present when drop_fields is empty list"
+    );
+}
+
+#[tokio::test]
+async fn drop_fields_nonexistent_field_is_noop() {
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_upstream(
+        "/v1/chat/completions",
+        captured.clone(),
+        openai_upstream_response("noop-model", "ok"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream}"
+models = "noop-model"
+drop_fields = ["nonexistent"]
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let resp = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "noop-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // Just checking the proxy doesn't error on nonexistent field
+    let body = captured.lock().unwrap().take().expect("upstream body");
+    assert!(body.get("messages").is_some(), "messages should remain");
+}

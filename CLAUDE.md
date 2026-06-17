@@ -47,7 +47,7 @@ Client → POST /v1/chat/completions  or  /v1/messages
 
 ### Config model (TOML)
 
-Top-level: `listen_host`, `listen_port`, `upstream_timeout`, `max_request_body`, `body_too_large_hint_statuses` (default `[413]`), optional `[defaults]`.
+Top-level: `listen_host`, `listen_port`, `upstream_timeout`, `max_request_body`, optional `[[error_translation]]` (array of tables: `status`, optional `ingress`, `egress`), optional `[defaults]`.
 
 Each provider section has:
 - `endpoint_openai` / `endpoint_anthropic` — at least one required; determines routing direction

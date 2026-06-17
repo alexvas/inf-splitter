@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyllm_translate::anthropic::{MessageResponse, StreamEvent};
@@ -28,22 +27,18 @@ use crate::sse;
 pub struct AnthropicHandler {
     client: Client,
     diagnostics: Diagnostics,
-    hint_statuses: Arc<HashSet<StatusCode>>,
+    error_translation: Arc<[crate::config::ErrorTranslationRule]>,
 }
 
 impl AnthropicHandler {
-    pub fn new(
-        config: &crate::config::Config,
-        diagnostics: Diagnostics,
-        hint_statuses: Arc<HashSet<StatusCode>>,
-    ) -> Result<Self, AppError> {
+    pub fn new(config: &crate::config::Config, diagnostics: Diagnostics) -> Result<Self, AppError> {
         Ok(Self {
             client: Client::builder()
                 .timeout(config.upstream_timeout)
                 .build()
                 .map_err(|err| AppError::Internal(err.to_string()))?,
             diagnostics,
-            hint_statuses,
+            error_translation: config.error_translation.clone().into(),
         })
     }
 
@@ -131,6 +126,8 @@ impl AnthropicHandler {
             );
             let sc = axum::http::StatusCode::from_u16(status.as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let error_body =
+                crate::apply_error_translation(sc, error_body, &self.error_translation);
             let mut response = axum::response::Response::builder()
                 .status(sc)
                 .header(axum::http::header::CONTENT_TYPE, "application/json");
@@ -339,7 +336,7 @@ impl AnthropicHandler {
                     true,
                 );
             }
-            return relay_error_body(status, error_body, &self.hint_statuses);
+            return relay_error_body(status, error_body, &self.error_translation);
         }
 
         let anthropic_resp: MessageResponse = upstream.json().await?;
@@ -514,7 +511,7 @@ impl AnthropicHandler {
                     true,
                 );
             }
-            return relay_error_body(status, error_body, &self.hint_statuses);
+            return relay_error_body(status, error_body, &self.error_translation);
         }
 
         let model = openai_req.model.clone();
@@ -689,10 +686,10 @@ impl AnthropicHandler {
 fn relay_error_body(
     status: reqwest::StatusCode,
     body: String,
-    hint_statuses: &HashSet<StatusCode>,
+    error_translation: &[crate::config::ErrorTranslationRule],
 ) -> Result<Response, AppError> {
     let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = crate::append_size_hint(status_code, body, hint_statuses);
+    let body = crate::apply_error_translation(status_code, body, error_translation);
     Response::builder()
         .status(status_code)
         .header(header::CONTENT_TYPE, "application/json")

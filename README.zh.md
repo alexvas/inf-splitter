@@ -47,7 +47,7 @@ models = "default"
 | `listen_port` | TCP端口（默认3000） |
 | `upstream_timeout` | 出站上游请求超时；后缀`s`（秒）或`m`（分钟），例如`15s`、`1m`（默认`5m`） |
 | `max_request_body` | 最大传入请求体大小；后缀`k`（KiB）或`m`（MiB），例如`512k`、`2m`（默认`2m`） |
-| `body_too_large_hint_statuses` | 可选的HTTP状态码列表（整数），当出现这些状态码时在错误中附加`Try reducing context size...`提示（默认`[413]`，空列表=不附加提示） |
+| `[[error_translation]]` | 可选的表格数组，用于替换上游错误响应体。每个表格包含：`status`（HTTP状态码）、`ingress`（可选，用于在响应体中匹配的子字符串）、`egress`（替换文本）。规则按顺序检查，首次匹配生效。如果该段缺失或为空——错误响应体保持不变 |
 
 ### `[defaults]` 段
 

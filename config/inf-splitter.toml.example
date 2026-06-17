@@ -1,6 +1,17 @@
 upstream_timeout = "3m"
 max_request_body = "2m"
 
+# Опционально: замена тел ошибочных ответов от upstream.
+# Правила проверяются по порядку, срабатывает первое совпадение.
+# ingress — опциональная подстрока для поиска в теле ответа (если не указана — замена по статусу).
+#[[error_translation]]
+#status = 413
+#ingress = "some vague message substring"
+#egress = "body too large"
+#[[error_translation]]
+#status = 502
+#egress = "BODY TOO LARGE"
+
 [llama-local]
 endpoint_anthropic = "http://127.0.0.1:11345"
 models = "local-model"

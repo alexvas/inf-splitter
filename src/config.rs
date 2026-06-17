@@ -4,14 +4,12 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::StatusCode;
-
-use crate::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -132,12 +130,21 @@ struct ProviderSection {
     drop_fields: DropFields,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorTranslationRule {
+    pub status: u16,
+    #[serde(default)]
+    pub ingress: Option<String>,
+    pub egress: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub upstream_timeout: Duration,
     pub max_request_body: usize,
-    pub body_too_large_hint_statuses: Arc<HashSet<StatusCode>>,
+    pub error_translation: Vec<ErrorTranslationRule>,
     pub diagnostics: DiagnosticsConfig,
     default_max_tokens: Option<u32>,
     default_max_output_tokens: Option<u32>,
@@ -145,10 +152,6 @@ pub struct Config {
     sections: HashMap<String, ProviderSection>,
     model_routes: HashMap<String, String>,
     default_section: Option<String>,
-}
-
-fn default_body_too_large_hint_statuses() -> HashSet<StatusCode> {
-    HashSet::from([StatusCode::PAYLOAD_TOO_LARGE])
 }
 
 const DEFAULT_UPSTREAM_TIMEOUT: &str = "5m";
@@ -180,7 +183,8 @@ struct FileConfig {
     upstream_timeout: Option<String>,
     max_request_body: Option<String>,
     defaults: Option<DefaultConfig>,
-    body_too_large_hint_statuses: Option<Vec<u16>>,
+    #[serde(default)]
+    error_translation: Vec<ErrorTranslationRule>,
     diagnostics: Option<DiagnosticsConfigRaw>,
     #[serde(flatten)]
     providers: HashMap<String, ProviderConfigRaw>,
@@ -319,14 +323,6 @@ impl Config {
             max_completion_tokens: None,
         });
 
-        let body_too_large_hint_statuses = Arc::new(match file.body_too_large_hint_statuses {
-            Some(codes) if !codes.is_empty() => codes
-                .into_iter()
-                .map(|c| StatusCode::from_u16(c).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE))
-                .collect(),
-            _ => default_body_too_large_hint_statuses(),
-        });
-
         let mut sections = HashMap::new();
         let mut model_routes = HashMap::new();
         let mut default_section: Option<String> = None;
@@ -412,7 +408,7 @@ impl Config {
             diagnostics,
             upstream_timeout,
             max_request_body,
-            body_too_large_hint_statuses,
+            error_translation: file.error_translation,
             default_max_tokens: defaults.max_tokens,
             default_max_output_tokens: defaults.max_output_tokens,
             default_max_completion_tokens: defaults.max_completion_tokens,
@@ -486,7 +482,7 @@ impl Config {
             upstream_timeout: parse_duration(DEFAULT_UPSTREAM_TIMEOUT).expect("default timeout"),
             max_request_body: parse_byte_size(DEFAULT_MAX_REQUEST_BODY)
                 .expect("default body limit"),
-            body_too_large_hint_statuses: Arc::new(default_body_too_large_hint_statuses()),
+            error_translation: Vec::new(),
             default_max_tokens: None,
             default_max_output_tokens: None,
             default_max_completion_tokens: None,
@@ -1178,5 +1174,136 @@ models = "test-model"
         let err = Config::load_from_str(raw).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("endpoint_openai"), "got: {msg}");
+    }
+
+    // --- error_translation config parsing ---
+
+    #[test]
+    fn error_translation_status_only_parses() {
+        let raw = r#"
+listen_port =3000
+
+[[error_translation]]
+status = 502
+egress = "BODY TOO LARGE"
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert_eq!(config.error_translation.len(), 1);
+        assert_eq!(config.error_translation[0].status, 502);
+        assert!(config.error_translation[0].ingress.is_none());
+        assert_eq!(config.error_translation[0].egress, "BODY TOO LARGE");
+    }
+
+    #[test]
+    fn error_translation_status_with_ingress_parses() {
+        let raw = r#"
+listen_port =3000
+
+[[error_translation]]
+status = 413
+ingress = "vague message"
+egress = "body too large"
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert_eq!(config.error_translation.len(), 1);
+        assert_eq!(config.error_translation[0].status, 413);
+        assert_eq!(
+            config.error_translation[0].ingress.as_deref(),
+            Some("vague message")
+        );
+        assert_eq!(config.error_translation[0].egress, "body too large");
+    }
+
+    #[test]
+    fn error_translation_multiple_rules_parses_in_order() {
+        let raw = r#"
+listen_port =3000
+
+[[error_translation]]
+status = 413
+ingress = "vague"
+egress = "first"
+
+[[error_translation]]
+status = 502
+egress = "second"
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert_eq!(config.error_translation.len(), 2);
+        assert_eq!(config.error_translation[0].egress, "first");
+        assert_eq!(config.error_translation[1].egress, "second");
+    }
+
+    #[test]
+    fn error_translation_absent_is_empty() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert!(config.error_translation.is_empty());
+    }
+
+    #[test]
+    fn error_translation_empty_list_is_noop() {
+        let raw = r#"
+listen_port =3000
+error_translation = []
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert!(config.error_translation.is_empty());
+    }
+
+    #[test]
+    fn rejects_error_translation_missing_status() {
+        let raw = r#"
+listen_port =3000
+
+[[error_translation]]
+egress = "no status field"
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let err = Config::load_from_str(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("status"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_error_translation_missing_egress() {
+        let raw = r#"
+listen_port =3000
+
+[[error_translation]]
+status = 502
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let err = Config::load_from_str(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("egress"), "got: {msg}");
     }
 }

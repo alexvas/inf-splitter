@@ -21,31 +21,35 @@ use tokio::sync::Mutex;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::anthropic::AnthropicHandler;
-use crate::config::{cap_numeric_field, Config, RouteTarget};
+use crate::config::{cap_numeric_field, Config, ErrorTranslationRule, RouteTarget};
 use crate::diagnostics::Diagnostics;
 use crate::error::AppError;
 use crate::openai::OpenAiHandler;
 use crate::router::{router, AppState};
 
-const BODY_TOO_LARGE_HINT: &str = "Try reducing context size or splitting into smaller requests.";
-
-/// Append a size hint to an error body when the status code indicates the
-/// request was too large.
-pub(crate) fn append_size_hint(
+/// Apply error translation rules to an upstream error body.
+/// Rules are evaluated in order; first match wins.
+/// If no rule matches, the original body is returned unchanged.
+pub(crate) fn apply_error_translation(
     status: StatusCode,
     body: String,
-    hint_statuses: &HashSet<StatusCode>,
+    rules: &[ErrorTranslationRule],
 ) -> String {
-    if !hint_statuses.contains(&status) {
-        return body;
-    }
-    if let Ok(mut value) = serde_json::from_str::<Value>(&body) {
-        if let Some(Value::String(msg)) = value.pointer_mut("/error/message") {
-            *msg = format!("{msg}. Try reducing context size or splitting into smaller requests.");
-            return serde_json::to_string(&value).unwrap_or(body);
+    let status_u16 = status.as_u16();
+    for rule in rules {
+        if rule.status != status_u16 {
+            continue;
+        }
+        match &rule.ingress {
+            Some(substring) if !substring.is_empty() => {
+                if body.contains(substring.as_str()) {
+                    return rule.egress.clone();
+                }
+            }
+            _ => return rule.egress.clone(),
         }
     }
-    format!("{body}. Try reducing context size or splitting into smaller requests.")
+    body
 }
 
 /// Apply token limits from the route config to a raw JSON body (passthrough path).
@@ -139,12 +143,10 @@ pub(crate) fn peek_model_from_json(body: &[u8]) -> String {
 }
 
 pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Router, AppError> {
-    let hint_statuses = config.body_too_large_hint_statuses.clone();
     let config = Arc::new(config);
     let max_request_body = config.max_request_body;
-    let openai = OpenAiHandler::new(config.as_ref(), diagnostics.clone(), hint_statuses.clone())?;
-    let anthropic =
-        AnthropicHandler::new(config.as_ref(), diagnostics.clone(), hint_statuses.clone())?;
+    let openai = OpenAiHandler::new(config.as_ref(), diagnostics.clone())?;
+    let anthropic = AnthropicHandler::new(config.as_ref(), diagnostics.clone())?;
 
     let health_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -163,30 +165,26 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
     Ok(router(state)
         .layer(RequestBodyLimitLayer::new(max_request_body))
         .layer(axum::middleware::map_response(
-            move |response: Response| {
-                let hs = hint_statuses.clone();
-                async move {
-                    let status = response.status();
-                    if hs.contains(&status) {
-                        let is_upstream_relay = response
-                            .headers()
-                            .get(header::CONTENT_TYPE)
-                            .and_then(|v| v.to_str().ok())
-                            .map(|v| v.starts_with("application/json"))
-                            .unwrap_or(false);
-                        if !is_upstream_relay {
-                            let body = serde_json::json!({
-                                "type": "error",
-                                "error": {
-                                    "type": "invalid_request_error",
-                                    "message": format!("Request body exceeds limit. {BODY_TOO_LARGE_HINT}")
-                                }
-                            });
-                            return (status, Json(body)).into_response();
-                        }
+            move |response: Response| async move {
+                if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    let is_upstream_relay = response
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.starts_with("application/json"))
+                        .unwrap_or(false);
+                    if !is_upstream_relay {
+                        let body = serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": "Request body exceeds limit."
+                            }
+                        });
+                        return (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response();
                     }
-                    response
                 }
+                response
             },
         )))
 }
@@ -293,5 +291,127 @@ mod tests {
         let fields: HashSet<String> = HashSet::from(["nonexistent".into()]);
         drop_fields_from_value(&mut v, &fields);
         assert_eq!(v, serde_json::json!({"a": 1}));
+    }
+
+    // --- apply_error_translation ---
+
+    use crate::config::ErrorTranslationRule;
+
+    #[test]
+    fn error_translation_status_match_replaces_body() {
+        let rules = vec![ErrorTranslationRule {
+            status: 502,
+            ingress: None,
+            egress: "BODY TOO LARGE".into(),
+        }];
+        let result = apply_error_translation(
+            StatusCode::BAD_GATEWAY,
+            "upstream error text".into(),
+            &rules,
+        );
+        assert_eq!(result, "BODY TOO LARGE");
+    }
+
+    #[test]
+    fn error_translation_status_with_substring_replaces_body() {
+        let rules = vec![ErrorTranslationRule {
+            status: 413,
+            ingress: Some("vague message".into()),
+            egress: "body too large".into(),
+        }];
+        let result = apply_error_translation(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "some vague message from upstream".into(),
+            &rules,
+        );
+        assert_eq!(result, "body too large");
+    }
+
+    #[test]
+    fn error_translation_substring_mismatch_passes_through() {
+        let rules = vec![ErrorTranslationRule {
+            status: 413,
+            ingress: Some("vague".into()),
+            egress: "translated".into(),
+        }];
+        let result = apply_error_translation(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "different error".into(),
+            &rules,
+        );
+        assert_eq!(result, "different error");
+    }
+
+    #[test]
+    fn error_translation_status_mismatch_passes_through() {
+        let rules = vec![ErrorTranslationRule {
+            status: 502,
+            ingress: None,
+            egress: "translated".into(),
+        }];
+        let result = apply_error_translation(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server error".into(),
+            &rules,
+        );
+        assert_eq!(result, "server error");
+    }
+
+    #[test]
+    fn error_translation_first_match_wins() {
+        let rules = vec![
+            ErrorTranslationRule {
+                status: 502,
+                ingress: Some("specific".into()),
+                egress: "first".into(),
+            },
+            ErrorTranslationRule {
+                status: 502,
+                ingress: None,
+                egress: "second".into(),
+            },
+        ];
+        let result =
+            apply_error_translation(StatusCode::BAD_GATEWAY, "specific error".into(), &rules);
+        assert_eq!(result, "first");
+    }
+
+    #[test]
+    fn error_translation_second_rule_when_first_no_match() {
+        let rules = vec![
+            ErrorTranslationRule {
+                status: 502,
+                ingress: Some("specific".into()),
+                egress: "first".into(),
+            },
+            ErrorTranslationRule {
+                status: 502,
+                ingress: None,
+                egress: "second".into(),
+            },
+        ];
+        let result =
+            apply_error_translation(StatusCode::BAD_GATEWAY, "generic error".into(), &rules);
+        assert_eq!(result, "second");
+    }
+
+    #[test]
+    fn error_translation_empty_rules_returns_body_unchanged() {
+        let rules: Vec<ErrorTranslationRule> = vec![];
+        let result =
+            apply_error_translation(StatusCode::BAD_GATEWAY, "upstream error".into(), &rules);
+        assert_eq!(result, "upstream error");
+    }
+
+    #[test]
+    fn error_translation_empty_ingress_matches_any_body() {
+        let rules = vec![ErrorTranslationRule {
+            status: 413,
+            ingress: Some("".into()),
+            egress: "translated".into(),
+        }];
+        let result =
+            apply_error_translation(StatusCode::PAYLOAD_TOO_LARGE, "any error".into(), &rules);
+        assert_eq!(result, "translated");
     }
 }

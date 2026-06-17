@@ -161,12 +161,49 @@ all = ["thinking"]
 Top-level config keys:
 - `upstream_timeout` — HTTP timeout for upstream calls, suffix `s`/`m` (default `5m`)
 - `max_request_body` — max incoming body size, suffix `k`/`m` (default `2m`)
-- `body_too_large_hint_statuses` — list of HTTP status codes that trigger a "try reducing context" hint on 413 errors (default `[413]`)
+- `[[error_translation]]` — optional array of tables for upstream error body translation (see below)
 
 ### Scenario: Custom timeout
 - GIVEN `upstream_timeout = "30s"`
 - WHEN an upstream call is made
 - THEN the HTTP client times out after 30 seconds
+
+## Requirement: Error Translation Rules
+
+The optional `[[error_translation]]` array in the top-level TOML config defines rules for translating upstream error response bodies before returning them to the client. Each rule has:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `status` | Yes | HTTP status code (u16) to match |
+| `ingress` | No | Substring to match in the upstream error body; absent/empty = match any body |
+| `egress` | Yes | Replacement body string (replaces the entire upstream body) |
+
+Rules are evaluated in definition order; first match wins. If no rule matches, the upstream body passes through unchanged. An empty or absent `error_translation` disables translation entirely.
+
+### Scenario: Status+substring match
+- GIVEN `status = 413`, `ingress = "vague"`, `egress = "translated"`
+- WHEN upstream returns 413 with body `"a vague error"`
+- THEN the body is replaced with `"translated"`
+
+### Scenario: Status-only match
+- GIVEN `status = 502`, no `ingress`, `egress = "replaced"`
+- WHEN upstream returns 502 with body `"any error text"`
+- THEN the body is replaced with `"replaced"`
+
+### Scenario: No match — pass-through
+- GIVEN a rule matches status 413 only
+- WHEN upstream returns 500 with body `"server error"`
+- THEN the body passes through unchanged
+
+### Scenario: First-match ordering
+- GIVEN two rules for the same status 413
+- WHEN upstream returns 413
+- THEN the first matching rule's `egress` is used
+
+### Scenario: Empty rules — no translation
+- GIVEN no `[[error_translation]]` entries in config
+- WHEN any upstream error occurs
+- THEN all bodies pass through unchanged
 
 ## Requirement: Model Name Validation
 

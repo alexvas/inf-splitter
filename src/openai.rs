@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyllm_translate::anthropic::MessageCreateRequest;
@@ -12,7 +11,7 @@ use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
 use crate::auth::forward_request_headers;
-use crate::config::{Config, RouteTarget};
+use crate::config::{Config, ErrorTranslationRule, RouteTarget};
 use crate::diagnostics::{Diagnostics, DumpBody, StatsEvent};
 use crate::error::AppError;
 use crate::relay::cap_openai_max_tokens;
@@ -23,22 +22,18 @@ use crate::sse;
 pub struct OpenAiHandler {
     http: HttpClient,
     diagnostics: Diagnostics,
-    hint_statuses: Arc<HashSet<StatusCode>>,
+    error_translation: Arc<[ErrorTranslationRule]>,
 }
 
 impl OpenAiHandler {
-    pub fn new(
-        config: &Config,
-        diagnostics: Diagnostics,
-        hint_statuses: Arc<HashSet<StatusCode>>,
-    ) -> Result<Self, AppError> {
+    pub fn new(config: &Config, diagnostics: Diagnostics) -> Result<Self, AppError> {
         Ok(Self {
             http: HttpClient::builder()
                 .timeout(config.upstream_timeout)
                 .build()
                 .map_err(|err| AppError::Internal(err.to_string()))?,
             diagnostics,
-            hint_statuses,
+            error_translation: config.error_translation.clone().into(),
         })
     }
 
@@ -180,6 +175,8 @@ impl OpenAiHandler {
                 );
             }
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let error_body =
+                crate::apply_error_translation(sc, error_body, &self.error_translation);
             let mut response = Response::builder()
                 .status(sc)
                 .header(header::CONTENT_TYPE, "application/json");
@@ -369,7 +366,7 @@ impl OpenAiHandler {
                 );
             }
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let body = crate::append_size_hint(sc, error_body, &self.hint_statuses);
+            let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
             return Response::builder()
                 .status(sc)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -555,7 +552,7 @@ impl OpenAiHandler {
                 );
             }
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let body = crate::append_size_hint(sc, error_body, &self.hint_statuses);
+            let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
             return Response::builder()
                 .status(sc)
                 .header(header::CONTENT_TYPE, "application/json")

@@ -47,7 +47,7 @@ models = "default"
 | `listen_port` | TCP port (default 3000) |
 | `upstream_timeout` | Timeout for outgoing upstream requests; suffixes `s` (seconds) or `m` (minutes), e.g. `15s`, `1m` (default `5m`) |
 | `max_request_body` | Max incoming request body size; suffixes `k` (KiB) or `m` (MiB), e.g. `512k`, `2m` (default `2m`) |
-| `body_too_large_hint_statuses` | Optional list of HTTP status codes (integers) for which a `Try reducing context size...` hint is appended to the error (default `[413]`, empty list = no hint) |
+| `[[error_translation]]` | Optional array of tables for replacing upstream error response bodies. Each table: `status` (HTTP status code), `ingress` (optional substring to match in the body), `egress` (replacement text). Rules are checked in order, first match wins. If the section is absent or empty — error bodies pass through unchanged |
 
 ### `[defaults]` section
 

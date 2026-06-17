@@ -80,12 +80,35 @@ On receiving a POST body, the router:
 
 ## Requirement: Body Size Limit
 
-The proxy enforces `max_request_body` via `tower-http::limit::RequestBodyLimitLayer`. On 413 errors, if the response status code matches any entry in `body_too_large_hint_statuses`, an error JSON with a hint about reducing context size is returned.
+The proxy enforces `max_request_body` via `tower-http::limit::RequestBodyLimitLayer`. On 413 errors, a JSON error is returned: `{"type":"error","error":{"type":"invalid_request_error","message":"Request body exceeds limit."}}`.
 
 ### Scenario: Body exceeds limit
 - GIVEN `max_request_body = "1m"`
 - WHEN a request body exceeds 1 MiB
-- THEN the proxy returns 413 with a JSON error and optional context-size hint
+- THEN the proxy returns 413 with a JSON error
+
+## Requirement: Upstream Error Body Translation
+
+When an upstream returns a non-success HTTP status with a non-streaming response, the error body is checked against the configured `[[error_translation]]` rules. On match, the body is replaced with the rule's `egress` string. On no match, the body passes through unchanged.
+
+The `apply_error_translation(status, body, rules) -> String` function in `lib.rs` implements the matching logic — iterating rules in order, returning the translated body on first match, or the original body if no rule matches.
+
+Translation applies to all four routing directions (openai→openai, openai→anthropic, anthropic→anthropic, anthropic→openai) and both streaming and non-streaming error paths.
+
+### Scenario: Upstream 413 error translated
+- GIVEN `[[error_translation]]` has `{status = 413, egress = "body too large"}`
+- WHEN upstream returns 413 with any body
+- THEN the client receives 413 with body `"body too large"`
+
+### Scenario: Upstream error passes through
+- GIVEN no matching translation rule for status 500
+- WHEN upstream returns 500 with body `"internal error"`
+- THEN the client receives 500 with body `"internal error"`
+
+### Scenario: Substring match required
+- GIVEN `{status = 413, ingress = "vague", egress = "translated"}`
+- WHEN upstream returns 413 with body `"some other error"`
+- THEN body passes through unchanged (substring does not match)
 
 ## Requirement: Auth Header Forwarding
 
@@ -109,20 +132,6 @@ All error responses follow the Anthropic API error shape: `{"type":"error","erro
 - GIVEN an upstream returns an error response
 - WHEN the proxy relays it to the client
 - THEN it uses the Anthropic error JSON format
-
-## Requirement: Body Too Large Hint
-
-When a request exceeds `max_request_body`, the proxy returns 413 with a JSON error. If the response status matches a code in `body_too_large_hint_statuses` (default `[413]`), the `append_size_hint()` function in `lib.rs` appends a hint: `"Try reducing context size or splitting into smaller requests."` to the error message. Set `body_too_large_hint_statuses = []` to disable hints.
-
-### Scenario: 413 with hint
-- GIVEN `body_too_large_hint_statuses = [413]` (default) and the body exceeds the limit
-- WHEN a 413 response is generated
-- THEN the error message includes the context-size hint
-
-### Scenario: 413 without hint
-- GIVEN `body_too_large_hint_statuses = []` and the body exceeds the limit
-- WHEN a 413 response is generated
-- THEN the error message does NOT include the hint
 
 ## Requirement: Graceful Shutdown
 

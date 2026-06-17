@@ -255,8 +255,10 @@ cd C:\temp\inf-splitter\inf-splitter
 
 安装后：
 1. 编辑`%ProgramData%\inf-splitter\config.toml`
-2. 通过WinSW设置API密钥：`& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
+2. 设置API密钥：在`%ProgramData%\inf-splitter\secrets\`中创建一个以密钥命名的文件，并将值放入其中。例如，对于`${DEEPSEEK_API_KEY}` — 创建文件`secrets\DEEPSEEK_API_KEY`，内容为`sk-...`
 3. 重启服务：`Restart-Service inf-splitter`
+
+或者，通过WinSW设置API密钥：`& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
 
 ```powershell
 Get-Service inf-splitter          # 服务状态

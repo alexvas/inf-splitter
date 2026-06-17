@@ -255,8 +255,10 @@ cd C:\temp\inf-splitter\inf-splitter
 
 После установки:
 1. Отредактируйте `%ProgramData%\inf-splitter\config.toml`
-2. Задайте API-ключи через WinSW: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
+2. Задайте API-ключи: создайте файл в `%ProgramData%\inf-splitter\secrets\` с именем ключа и поместите в него значение. Например, для `${DEEPSEEK_API_KEY}` — создайте файл `secrets\DEEPSEEK_API_KEY` и запишите в него `sk-...`
 3. Перезапустите сервис: `Restart-Service inf-splitter`
+
+Альтернативно, API-ключи можно задать через WinSW: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
 
 ```powershell
 Get-Service inf-splitter          # статус сервиса

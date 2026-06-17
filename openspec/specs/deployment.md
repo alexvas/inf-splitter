@@ -49,8 +49,21 @@ The `.deb` package installs:
 
 The `inf-splitter-windows.zip` artifact contains the binary, config, and `install.ps1`:
 - Installs to `%ProgramData%\inf-splitter\`
+- Creates `secrets\` directory for API key files
 - Creates and starts a Windows service via WinSW
 - Config: `%ProgramData%\inf-splitter\config.toml`
+
+Secrets are stored as files in `%ProgramData%\inf-splitter\secrets\`: one file per key, filename = variable name, content = key value. The `${VAR}` resolution in config reads `secrets/VAR` on all platforms. Env vars (via WinSW) take precedence when both exist.
+
+### Scenario: Windows install creates secrets dir
+- GIVEN `install.ps1` is run as Administrator
+- WHEN installation completes
+- THEN `%ProgramData%\inf-splitter\secrets\` exists and is ready for API keys
+
+### Scenario: API key from secrets file
+- GIVEN `config.toml` has `api_key = "${DEEPSEEK_API_KEY}"`
+- WHEN `%ProgramData%\inf-splitter\secrets\DEEPSEEK_API_KEY` contains `sk-abc123`
+- THEN the proxy uses `sk-abc123` as the API key
 
 ### Scenario: Windows install
 - GIVEN the zip is extracted

@@ -255,8 +255,10 @@ The script creates `%ProgramData%\inf-splitter\`, installs and starts the Window
 
 After installation:
 1. Edit `%ProgramData%\inf-splitter\config.toml`
-2. Set API keys via WinSW: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
+2. Set API keys: create a file in `%ProgramData%\inf-splitter\secrets\` named after the key and put the value inside. For example, for `${DEEPSEEK_API_KEY}` — create file `secrets\DEEPSEEK_API_KEY` with content `sk-...`
 3. Restart the service: `Restart-Service inf-splitter`
+
+Alternatively, set API keys via WinSW: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`
 
 ```powershell
 Get-Service inf-splitter          # service status

@@ -305,9 +305,9 @@ jobs:
             1. Отредактируйте `%ProgramData%\inf-splitter\config.toml`.
                Edit `%ProgramData%\inf-splitter\config.toml`.
                编辑 `%ProgramData%\inf-splitter\config.toml`。
-            2. Задайте API-ключи: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`.
-               Set API keys: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`.
-               设置API密钥: `& "$env:ProgramData\inf-splitter\inf-splitter-service.exe" set VAR=value`。
+            2. Задайте API-ключи: создайте файл в `%ProgramData%\inf-splitter\secrets\` с именем ключа и поместите в него значение (напр. `DEEPSEEK_API_KEY` → `sk-...`).
+               Set API keys: create a file in `%ProgramData%\inf-splitter\secrets\` named after the key and put the value inside (e.g. `DEEPSEEK_API_KEY` → `sk-...`).
+               设置API密钥：在`%ProgramData%\inf-splitter\secrets\`中创建以密钥命名的文件并放入值（例如 `DEEPSEEK_API_KEY` → `sk-...`）。
             3. Перезапустите сервис: `Restart-Service inf-splitter`.
                Restart the service: `Restart-Service inf-splitter`.
                重启服务: `Restart-Service inf-splitter`。

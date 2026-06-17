@@ -942,7 +942,19 @@ pub fn epoch_secs() -> u64 {
 }
 
 pub fn ts_string() -> String {
-    epoch_secs().to_string()
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    let (d, s) = (secs / 86400, secs % 86400);
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let sec = s % 60;
+
+    // civil_from_days expects days since 0000-03-01; 719468 = offset from Unix epoch
+    let (y, mo, day) = civil_from_days(d as i64 + 719468);
+
+    format!("{y:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{sec:02}Z")
 }
 
 // ── message detail builders (moved from lib.rs) ──────────────────

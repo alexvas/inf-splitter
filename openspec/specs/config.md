@@ -167,3 +167,40 @@ Top-level config keys:
 - GIVEN `upstream_timeout = "30s"`
 - WHEN an upstream call is made
 - THEN the HTTP client times out after 30 seconds
+
+## Requirement: Model Name Validation
+
+When `models` is a list, each entry is validated: whitespace is trimmed and empty strings are rejected. Previously only the single-string form performed this check; list entries with empty or whitespace-only strings silently registered blank routes.
+
+### Scenario: Empty string in model list
+- GIVEN `models = ["valid", ""]`
+- WHEN config is loaded
+- THEN startup fails with `ConfigError::Provider { name, message: "model name must not be empty" }`
+
+### Scenario: Whitespace-only in model list
+- GIVEN `models = ["valid", "  "]`
+- WHEN config is loaded
+- THEN startup fails with the same error
+
+## Requirement: drop_fields Per-Model Key Validation
+
+When `drop_fields` uses the per-model form (`[section.drop_fields]`), each model-specific key (anything except `"all"`) must match a model in the section's `models` list. Unknown keys are a configuration error. Default sections (`models = "default"`) are exempt from this check since they have no concrete model list.
+
+### Scenario: drop_fields references unknown model
+- GIVEN `models = ["known-model"]` and `[s.drop_fields] "unknown-model" = ["field"]`
+- WHEN config is loaded
+- THEN startup fails with `ConfigError::UnknownDropModel { section: "s", model: "unknown-model" }`
+
+### Scenario: drop_fields "all" key is always valid
+- GIVEN `models = ["known-model"]` and `[s.drop_fields] all = ["field"]`
+- WHEN config is loaded
+- THEN no error (all models in section get the base fields)
+
+## Requirement: Defaults Section Strict Parsing
+
+`DefaultConfig` has `#[serde(deny_unknown_fields)]`. Unknown keys in `[defaults]` cause a TOML parse error naming the unrecognized field, preventing silent misconfiguration when an operator puts endpoint fields under `[defaults]`.
+
+### Scenario: Unknown field in defaults
+- GIVEN `[defaults]` with `endpoint_openai = "http://x"`
+- WHEN config is loaded
+- THEN TOML parse fails with "unknown field `endpoint_openai`"

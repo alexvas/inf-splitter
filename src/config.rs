@@ -187,6 +187,7 @@ struct FileConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DefaultConfig {
     max_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
@@ -231,6 +232,8 @@ pub enum ConfigError {
     },
     #[error("multiple default provider sections: {first} and {second}")]
     MultipleDefaults { first: String, second: String },
+    #[error("drop_fields references model {model} not in section {section}")]
+    UnknownDropModel { section: String, model: String },
     #[error(
         "no provider section defines models = \"default\" and model {0} is not listed elsewhere"
     )]
@@ -352,6 +355,21 @@ impl Config {
             };
 
             let (is_default, model_names) = parse_models(&name, raw_section.models)?;
+
+            // Validate per-model drop_fields keys against the section's model list
+            // (only for non-default sections where we have a concrete model set).
+            if !is_default {
+                if let DropFields::PerModel { by_model, .. } = &raw_section.drop_fields {
+                    for key in by_model.keys() {
+                        if !model_names.contains(key) {
+                            return Err(ConfigError::UnknownDropModel {
+                                section: name.clone(),
+                                model: key.clone(),
+                            });
+                        }
+                    }
+                }
+            }
 
             if is_default {
                 if let Some(existing) = &default_section {
@@ -575,6 +593,14 @@ fn parse_models(name: &str, models: ModelsField) -> Result<(bool, HashSet<String
                     message: "use models = \"default\" instead of listing default in an array"
                         .to_string(),
                 });
+            }
+            for model in &values {
+                if model.trim().is_empty() {
+                    return Err(ConfigError::Provider {
+                        name: name.to_string(),
+                        message: "model name must not be empty".to_string(),
+                    });
+                }
             }
             Ok((false, values.into_iter().collect()))
         }
@@ -1070,5 +1096,87 @@ drop_fields = []
         };
         let result = fields.for_model("model-x");
         assert_eq!(result, HashSet::from(["all-field".into()]));
+    }
+
+    // --- config validation ---
+
+    #[test]
+    fn rejects_empty_model_name_in_list() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = ["valid", ""]
+"#;
+        let err = Config::load_from_str(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("model name must not be empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_whitespace_model_name_in_list() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = ["valid", "  "]
+"#;
+        let err = Config::load_from_str(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("model name must not be empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_drop_fields_unknown_model() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "known-model"
+
+[local.drop_fields]
+"unknown-model" = ["field"]
+"#;
+        let err = Config::load_from_str(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown-model"), "got: {msg}");
+        assert!(msg.contains("drop_fields"), "got: {msg}");
+    }
+
+    #[test]
+    fn drop_fields_all_key_is_valid_when_no_models_match() {
+        // "all" is always valid even when there are no model-specific matches
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "known-model"
+
+[local.drop_fields]
+all = ["field"]
+"#;
+        assert!(Config::load_from_str(raw).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_defaults_section() {
+        let raw = r#"
+listen_port =3000
+
+[defaults]
+max_tokens = 4096
+endpoint_openai = "http://127.0.0.1:11434"
+
+[local]
+endpoint_openai = "http://127.0.0.1:11434"
+models = "test-model"
+"#;
+        let err = Config::load_from_str(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("endpoint_openai"), "got: {msg}");
     }
 }

@@ -54,7 +54,7 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: inf-splitter
+          name: inf-splitter-linux_amd64.bin
           path: target/release/inf-splitter
 
   rust-test:
@@ -78,7 +78,7 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: inf-splitter
+          name: inf-splitter-linux_amd64.bin
           path: target/release/
       - run: chmod +x target/release/inf-splitter
       - name: Build image from pre-built binary
@@ -207,7 +207,7 @@ jobs:
       - name: Download Linux binary
         uses: actions/download-artifact@v4
         with:
-          name: inf-splitter
+          name: inf-splitter-linux_amd64.bin
 
       - name: Download .deb
         uses: actions/download-artifact@v4
@@ -220,6 +220,7 @@ jobs:
           name: inf-splitter-windows
 
       - run: chmod +x inf-splitter
+      - run: cp inf-splitter inf-splitter-linux_amd64.bin
 
       - name: Delete existing release if present
         env:
@@ -288,19 +289,6 @@ jobs:
             journalctl -u inf-splitter -f          # логи / logs / 日志
             ```
 
-            #### Linux (binary)
-
-            Скачайте бинарник и запустите.
-            Download the binary and run it.
-            下载二进制文件并运行。
-
-            ```bash
-            cd /tmp
-            wget https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/inf-splitter
-            chmod +x inf-splitter
-            ./inf-splitter
-            ```
-
             #### Windows
 
             Скачайте `inf-splitter-windows.zip`, распакуйте и запустите `install.ps1` от имени администратора.
@@ -324,7 +312,7 @@ jobs:
                Restart the service: `Restart-Service inf-splitter`.
                重启服务: `Restart-Service inf-splitter`。
           files: |
-            inf-splitter
+            inf-splitter-linux_amd64.bin
             inf-splitter_*.deb
             inf-splitter-windows.zip
           draft: false

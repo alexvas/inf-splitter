@@ -121,7 +121,8 @@
 - [x] 7.11 `proxy_limit` splitting — RED: test oversized messages split into multiple interactions ✓ (`split_content_for_limit` tests)
 - [x] 7.12 `proxy_limit` splitting — RED: test single-element-too-large returns error ✓
 - [x] 7.13 `proxy_limit` splitting — RED: test system_instruction splitting with natural text boundaries ✓ 2026-06-19
-- [ ] 7.13a `proxy_limit` splitting — RED: test delta accounting with split interactions
+- [x] 7.13a `proxy_limit` splitting — RED: test delta accounting with split interactions ✓ 2026-06-19
+  - 5 tests in session.rs: delta_after_single_chunk_split, delta_across_multiple_split_rounds, delta_with_system_instruction_split_no_messages, delta_no_new_messages_after_split, delta_reset_after_split_smaller_count
 - [x] 7.14 GREEN: implement `split_egress_content()` — split Content[] into chunks under byte limit, handle system_instruction splitting with natural text boundaries ✓
 - [x] 7.15 GREEN: chain split interactions via `previous_interaction_id`, store LAST ID in session ✓
 - [x] 7.16 GREEN: update `message_count` to reflect total messages across all chunks ✓
@@ -153,9 +154,9 @@
 - [x] 9.1 Add `interactions: InteractionsHandler` to `AppState` ✓
 - [x] 9.2 Update `build_app()` to construct `InteractionsHandler` ✓
 - [x] 9.3 Wire per-section `proxy` into handler HTTP clients (reqwest `Proxy::all()`) ✓
-- [ ] 9.4 Add `GET /interactions/v1/control-constants` route — expose configured control constants per section
+- [x] 9.4 Add `GET /interactions/v1/control-constants` route — expose configured control constants per section ✓ 2026-06-19
 - [x] 9.5 Update `dispatch_messages()` — add interactions branch to routing matrix ✓
-- [ ] 9.6 Update `upstream_endpoints()` for health checks
+- [x] 9.6 Update `upstream_endpoints()` for health checks ✓ 2026-06-19 (uses GET for interactions, HEAD for others)
 - [x] 9.7 Update `build_models_response()` — no changes needed (uses `sorted_model_ids()`) ✓
 
 **Quality Gate:**

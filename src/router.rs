@@ -66,6 +66,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(post_openai_messages))
         .route("/v1/messages", post(post_anthropic_messages))
+        .route("/interactions/v1/control-constants", get(control_constants))
         .with_state(state)
 }
 
@@ -93,13 +94,19 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
     let checks: Vec<_> = endpoints
         .iter()
-        .map(|(name, endpoint)| {
+        .map(|(name, endpoint, is_interactions)| {
             let client = state.health_client.clone();
             let endpoint = endpoint.clone();
             let name = name.clone();
+            let use_get = *is_interactions;
             async move {
                 let url = format!("{endpoint}/");
-                let result = tokio::time::timeout(CHECK_TIMEOUT, client.head(&url).send()).await;
+                let req = if use_get {
+                    client.get(&url)
+                } else {
+                    client.head(&url)
+                };
+                let result = tokio::time::timeout(CHECK_TIMEOUT, req.send()).await;
                 match result {
                     Ok(Ok(_)) => (name, "ok".to_string()),
                     Ok(Err(e)) => {
@@ -365,6 +372,29 @@ async fn dispatch_messages(
             }
         }
     }
+}
+
+async fn control_constants(State(state): State<AppState>) -> impl IntoResponse {
+    let mut result = serde_json::Map::new();
+    for (name, section) in &state.config.sections {
+        if section.endpoint_interactions.is_none() {
+            continue;
+        }
+        let mut constants = serde_json::Map::new();
+        if let Some(ref clean_all) = section.control_clean_all {
+            constants.insert("clean_all".to_string(), serde_json::json!(clean_all));
+        }
+        if let Some(ref extend_lifetime) = section.control_extend_lifetime {
+            constants.insert(
+                "extend_lifetime".to_string(),
+                serde_json::json!(extend_lifetime),
+            );
+        }
+        if !constants.is_empty() {
+            result.insert(name.clone(), serde_json::Value::Object(constants));
+        }
+    }
+    Json(serde_json::Value::Object(result))
 }
 
 #[cfg(test)]

@@ -258,6 +258,70 @@ mod tests {
         assert_eq!(new_count, 5); // unchanged
     }
 
+    // --- Delta accounting with proxy_limit splits ---
+
+    #[test]
+    fn delta_after_single_chunk_split() {
+        // First request: 3 messages sent in 2 chunks (msg1+msg2 → chunk1, msg3 → chunk2)
+        // After all chunks: message_count = 3 (total across chunks)
+        let (start, new_count) = compute_delta(0, 3);
+        assert_eq!(start, 0);
+        assert_eq!(new_count, 3);
+
+        // Next request: client sends full history (3 old + 2 new = 5)
+        // Delta should skip all 3 prior, process only 2 new
+        let (start, new_count) = compute_delta(3, 5);
+        assert_eq!(start, 3);
+        assert_eq!(new_count, 5);
+    }
+
+    #[test]
+    fn delta_across_multiple_split_rounds() {
+        // Round 1: 5 messages sent in 3 chunks (2+2+1), total = 5
+        // Round 2: client sends 5 old + 4 new = 9 total
+        let (start, new_count) = compute_delta(5, 9);
+        assert_eq!(start, 5);
+        assert_eq!(new_count, 9);
+
+        // Round 3: client sends 9 old + 3 new = 12 total
+        let (start, new_count) = compute_delta(9, 12);
+        assert_eq!(start, 9);
+        assert_eq!(new_count, 12);
+    }
+
+    #[test]
+    fn delta_with_system_instruction_split_no_messages() {
+        // System instruction split: first 2 chunks have empty Content[]
+        // Only the last chunk carries the actual messages (3 messages)
+        // After the chain: message_count = 3 (only the real messages)
+        let (start, new_count) = compute_delta(0, 3);
+        assert_eq!(start, 0);
+        assert_eq!(new_count, 3);
+
+        // Next request: client sends full history 3 old + 2 new = 5
+        let (start, new_count) = compute_delta(3, 5);
+        assert_eq!(start, 3);
+        assert_eq!(new_count, 5);
+    }
+
+    #[test]
+    fn delta_no_new_messages_after_split() {
+        // 7 messages delivered across 3 chunks (3+2+2)
+        // Next request: same 7 messages (no new ones)
+        let (start, new_count) = compute_delta(7, 7);
+        assert_eq!(start, 7);
+        assert_eq!(new_count, 7); // delta empty — nothing new to send
+    }
+
+    #[test]
+    fn delta_reset_after_split_smaller_count() {
+        // 6 messages delivered across 2 chunks (3+3)
+        // Next request: only 2 messages (client reset conversation)
+        let (start, new_count) = compute_delta(6, 2);
+        assert_eq!(start, 6); // all 6 prior messages need re-sending
+        assert_eq!(new_count, 6); // new_count stays at 6 (re-send all)
+    }
+
     #[tokio::test]
     async fn session_store_create_and_update() {
         let (store, _path) = new_store("create-update").await;

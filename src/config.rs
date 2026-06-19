@@ -502,7 +502,7 @@ impl Config {
     }
 
     /// Unique upstream endpoints for health checks.
-    pub fn upstream_endpoints(&self) -> Vec<(String, String)> {
+    pub fn upstream_endpoints(&self) -> Vec<(String, String, bool)> {
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         for section in self.sections.values() {
@@ -512,7 +512,12 @@ impl Config {
             ];
             for ep in eps.into_iter().flatten() {
                 if seen.insert(ep.to_string()) {
-                    result.push((section.name.clone(), ep.to_string()));
+                    result.push((section.name.clone(), ep.to_string(), false));
+                }
+            }
+            if let Some(ref ep) = section.endpoint_interactions {
+                if seen.insert(ep.clone()) {
+                    result.push((section.name.clone(), ep.clone(), true));
                 }
             }
         }

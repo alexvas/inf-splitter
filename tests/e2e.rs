@@ -667,3 +667,353 @@ max_tokens = 42
         "max_tokens should be injected as generation_config.max_output_tokens"
     );
 }
+
+// ── Session persistence ──
+
+#[tokio::test]
+async fn interactions_session_persistence_survives_restart() {
+    let session_store_path = std::env::temp_dir().join(format!(
+        "inf-splitter-test-sessions-{}.toml",
+        std::process::id()
+    ));
+    // Clean up any leftover from previous failed test
+    let _ = std::fs::remove_file(&session_store_path);
+
+    // ── First proxy instance: establish a session ──
+    let captured1 = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured1.clone(),
+        interactions_upstream_response("int-persist-1", "Persisted reply"),
+    )
+    .await;
+
+    let config1 = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#,
+        store_path = session_store_path.display(),
+        upstream_addr = upstream_addr,
+    );
+    let proxy_addr1 = spawn_router(&config1).await;
+
+    // Send first request — establishes session with 1 message delivered
+    let request1 = make_anthropic_request("gemini-3.1-flash-lite");
+    let response1 = post_anthropic_with_session(
+        &proxy_addr1,
+        serde_json::to_value(&request1).unwrap(),
+        "sess-persist",
+    )
+    .await;
+    assert_eq!(response1.status(), reqwest::StatusCode::OK);
+
+    // Drop the first proxy
+    drop(proxy_addr1);
+    // Give it a moment to flush
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Verify the session file exists
+    assert!(
+        session_store_path.exists(),
+        "session store should be persisted to disk"
+    );
+
+    // ── Second proxy instance: recover session and compute delta ──
+    let captured2 = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr2 = spawn_upstream(
+        "/v1beta/interactions",
+        captured2.clone(),
+        interactions_upstream_response("int-persist-2", "Second reply"),
+    )
+    .await;
+
+    let config2 = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr2}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#,
+        store_path = session_store_path.display(),
+        upstream_addr2 = upstream_addr2,
+    );
+    let proxy_addr2 = spawn_router(&config2).await;
+
+    // Send second request with 2 messages (1 old + 1 new) — delta should skip the first
+    let request2 = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": "new message after restart"}
+        ]
+    });
+    let response2 = post_anthropic_with_session(&proxy_addr2, request2, "sess-persist").await;
+    assert_eq!(response2.status(), reqwest::StatusCode::OK);
+
+    // Delta should have skipped the already-delivered message
+    let upstream2 = captured2.lock().unwrap().clone().expect("turn 2 body");
+    let input2 = upstream2["input"].as_array().unwrap();
+    assert_eq!(
+        input2.len(),
+        1,
+        "after restart, delta should send only 1 new message"
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_file(&session_store_path);
+}
+
+// ── Control messages ──
+
+const CTRL_CLEAN_ALL: &str = "***!___!--- clear all sessions for test ---!___!***";
+const CTRL_EXTEND: &str = "***!___!--- extend session test to <unix_utc> ---!___!***";
+
+#[tokio::test]
+async fn control_message_clean_all_sessions() {
+    let session_path = std::env::temp_dir().join(format!(
+        "inf-splitter-ctrl-clean-{}.toml",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&session_path);
+
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-ctrl-1", "Reply before clean"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+control_clean_all = "{CTRL_CLEAN_ALL}"
+"#,
+        store_path = session_path.display(),
+        CTRL_CLEAN_ALL = CTRL_CLEAN_ALL,
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    // First, create a session with a normal message
+    let request1 = make_anthropic_request("gemini-3.1-flash-lite");
+    let response1 = post_anthropic_with_session(
+        &proxy_addr,
+        serde_json::to_value(&request1).unwrap(),
+        "sess-ctrl",
+    )
+    .await;
+    assert_eq!(response1.status(), reqwest::StatusCode::OK);
+
+    // Send the clean-all control message
+    let clean_request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": CTRL_CLEAN_ALL}
+        ]
+    });
+    let response2 = post_anthropic_with_session(&proxy_addr, clean_request, "sess-ctrl").await;
+    assert_eq!(response2.status(), reqwest::StatusCode::OK);
+    let body2: serde_json::Value = response2.json().await.unwrap();
+    assert_eq!(body2["status"], "ok");
+    assert!(body2["message"].as_str().unwrap().contains("Cleaned"));
+
+    let _ = std::fs::remove_file(&session_path);
+}
+
+#[tokio::test]
+async fn control_message_extend_lifetime() {
+    let session_path =
+        std::env::temp_dir().join(format!("inf-splitter-ctrl-ext-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&session_path);
+
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-ext-1", "Reply"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+control_extend_lifetime = "{CTRL_EXTEND}"
+"#,
+        store_path = session_path.display(),
+        CTRL_EXTEND = CTRL_EXTEND,
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    // First establish a session with a normal message
+    let request1 = make_anthropic_request("gemini-3.1-flash-lite");
+    let response1 = post_anthropic_with_session(
+        &proxy_addr,
+        serde_json::to_value(&request1).unwrap(),
+        "sess-extend",
+    )
+    .await;
+    assert_eq!(response1.status(), reqwest::StatusCode::OK);
+
+    let future_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 86400;
+    let extend_msg = CTRL_EXTEND.replace("<unix_utc>", &future_ts.to_string());
+
+    let extend_request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": extend_msg}
+        ]
+    });
+    let response = post_anthropic_with_session(&proxy_addr, extend_request, "sess-extend").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert!(body["message"].as_str().unwrap().contains("extended"));
+
+    let _ = std::fs::remove_file(&session_path);
+}
+
+#[tokio::test]
+async fn control_message_idempotency() {
+    let session_path = std::env::temp_dir().join(format!(
+        "inf-splitter-ctrl-idem-{}.toml",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&session_path);
+
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-idem-1", "Reply"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+control_clean_all = "{CTRL_CLEAN_ALL}"
+"#,
+        store_path = session_path.display(),
+        CTRL_CLEAN_ALL = CTRL_CLEAN_ALL,
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let clean_request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": CTRL_CLEAN_ALL}
+        ]
+    });
+    // First: should be processed
+    let response1 =
+        post_anthropic_with_session(&proxy_addr, clean_request.clone(), "sess-idem").await;
+    assert_eq!(response1.status(), reqwest::StatusCode::OK);
+    let body1: serde_json::Value = response1.json().await.unwrap();
+    assert_eq!(body1["status"], "ok");
+
+    // Second: same message — idempotent, should be ignored
+    let response2 = post_anthropic_with_session(&proxy_addr, clean_request, "sess-idem").await;
+    assert_eq!(response2.status(), reqwest::StatusCode::OK);
+    let body2: serde_json::Value = response2.json().await.unwrap();
+    assert_eq!(body2["status"], "ok");
+
+    let _ = std::fs::remove_file(&session_path);
+}
+
+#[tokio::test]
+async fn control_messages_stripped_from_delta() {
+    let session_path = std::env::temp_dir().join(format!(
+        "inf-splitter-ctrl-strip-{}.toml",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&session_path);
+
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-strip-1", "First reply"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+control_extend_lifetime = "{CTRL_EXTEND}"
+"#,
+        store_path = session_path.display(),
+        CTRL_EXTEND = CTRL_EXTEND,
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    // First establish a session with a normal message
+    let request1 = make_anthropic_request("gemini-3.1-flash-lite");
+    let response1 = post_anthropic_with_session(
+        &proxy_addr,
+        serde_json::to_value(&request1).unwrap(),
+        "sess-strip",
+    )
+    .await;
+    assert_eq!(response1.status(), reqwest::StatusCode::OK);
+
+    // Send a request with ONLY a control message — it should be intercepted
+    // and return the extend-lifetime action response (not forwarded to upstream)
+    let extend_msg = CTRL_EXTEND.replace(
+        "<unix_utc>",
+        &(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86400)
+            .to_string(),
+    );
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": extend_msg}
+        ]
+    });
+    let response = post_anthropic_with_session(&proxy_addr, request, "sess-strip").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert!(body["message"].as_str().unwrap().contains("extended"));
+
+    let _ = std::fs::remove_file(&session_path);
+}

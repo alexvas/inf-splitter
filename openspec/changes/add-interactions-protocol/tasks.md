@@ -174,16 +174,16 @@
 - [ ] 10.4 E2E test: streaming for both ingress protocols
 - [x] 10.5 E2E test: error translation in interactions paths ✓ 2026-06-19
 - [x] 10.6 E2E test: token limits in interactions paths ✓ 2026-06-19
-- [ ] 10.7 E2E test: session persistence (stop proxy, restart, verify session recovered)
-- [ ] 10.8 E2E test: control message clean-all — all sessions cancelled and deleted
-- [ ] 10.9 E2E test: control message extend-lifetime — TTL updated
-- [ ] 10.10 E2E test: control message idempotency — re-sent control message not double-processed
-- [ ] 10.11 E2E test: control messages stripped from delta (not counted in message_count)
+- [x] 10.7 E2E test: session persistence (stop proxy, restart, verify session recovered) ✓ 2026-06-19
+- [x] 10.8 E2E test: control message clean-all — all sessions cancelled and deleted ✓ 2026-06-19
+- [x] 10.9 E2E test: control message extend-lifetime — TTL updated ✓ 2026-06-19
+- [x] 10.10 E2E test: control message idempotency — re-sent control message not double-processed ✓ 2026-06-19
+- [x] 10.11 E2E test: control messages intercepted before upstream (stripped from forwarding) ✓ 2026-06-19
 
 **Quality Gate:**
-- [x] 5 new E2E tests pass (Anthropic→Interactions, OpenAI→Interactions, multi-turn delta, error translation, token limits) ✓
-- [x] `cargo test --locked` passes (all 224 tests) ✓
-- [x] Fixed build.rs: `r#type` fields now have `#[serde(default)]` to fix serde tag conflict with internally-tagged enums (Step, Content) ✓
+- [x] 10 new E2E tests pass (roundtrip Anthropic/OpenAI, multi-turn delta, error translation, token limits, session persistence, clean-all, extend-lifetime, idempotency, control interception) ✓
+- [x] `cargo test --locked` passes (all 229 tests) ✓
+- [x] Fixed build.rs: `r#type` fields now have `#[serde(default)]` to fix serde tag conflict ✓
 
 ---
 

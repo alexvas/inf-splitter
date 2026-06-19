@@ -7,6 +7,7 @@ pub mod interactions_types;
 pub mod openai;
 pub mod relay;
 pub mod router;
+pub mod session;
 pub mod sse;
 
 use std::collections::HashSet;

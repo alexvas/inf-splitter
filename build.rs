@@ -114,6 +114,7 @@ enum ResolvedType {
 #[derive(Debug, Clone)]
 struct PropertyType {
     variant_name: Option<String>, // for oneOf enum variants (from title)
+    variant_tag: Option<String>,  // #[serde(rename)] value from discriminator mapping
     rust_type: String,
     description: Option<String>,
     is_optional: bool,
@@ -181,6 +182,27 @@ fn resolve_schema(
             .and_then(|p| p.as_str())
             .map(String::from);
 
+        // Extract mapping: tag value → schema name
+        let mapping: BTreeMap<String, String> = schema
+            .get("discriminator")
+            .and_then(|d| d.get("mapping"))
+            .and_then(|m| m.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .map(|(tag, ref_path)| {
+                        let name = ref_path
+                            .as_str()
+                            .unwrap_or("")
+                            .split('/')
+                            .last()
+                            .unwrap_or("")
+                            .to_string();
+                        (tag.clone(), name)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut variant_types = Vec::new();
         for variant in variants {
             // Use title as variant name if present
@@ -192,8 +214,15 @@ fn resolve_schema(
             if let Some(ref_path) = variant.get("$ref").and_then(|v| v.as_str()) {
                 let ref_name = ref_path.split('/').last().unwrap();
                 let vname = variant_name.unwrap_or_else(|| ref_name.to_string());
+                // Use explicit mapping if available, otherwise derive from variant name
+                let tag = if mapping.is_empty() {
+                    Some(derive_tag_from_variant(ref_name, name))
+                } else {
+                    mapping.iter().find(|(_, name)| *name == ref_name).map(|(t, _)| t.clone())
+                };
                 variant_types.push(PropertyType {
                     variant_name: Some(vname),
+                    variant_tag: tag,
                     rust_type: ref_name.to_string(),
                     description: variant
                         .get("description")
@@ -207,7 +236,6 @@ fn resolve_schema(
                 }
             } else {
                 let rust_type = rust_type_from_schema(variant);
-                // Derive variant name from title, or from type
                 let vname = variant_name.unwrap_or_else(|| {
                     let t = variant
                         .get("type")
@@ -217,6 +245,7 @@ fn resolve_schema(
                 });
                 variant_types.push(PropertyType {
                     variant_name: Some(vname),
+                    variant_tag: None,
                     rust_type,
                     description: variant
                         .get("description")
@@ -273,6 +302,7 @@ fn resolve_schema(
                     prop_name.clone(),
                     PropertyType {
                         variant_name: None,
+                        variant_tag: None,
                         rust_type,
                         description: prop_schema
                             .get("description")
@@ -301,6 +331,7 @@ fn resolve_schema(
                 let ref_name = ref_path.split('/').last().unwrap();
                 PropertyType {
                     variant_name: None,
+                    variant_tag: None,
                     rust_type: ref_name.to_string(),
                     description: None,
                     is_optional: false,
@@ -308,6 +339,7 @@ fn resolve_schema(
             } else {
                 PropertyType {
                     variant_name: None,
+                    variant_tag: None,
                     rust_type: rust_type_from_schema(items),
                     description: None,
                     is_optional: false,
@@ -361,7 +393,7 @@ fn rust_type_from_schema(schema: &serde_json::Value) -> String {
 fn generate_type(
     name: &str,
     rt: &ResolvedType,
-    all_types: &BTreeMap<String, ResolvedType>,
+    _all_types: &BTreeMap<String, ResolvedType>,
 ) -> String {
     match rt {
         ResolvedType::Object {
@@ -468,12 +500,17 @@ fn generate_oneof_enum(
                 .as_deref()
                 .map(to_pascal_case)
                 .unwrap_or_else(|| to_pascal_case(&variant.rust_type));
-            code.push_str(&format!("    {},\n", variant_name));
+            // Use discriminator mapping for the rename value
+            if let Some(ref tag_val) = variant.variant_tag {
+                code.push_str(&format!("    #[serde(rename = \"{}\")]\n", tag_val));
+            }
+            // Variant carries the actual data struct (not unit variant)
+            code.push_str(&format!("    {}({}),\n", variant_name, variant.rust_type));
         }
 
         code.push_str("}\n");
     } else {
-        // Untagged enum for oneOf without discriminator
+        // Untagged enum for oneOf without discriminator (like InteractionsInput)
         code.push_str("#[derive(Debug, Clone, Serialize, Deserialize)]\n");
         code.push_str("#[serde(untagged)]\n");
         code.push_str(&format!("pub enum {} {{\n", enum_name));
@@ -620,4 +657,13 @@ fn to_snake_case(s: &str) -> String {
         | "unsized" | "virtual" | "yield" | "extern" => format!("r#{}", name),
         _ => name,
     }
+}
+
+/// Derive a serde tag value from a variant name by stripping the parent enum name.
+/// E.g., `TextContent` in enum `Content` → `text`, `UserInputStep` in enum `Step` → `user_input`.
+fn derive_tag_from_variant(variant_name: &str, parent_enum_name: &str) -> String {
+    let stripped = variant_name
+        .strip_suffix(parent_enum_name)
+        .unwrap_or(variant_name);
+    to_snake_case(stripped)
 }

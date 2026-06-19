@@ -4,6 +4,7 @@ pub mod config;
 pub mod control;
 pub mod diagnostics;
 pub mod error;
+pub mod interactions;
 pub mod interactions_types;
 pub mod openai;
 pub mod relay;

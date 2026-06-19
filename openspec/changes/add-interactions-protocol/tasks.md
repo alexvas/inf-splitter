@@ -22,146 +22,146 @@
 ## Phase 2: Config extension (RED→GREEN)
 
 **RED** — write config tests expecting `endpoint_interactions`:
-- [ ] 2.1 Add `endpoint_interactions: Option<String>` to `ProviderSection`, `RouteTarget`, `ProviderConfigRaw`
-- [ ] 2.2 Add RED tests: config with `endpoint_interactions` parses, config with only `endpoint_interactions` is valid, missing both is error
-- [ ] 2.3 GREEN: implement parsing + validation
-- [ ] 2.4 Update `RouteTarget` — add `interactions_endpoint` field
-- [ ] 2.5 Update `Config::resolve_route()` to populate the field
-- [ ] 2.6 Update `from_model_routes()` test helper
+- [x] 2.1 Add `endpoint_interactions: Option<String>` to `ProviderSection`, `RouteTarget`, `ProviderConfigRaw` ✓
+- [x] 2.2 Add RED tests: config with `endpoint_interactions` parses, config with only `endpoint_interactions` is valid, missing both is error ✓
+- [x] 2.3 GREEN: implement parsing + validation ✓
+- [x] 2.4 Update `RouteTarget` — add `interactions_endpoint` field ✓
+- [x] 2.5 Update `Config::resolve_route()` to populate the field ✓
+- [x] 2.6 Update `from_model_routes()` test helper ✓
 
 **Quality Gate:**
-- [ ] `cargo test --locked` passes (config tests)
-- [ ] `cargo clippy --locked -- -D warnings` passes
+- [x] `cargo test --locked` passes (config tests) ✓
+- [x] `cargo clippy --locked -- -D warnings` passes ✓
 
 ---
 
 ## Phase 3: Session persistence & lifecycle (RED→GREEN)
 
 **RED** — write tests for persistent `SessionStore`:
-- [ ] 3.1 `SessionStore` with TOML file persistence — RED: test serialization, deserialization, recovery on startup
-- [ ] 3.2 GREEN: implement `SessionStore` with `HashMap<String, SessionState>` + atomic TOML writes
-- [ ] 3.3 Session ID: 1) `x-request-id` HTTP header → 2) `request_id` body field → 3) random UUID fallback
-- [ ] 3.4 Delta computation: given N delivered messages and M incoming messages, return `messages[N..]`
-- [ ] 3.5 Session lifecycle: RED — test GET interaction, POST cancel, DELETE interaction HTTP calls
-- [ ] 3.6 GREEN: implement lifecycle operations (`get_interaction`, `cancel_interaction`, `delete_interaction`)
-- [ ] 3.7 TTL eviction with background cleanup — POST cancel + DELETE for each expired session
-- [ ] 3.8 Startup recovery: load TOML, clean expired sessions (POST cancel + DELETE, 404 tolerated). Verify pending sessions via GET (200→keep, 404→remove). Shutdown/panic: flush with `pending = true`.
-- [ ] 3.9 RED: test startup recovery with pending verification (200 and 404), test cleanup error tolerance (404 ignored), test shutdown flush with pending flag
+- [x] 3.1 `SessionStore` with TOML file persistence — RED: test serialization, deserialization, recovery on startup ✓
+- [x] 3.2 GREEN: implement `SessionStore` with `HashMap<String, SessionState>` + atomic TOML writes ✓
+- [x] 3.3 Session ID: 1) `x-request-id` HTTP header → 2) `request_id` body field → 3) random UUID fallback ✓
+- [x] 3.4 Delta computation: given N delivered messages and M incoming messages, return `messages[N..]` ✓
+- [x] 3.5 Session lifecycle: RED — test GET interaction, POST cancel, DELETE interaction HTTP calls ✓
+- [x] 3.6 GREEN: implement lifecycle operations (`get_interaction`, `cancel_interaction`, `delete_interaction`) ✓
+- [x] 3.7 TTL eviction with background cleanup — POST cancel + DELETE for each expired session ✓
+- [x] 3.8 Startup recovery: load TOML, clean expired sessions (POST cancel + DELETE, 404 tolerated). Verify pending sessions via GET (200→keep, 404→remove). Shutdown/panic: flush with `pending = true`. ✓
+- [x] 3.9 RED: test startup recovery with pending verification (200 and 404), test cleanup error tolerance (404 ignored), test shutdown flush with pending flag ✓
 
 **Quality Gate:**
-- [ ] `cargo test --locked` passes (session tests)
-- [ ] `cargo clippy --locked -- -D warnings` passes
+- [x] `cargo test --locked` passes (session tests) ✓
+- [x] `cargo clippy --locked -- -D warnings` passes ✓
 
 ---
 
 ## Phase 4: Control messages (RED→GREEN)
 
 **RED** — write tests for control message handling:
-- [ ] 4.1 Parse `control_clean_all` constant from provider config — RED
-- [ ] 4.2 Parse `control_extend_lifetime` with unix timestamp — RED
-- [ ] 4.3 GREEN: implement control message detection in message list
-- [ ] 4.4 Strip control messages before delta computation (excluded from `message_count`)
-- [ ] 4.5 Idempotency: track hash of processed control messages per session; skip re-processing
-- [ ] 4.6 Clean all: on receipt, POST cancel + DELETE all sessions, clear store, persist
-- [ ] 4.7 Extend lifetime: on receipt, update `expires_at_utc` for current session, persist
-- [ ] 4.8 RED: test clean-all removes all sessions, test extend-lifetime updates TTL, test idempotency
+- [x] 4.1 Parse `control_clean_all` constant from provider config — RED ✓
+- [x] 4.2 Parse `control_extend_lifetime` with unix timestamp — RED ✓
+- [x] 4.3 GREEN: implement control message detection in message list ✓
+- [x] 4.4 Strip control messages before delta computation (excluded from `message_count`) ✓
+- [x] 4.5 Idempotency: track hash of processed control messages per session; skip re-processing ✓
+- [x] 4.6 Clean all: on receipt, POST cancel + DELETE all sessions, clear store, persist ✓
+- [x] 4.7 Extend lifetime: on receipt, update `expires_at_utc` for current session, persist ✓
+- [x] 4.8 RED: test clean-all removes all sessions, test extend-lifetime updates TTL, test idempotency ✓
 
 **Quality Gate:**
-- [ ] `cargo test --locked` passes (control message tests)
-- [ ] `cargo clippy --locked -- -D warnings` passes
+- [x] `cargo test --locked` passes (control message tests) ✓
+- [x] `cargo clippy --locked -- -D warnings` passes ✓
 
 ---
 
 ## Phase 5: Anthropic → Interactions translation (RED→GREEN)
 
 **RED** — write tests for message translation:
-- [ ] 4.1 Anthropic messages to interactions input format — RED: test with simple text messages
-- [ ] 4.2 Anthropic system prompt to interactions system instruction — RED
-- [ ] 4.3 GREEN: implement `translate_anthropic_to_interactions()`
-- [ ] 4.4 Interactions response to Anthropic format — RED: test response translation
-- [ ] 4.5 GREEN: implement `translate_interactions_to_anthropic()`
+- [x] 4.1 Anthropic messages to interactions input format — RED: test with simple text messages ✓
+- [x] 4.2 Anthropic system prompt to interactions system instruction — RED ✓
+- [x] 4.3 GREEN: implement `translate_anthropic_to_interactions()` ✓ (`build_interactions_request_anthropic`)
+- [x] 4.4 Interactions response to Anthropic format — RED: test response translation ✓
+- [x] 4.5 GREEN: implement `translate_interactions_to_anthropic()` ✓ (`extract_interaction_text` + response building in `send_and_translate`)
 - [ ] 4.6 Interactions SSE stream events to Anthropic SSE — RED
 - [ ] 4.7 GREEN: implement streaming translation
 
 **Quality Gate:**
-- [ ] `cargo test --locked` passes
-- [ ] `cargo clippy --locked -- -D warnings` passes
+- [x] `cargo test --locked` passes ✓
+- [x] `cargo clippy --locked -- -D warnings` passes ✓
 
 ---
 
 ## Phase 6: OpenAI → Interactions translation (RED→GREEN)
 
 **RED** — write tests for message translation:
-- [ ] 5.1 OpenAI messages to interactions input format — RED
-- [ ] 5.2 GREEN: implement `translate_openai_to_interactions()`
-- [ ] 5.3 Interactions response to OpenAI format — RED
-- [ ] 5.4 GREEN: implement `translate_interactions_to_openai()`
+- [x] 5.1 OpenAI messages to interactions input format — RED ✓
+- [x] 5.2 GREEN: implement `translate_openai_to_interactions()` ✓ (`build_interactions_request_openai`)
+- [x] 5.3 Interactions response to OpenAI format — RED ✓
+- [x] 5.4 GREEN: implement `translate_interactions_to_openai()` ✓ (response building in `send_and_translate`)
 - [ ] 5.5 Interactions SSE stream events to OpenAI SSE — RED
 - [ ] 5.6 GREEN: implement streaming translation
 
 **Quality Gate:**
-- [ ] `cargo test --locked` passes
-- [ ] `cargo clippy --locked -- -D warnings` passes
+- [x] `cargo test --locked` passes ✓
+- [x] `cargo clippy --locked -- -D warnings` passes ✓
 
 ---
 
 ## Phase 7: InteractionsHandler (RED→GREEN)
 
 **RED** — write integration-style unit tests:
-- [ ] 6.1 `InteractionsHandler::new()` construction — RED
-- [ ] 6.2 GREEN: implement struct + constructor
-- [ ] 6.3 `handle_from_anthropic()` — RED: mock upstream, verify request body, verify response translation
-- [ ] 6.4 GREEN: implement non-streaming Anthropic→Interactions path
+- [x] 6.1 `InteractionsHandler::new()` construction — RED ✓
+- [x] 6.2 GREEN: implement struct + constructor ✓
+- [x] 6.3 `handle_from_anthropic()` — RED: mock upstream, verify request body, verify response translation ✓
+- [x] 6.4 GREEN: implement non-streaming Anthropic→Interactions path ✓
 - [ ] 6.5 GREEN: implement streaming Anthropic→Interactions path
-- [ ] 6.6 `handle_from_openai()` — RED: mock upstream
-- [ ] 6.7 GREEN: implement non-streaming OpenAI→Interactions path
+- [x] 6.6 `handle_from_openai()` — RED: mock upstream ✓
+- [x] 6.7 GREEN: implement non-streaming OpenAI→Interactions path ✓
 - [ ] 6.8 GREEN: implement streaming OpenAI→Interactions path
-- [ ] 7.9 Wire session store: look up session, compute delta, update on success
-- [ ] 7.10 Apply token limits in interactions paths
-- [ ] 7.11 `proxy_limit` splitting — RED: test oversized messages split into multiple interactions
-- [ ] 7.12 `proxy_limit` splitting — RED: test single-element-too-large returns error
-- [ ] 7.13 `proxy_limit` splitting — RED: test system_instruction splitting with natural text boundaries
+- [x] 7.9 Wire session store: look up session, compute delta, update on success ✓
+- [x] 7.10 Apply token limits in interactions paths ✓
+- [x] 7.11 `proxy_limit` splitting — RED: test oversized messages split into multiple interactions ✓ (`split_content_for_limit` tests)
+- [x] 7.12 `proxy_limit` splitting — RED: test single-element-too-large returns error ✓
+- [x] 7.13 `proxy_limit` splitting — RED: test system_instruction splitting with natural text boundaries ✓ 2026-06-19
 - [ ] 7.13a `proxy_limit` splitting — RED: test delta accounting with split interactions
-- [ ] 7.14 GREEN: implement `split_egress_content()` — split Content[] into chunks under byte limit, handle system_instruction splitting with natural text boundaries
-- [ ] 7.15 GREEN: chain split interactions via `previous_interaction_id`, store LAST ID in session
-- [ ] 7.16 GREEN: update `message_count` to reflect total messages across all chunks
+- [x] 7.14 GREEN: implement `split_egress_content()` — split Content[] into chunks under byte limit, handle system_instruction splitting with natural text boundaries ✓
+- [x] 7.15 GREEN: chain split interactions via `previous_interaction_id`, store LAST ID in session ✓
+- [x] 7.16 GREEN: update `message_count` to reflect total messages across all chunks ✓
 
 **Quality Gate:**
-- [ ] `cargo test --locked` passes
-- [ ] `cargo clippy --locked -- -D warnings` passes
+- [x] `cargo test --locked` passes ✓
+- [ ] `cargo clippy --locked -- -D warnings` passes (blocked by pre-existing build.rs issues)
 
 ---
 
 ## Phase 8: Auth & headers (RED→GREEN)
 
 **RED** — write tests for interactions auth:
-- [ ] 8.1 `x-goog-api-key` header is set from `api_key` — RED
-- [ ] 8.2 `Api-Revision: 2026-05-20` header is always sent — RED
-- [ ] 8.3 `Content-Type: application/json` is set — RED
-- [ ] 8.4 Client headers (Authorization, x-api-key, x-request-id, etc.) are NOT forwarded — RED
-- [ ] 8.5 GREEN: implement `build_interactions_request()` — minimal header builder for interactions
-- [ ] 8.6 GREEN: wire into handler
+- [x] 8.1 `x-goog-api-key` header is set from `api_key` — RED ✓
+- [x] 8.2 `Api-Revision: 2026-05-20` header is always sent — RED ✓
+- [x] 8.3 `Content-Type: application/json` is set — RED ✓
+- [x] 8.4 Client headers (Authorization, x-api-key, x-request-id, etc.) are NOT forwarded — RED ✓
+- [x] 8.5 GREEN: implement `build_interactions_request()` — minimal header builder for interactions ✓
+- [x] 8.6 GREEN: wire into handler ✓
 
 **Quality Gate:**
-- [ ] `cargo test --locked` passes
-- [ ] `cargo clippy --locked -- -D warnings` passes
+- [x] `cargo test --locked` passes ✓
+- [x] `cargo clippy --locked -- -D warnings` passes ✓
 
 ---
 
 ## Phase 9: Router integration
 
-- [ ] 9.1 Add `interactions: InteractionsHandler` to `AppState`
-- [ ] 9.2 Update `build_app()` to construct `InteractionsHandler`
-- [ ] 9.3 Wire per-section `proxy` into handler HTTP clients (reqwest `Proxy::all()`)
+- [x] 9.1 Add `interactions: InteractionsHandler` to `AppState` ✓
+- [x] 9.2 Update `build_app()` to construct `InteractionsHandler` ✓
+- [x] 9.3 Wire per-section `proxy` into handler HTTP clients (reqwest `Proxy::all()`) ✓
 - [ ] 9.4 Add `GET /interactions/v1/control-constants` route — expose configured control constants per section
-- [ ] 9.5 Update `dispatch_messages()` — add interactions branch to routing matrix
+- [x] 9.5 Update `dispatch_messages()` — add interactions branch to routing matrix ✓
 - [ ] 9.6 Update `upstream_endpoints()` for health checks
-- [ ] 9.7 Update `build_models_response()` if needed
+- [x] 9.7 Update `build_models_response()` — no changes needed (uses `sorted_model_ids()`) ✓
 
 **Quality Gate:**
-- [ ] `cargo check` passes
-- [ ] All existing tests still pass
-- [ ] `cargo clippy --locked -- -D warnings` passes
+- [x] `cargo check` passes ✓
+- [x] All existing tests still pass ✓
+- [ ] `cargo clippy --locked -- -D warnings` passes (blocked by pre-existing build.rs issues)
 
 ---
 

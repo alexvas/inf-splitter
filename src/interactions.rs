@@ -34,13 +34,9 @@ pub fn build_interactions_request_anthropic(
         .filter_map(extract_anthropic_content)
         .collect();
 
-    build_request_body(
-        &contents,
-        route,
-        body,
-        previous_interaction_id,
-        || extract_anthropic_system(body),
-    )
+    build_request_body(&contents, route, body, previous_interaction_id, || {
+        extract_anthropic_system(body)
+    })
 }
 
 /// Build an interactions request from OpenAI ingress body.
@@ -127,7 +123,10 @@ pub fn split_content_for_limit(contents: &[Content], limit: usize) -> Vec<Vec<Co
     for content in contents.iter().cloned() {
         let mut test_chunk = current.clone();
         test_chunk.push(content.clone());
-        if serde_json::to_vec(&test_chunk).map(|v| v.len()).unwrap_or(0) <= limit
+        if serde_json::to_vec(&test_chunk)
+            .map(|v| v.len())
+            .unwrap_or(0)
+            <= limit
             || current.is_empty()
         {
             current.push(content);
@@ -146,12 +145,9 @@ pub fn split_content_for_limit(contents: &[Content], limit: usize) -> Vec<Vec<Co
 
 /// Check if any single Content element exceeds the limit (unsplittable).
 pub fn single_element_too_large(contents: &[Content], limit: usize) -> bool {
-    contents.iter().any(|c| {
-        serde_json::to_vec(c)
-            .map(|v| v.len())
-            .unwrap_or(0)
-            > limit
-    })
+    contents
+        .iter()
+        .any(|c| serde_json::to_vec(c).map(|v| v.len()).unwrap_or(0) > limit)
 }
 
 /// Extract response text from Interaction using generated types.
@@ -160,19 +156,16 @@ pub fn extract_interaction_text(interaction: &Interaction) -> String {
         .steps
         .iter()
         .filter_map(|step| match step {
-            Step::ModelOutputStep(mos) => mos
-                .content
-                .as_ref()
-                .map(|content| {
-                    content
-                        .iter()
-                        .filter_map(|c| match c {
-                            Content::TextContent(tc) => Some(tc.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<&str>>()
-                        .join("")
-                }),
+            Step::ModelOutputStep(mos) => mos.content.as_ref().map(|content| {
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::TextContent(tc) => Some(tc.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<&str>>()
+                    .join("")
+            }),
             _ => None,
         })
         .collect::<Vec<String>>()
@@ -336,7 +329,10 @@ mod tests {
             ]
         });
         let req = build_interactions_request_openai(&body, 0, &test_route(), None);
-        assert_eq!(req["system_instruction"].as_str().unwrap(), "You are helpful.");
+        assert_eq!(
+            req["system_instruction"].as_str().unwrap(),
+            "You are helpful."
+        );
     }
 
     #[test]

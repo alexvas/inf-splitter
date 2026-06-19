@@ -191,11 +191,7 @@ mod tests {
 
     #[test]
     fn scan_detects_clean_all() {
-        let msgs = vec![
-            user_msg("Hello"),
-            user_msg(CLEAN_ALL),
-            user_msg("World"),
-        ];
+        let msgs = vec![user_msg("Hello"), user_msg(CLEAN_ALL), user_msg("World")];
         let mut hashes = HashSet::new();
         let result = scan_control_messages(&msgs, Some(CLEAN_ALL), None, &mut hashes);
         assert_eq!(result.stripped_count, 1);
@@ -209,8 +205,7 @@ mod tests {
             "***!___!--- текущую сессию gemini interactions храни до 1718571800 ---!___!***";
         let msgs = vec![user_msg(ext_msg)];
         let mut hashes = HashSet::new();
-        let result =
-            scan_control_messages(&msgs, None, Some(EXTEND_LIFETIME), &mut hashes);
+        let result = scan_control_messages(&msgs, None, Some(EXTEND_LIFETIME), &mut hashes);
         assert_eq!(result.stripped_count, 1);
         assert!(result.cleaned_messages.is_empty());
         match result.action {
@@ -223,7 +218,8 @@ mod tests {
     fn scan_no_control_messages_passes_through() {
         let msgs = vec![user_msg("Hello"), user_msg("World")];
         let mut hashes = HashSet::new();
-        let result = scan_control_messages(&msgs, Some(CLEAN_ALL), Some(EXTEND_LIFETIME), &mut hashes);
+        let result =
+            scan_control_messages(&msgs, Some(CLEAN_ALL), Some(EXTEND_LIFETIME), &mut hashes);
         assert_eq!(result.stripped_count, 0);
         assert_eq!(result.cleaned_messages.len(), 2);
         assert!(result.action.is_none());
@@ -253,8 +249,7 @@ mod tests {
     #[test]
     fn extract_timestamp_from_constant() {
         // Exact match
-        let text =
-            "***!___!--- текущую сессию gemini interactions храни до 1718571800 ---!___!***";
+        let text = "***!___!--- текущую сессию gemini interactions храни до 1718571800 ---!___!***";
         let result = match_extend_lifetime(text, EXTEND_LIFETIME);
         assert_eq!(result, Some(1718571800));
 

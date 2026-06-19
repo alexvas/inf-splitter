@@ -240,7 +240,7 @@ When `proxy_limit` is configured on a provider section, the serialized `Content[
 
 **Error case 1:** If a single `Content` element serialized alone exceeds `proxy_limit`, return 415 with body `"Unable to split ingress message into chunks under proxy limit."`.
 
-**Error case 2 (system instruction splitting):** If the request (even with empty `Content[]`) exceeds `proxy_limit` solely due to `system_instruction`, split the instruction across chunks rather than failing. Split priority: `\n\n` → `\n` → `.` → `!`/`?` → `,`/`;` → space. First chunk(s) carry the split instruction + empty `Content[]`; the last chunk carries the remaining instruction + actual messages. Chain all via `previous_interaction_id`.
+**Error case 2 (system instruction splitting):** If the request (even with empty `Content[]`) exceeds `proxy_limit` solely due to `system_instruction`, split the instruction across chunks. Algorithm: greedy fill each chunk to the limit using hierarchical delimiters (`\n\n` → `\n` → `. ` → `! ` → `? ` → `, ` → `; ` → ` `). If a chunk still exceeds the limit after the finest delimiter, recurse into it with the next finer delimiter. First chunk(s) carry the split instruction + empty `Content[]`; the last chunk carries the remaining instruction + actual messages. Chain all via `previous_interaction_id`. If a single element cannot be split under the limit even at the finest delimiter, return error.
 
 #### Scenario: Single interaction (under limit)
 - GIVEN `proxy_limit = "130k"`, 3 messages serialized to 50 KiB

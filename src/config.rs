@@ -123,21 +123,21 @@ pub struct RouteTarget {
 }
 
 #[derive(Debug, Clone)]
-struct ProviderSection {
-    name: String,
-    endpoint_openai: Option<String>,
-    endpoint_anthropic: Option<String>,
-    endpoint_interactions: Option<String>,
-    api_key: Option<String>,
-    max_tokens: Option<u32>,
-    max_output_tokens: Option<u32>,
-    max_completion_tokens: Option<u32>,
-    model_names: HashSet<String>,
-    drop_fields: DropFields,
-    proxy: Option<String>,
-    proxy_limit: Option<usize>,
-    control_clean_all: Option<String>,
-    control_extend_lifetime: Option<String>,
+pub(crate) struct ProviderSection {
+    pub(crate) name: String,
+    pub(crate) endpoint_openai: Option<String>,
+    pub(crate) endpoint_anthropic: Option<String>,
+    pub(crate) endpoint_interactions: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) max_tokens: Option<u32>,
+    pub(crate) max_output_tokens: Option<u32>,
+    pub(crate) max_completion_tokens: Option<u32>,
+    pub(crate) model_names: HashSet<String>,
+    pub(crate) drop_fields: DropFields,
+    pub(crate) proxy: Option<String>,
+    pub(crate) proxy_limit: Option<usize>,
+    pub(crate) control_clean_all: Option<String>,
+    pub(crate) control_extend_lifetime: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,7 +160,7 @@ pub struct Config {
     default_max_tokens: Option<u32>,
     default_max_output_tokens: Option<u32>,
     default_max_completion_tokens: Option<u32>,
-    sections: HashMap<String, ProviderSection>,
+    pub(crate) sections: HashMap<String, ProviderSection>,
     model_routes: HashMap<String, String>,
     default_section: Option<String>,
 }
@@ -363,7 +363,10 @@ impl Config {
                 .map(|e| e.trim().trim_end_matches('/').to_string())
                 .filter(|e| !e.is_empty());
 
-            if endpoint_openai.is_none() && endpoint_anthropic.is_none() && endpoint_interactions.is_none() {
+            if endpoint_openai.is_none()
+                && endpoint_anthropic.is_none()
+                && endpoint_interactions.is_none()
+            {
                 return Err(ConfigError::Provider {
                     name,
                     message: "at least one of endpoint_openai, endpoint_anthropic, or endpoint_interactions must be set"
@@ -1362,7 +1365,9 @@ endpoint_interactions = "https://generativelanguage.googleapis.com/v1beta/intera
 models = "gemini-3.1-flash-lite"
 "#;
         let config = Config::load_from_str(raw).expect("interactions config");
-        let route = config.resolve_route("gemini-3.1-flash-lite").expect("route");
+        let route = config
+            .resolve_route("gemini-3.1-flash-lite")
+            .expect("route");
         assert!(route.endpoint_interactions.is_some());
         assert!(route.endpoint_openai.is_none());
         assert!(route.endpoint_anthropic.is_none());
@@ -1382,7 +1387,9 @@ control_clean_all = "***!___!--- очисти все сессии ---!___!***"
 control_extend_lifetime = "***!___!--- текущую сессию храни до <unix_utc> ---!___!***"
 "#;
         let config = Config::load_from_str(raw).expect("interactions full config");
-        let route = config.resolve_route("gemini-3.1-flash-lite").expect("route");
+        let route = config
+            .resolve_route("gemini-3.1-flash-lite")
+            .expect("route");
         assert_eq!(route.proxy.as_deref(), Some("http://127.0.0.1:8081"));
         assert_eq!(route.proxy_limit, Some(130 * 1024));
         assert!(route.control_clean_all.is_some());

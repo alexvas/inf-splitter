@@ -165,12 +165,13 @@ proxy_limit = "130k"
    - Subsequent chunks: chain via `previous_interaction_id` = previous chunk's `interaction.id`
    - Last chunk's `interaction.id` becomes the session's stored ID
 5. If a single `Content` element alone exceeds `proxy_limit` → return error 415 with message `"Unable to split ingress message into chunks under proxy limit."`
-6. **System instruction splitting:** if the outgoing request (even with empty `Content[]`) exceeds `proxy_limit` solely because of `system_instruction`, split the system instruction across multiple interactions using natural text boundaries:
-   - Priority order: double newline (`\n\n`) → single newline (`\n`) → period (`.`) → exclamation/question (`!` `?`) → comma/semicolon (`,` `;`) → space
+6. **System instruction splitting:** if the outgoing request (even with empty `Content[]`) exceeds `proxy_limit` solely because of `system_instruction`, split the system instruction across multiple interactions using hierarchical delimiter boundaries:
+   - Priority order: `\n\n` → `\n` → `. ` → `! ` → `? ` → `, ` → `; ` → ` `
+   - Algorithm: greedy fill each chunk to the limit before splitting; if a chunk exceeds the limit, recurse with the next finer delimiter
+   - If a single element cannot be split under the limit even at the finest delimiter, return error `"Unable to split system instruction under limit {N} bytes"`
    - First chunk(s): send with the split system_instruction portion, empty `Content[]`, empty `Step[]`
    - Chain via `previous_interaction_id`
    - Last chunk: receives remaining system_instruction + the actual messages
-   - This ensures long system prompts (e.g., lengthy instructions on how to format responses) don't block message delivery
 
 **Delta accounting with splits:**
 - `message_count` tracks the total number of client messages delivered across ALL chunks
@@ -186,6 +187,11 @@ proxy_limit = "130k"
 - GIVEN `proxy_limit = "10k"`, system_instruction is 25 KiB, messages are 2 KiB
 - WHEN request is processed
 - THEN chunk1 (empty Content[], system_instruction part 1 split at `\n\n`, ~9 KiB) → chunk2 (empty Content[], system_instruction part 2, ~9 KiB) → chunk3 (system_instruction part 3 + messages, ~9 KiB), `message_count += len(messages)`, stored `interaction_id` = chunk3's ID
+
+#### Scenario: System instruction unsplittable
+- GIVEN `proxy_limit = "1k"`, system_instruction is a single 3 KiB paragraph with no delimiters (no `\n\n`, no `\n`, no `. `, no `! `, no `? `, no `, `, no `; `)
+- WHEN request is processed
+- THEN error returned `"Unable to split system instruction under limit 1024 bytes"`
 
 #### Scenario: Messages split across chunks (with prior session state)
 - GIVEN `proxy_limit = "15k"`, session has `interaction_id = "prior-id"` and 2 already-delivered messages. 3 new messages serialize to 25 KiB (msg1: 12 KiB, msg2: 8 KiB, msg3: 5 KiB)

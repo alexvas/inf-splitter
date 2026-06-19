@@ -35,10 +35,7 @@ mod tests {
             serde_json::from_value(json).expect("deserialize interaction");
         assert_eq!(interaction.id, "abc123");
         assert_eq!(interaction.status, "completed");
-        assert_eq!(
-            interaction.model.as_deref(),
-            Some("gemini-3.1-flash-lite")
-        );
+        assert_eq!(interaction.model.as_deref(), Some("gemini-3.1-flash-lite"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod control;
 pub mod diagnostics;
 pub mod error;
 pub mod interactions;
+pub mod interactions_handler;
 pub mod interactions_types;
 pub mod openai;
 pub mod relay;
@@ -28,8 +29,10 @@ use crate::anthropic::AnthropicHandler;
 use crate::config::{cap_numeric_field, Config, ErrorTranslationRule, RouteTarget};
 use crate::diagnostics::Diagnostics;
 use crate::error::AppError;
+use crate::interactions_handler::InteractionsHandler;
 use crate::openai::OpenAiHandler;
 use crate::router::{router, AppState};
+use crate::session::SessionStore;
 
 /// Apply error translation rules to an upstream error body.
 /// Rules are evaluated in order; first match wins.
@@ -147,10 +150,39 @@ pub(crate) fn peek_model_from_json(body: &[u8]) -> String {
 }
 
 pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Router, AppError> {
+    let session_path = config
+        .interactions_session_store
+        .clone()
+        .unwrap_or_else(|| {
+            #[cfg(target_os = "linux")]
+            {
+                "/var/lib/inf-splitter/interactions-sessions.toml".to_string()
+            }
+            #[cfg(target_os = "windows")]
+            {
+                r"%ProgramData%\inf-splitter\interactions-sessions.toml".to_string()
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            {
+                "config/interactions-sessions.toml".to_string()
+            }
+        });
+    let session_store = Arc::new(SessionStore::new(std::path::PathBuf::from(&session_path)));
+    // Recover sessions from disk
+    let loaded = session_store.load_from_disk().await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to load session store, starting fresh");
+        Vec::new()
+    });
+    if !loaded.is_empty() {
+        tracing::info!(count = loaded.len(), "recovered sessions from disk");
+    }
+
     let config = Arc::new(config);
     let max_request_body = config.max_request_body;
     let openai = OpenAiHandler::new(config.as_ref(), diagnostics.clone())?;
     let anthropic = AnthropicHandler::new(config.as_ref(), diagnostics.clone())?;
+    let interactions =
+        InteractionsHandler::new(config.as_ref(), diagnostics.clone(), session_store.clone())?;
 
     let health_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -162,6 +194,8 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
         diagnostics,
         openai,
         anthropic,
+        interactions,
+        session_store,
         health_client,
         health_cache: Arc::new(Mutex::new(None)),
     };

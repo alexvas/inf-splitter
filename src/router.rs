@@ -16,7 +16,9 @@ use crate::anthropic::AnthropicHandler;
 use crate::config::{Config, Protocol};
 use crate::diagnostics::Diagnostics;
 use crate::error::AppError;
+use crate::interactions_handler::InteractionsHandler;
 use crate::openai::OpenAiHandler;
+use crate::session::SessionStore;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,6 +26,8 @@ pub struct AppState {
     pub diagnostics: Diagnostics,
     pub openai: OpenAiHandler,
     pub anthropic: AnthropicHandler,
+    pub interactions: InteractionsHandler,
+    pub session_store: Arc<SessionStore>,
     pub health_client: reqwest::Client,
     pub health_cache: Arc<Mutex<Option<(Instant, HealthResponse)>>>,
 }
@@ -324,6 +328,12 @@ async fn dispatch_messages(
                     .anthropic
                     .handle_from_openai(&body, &headers, &route, endpoint)
                     .await
+            } else if let Some(endpoint) = &route.endpoint_interactions {
+                tracing::debug!("converting OpenAI ingress to Interactions upstream");
+                state
+                    .interactions
+                    .handle_from_openai(&body, &headers, &route, endpoint)
+                    .await
             } else {
                 Err(AppError::Internal(
                     "no endpoint configured for this provider".to_string(),
@@ -340,6 +350,12 @@ async fn dispatch_messages(
                 tracing::debug!("converting Anthropic ingress to OpenAI upstream");
                 state
                     .openai
+                    .handle_from_anthropic(&body, &headers, &route, endpoint)
+                    .await
+            } else if let Some(endpoint) = &route.endpoint_interactions {
+                tracing::debug!("converting Anthropic ingress to Interactions upstream");
+                state
+                    .interactions
                     .handle_from_anthropic(&body, &headers, &route, endpoint)
                     .await
             } else {

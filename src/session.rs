@@ -67,8 +67,8 @@ impl SessionStore {
     /// Persist current sessions to the TOML file atomically.
     pub async fn save_to_disk(&self) -> Result<(), String> {
         let sessions = self.sessions.read().await;
-        let toml_str =
-            toml::to_string(&*sessions).map_err(|e| format!("failed to serialize sessions: {e}"))?;
+        let toml_str = toml::to_string(&*sessions)
+            .map_err(|e| format!("failed to serialize sessions: {e}"))?;
         // Atomic write: write to temp file, then rename
         let tmp = self.path.with_extension("tmp");
         fs::write(&tmp, toml_str).map_err(|e| e.to_string())?;

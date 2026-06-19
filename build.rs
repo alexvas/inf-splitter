@@ -11,7 +11,9 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let schema_path = manifest_dir.join("schemas").join("interactions.openapi.json");
+    let schema_path = manifest_dir
+        .join("schemas")
+        .join("interactions.openapi.json");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     println!("cargo:rerun-if-changed={}", schema_path.display());
@@ -74,9 +76,7 @@ fn main() {
     let mod_path = out_dir.join("interactions_types_mod.rs");
     fs::write(
         &mod_path,
-        format!(
-            "include!(concat!(env!(\"OUT_DIR\"), \"/interactions_types.rs\"));\n"
-        ),
+        format!("include!(concat!(env!(\"OUT_DIR\"), \"/interactions_types.rs\"));\n"),
     )
     .expect("failed to write mod file");
 }
@@ -156,11 +156,11 @@ fn resolve_schema(
             }
         }
         let mut schema_obj = serde_json::Map::new();
-        schema_obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
         schema_obj.insert(
-            "properties".to_string(),
-            serde_json::Value::Object(merged),
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
         );
+        schema_obj.insert("properties".to_string(), serde_json::Value::Object(merged));
         return resolve_schema(
             name,
             &serde_json::Value::Object(schema_obj),
@@ -218,7 +218,10 @@ fn resolve_schema(
                 let tag = if mapping.is_empty() {
                     Some(derive_tag_from_variant(ref_name, name))
                 } else {
-                    mapping.iter().find(|(_, name)| *name == ref_name).map(|(t, _)| t.clone())
+                    mapping
+                        .iter()
+                        .find(|(_, name)| *name == ref_name)
+                        .map(|(t, _)| t.clone())
                 };
                 variant_types.push(PropertyType {
                     variant_name: Some(vname),
@@ -291,7 +294,11 @@ fn resolve_schema(
         let required: Vec<String> = schema
             .get("required")
             .and_then(|r| r.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
@@ -455,9 +462,7 @@ fn generate_struct(
         }
         let rust_name = to_snake_case(prop_name);
         let serde_attr = if prop.is_optional {
-            format!(
-                "    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n"
-            )
+            format!("    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n")
         } else {
             String::new()
         };
@@ -466,7 +471,10 @@ fn generate_struct(
         } else {
             prop.rust_type.clone()
         };
-        code.push_str(&format!("{}    pub {}: {},\n", serde_attr, rust_name, rust_type));
+        code.push_str(&format!(
+            "{}    pub {}: {},\n",
+            serde_attr, rust_name, rust_type
+        ));
     }
 
     code.push_str("}\n");
@@ -521,10 +529,7 @@ fn generate_oneof_enum(
                 .as_deref()
                 .map(to_pascal_case)
                 .unwrap_or_else(|| to_pascal_case(&variant.rust_type));
-            code.push_str(&format!(
-                "    {}({}),\n",
-                variant_name, variant.rust_type
-            ));
+            code.push_str(&format!("    {}({}),\n", variant_name, variant.rust_type));
         }
 
         code.push_str("}\n");
@@ -533,11 +538,7 @@ fn generate_oneof_enum(
     code
 }
 
-fn generate_string_enum(
-    name: &str,
-    description: &Option<String>,
-    values: &[String],
-) -> String {
+fn generate_string_enum(name: &str, description: &Option<String>, values: &[String]) -> String {
     let mut code = String::new();
 
     if let Some(desc) = description {
@@ -549,14 +550,13 @@ fn generate_string_enum(
     code.push_str(&format!(
         "#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n"
     ));
-    code.push_str(&format!("#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]\n"));
+    code.push_str(&format!(
+        "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]\n"
+    ));
     code.push_str(&format!("pub enum {} {{\n", to_pascal_case(name)));
 
     for value in values {
-        let variant = value
-            .replace('/', "_")
-            .replace('.', "_")
-            .replace('-', "_");
+        let variant = value.replace('/', "_").replace('.', "_").replace('-', "_");
         code.push_str(&format!("    {},\n", variant));
     }
 
@@ -646,15 +646,20 @@ fn to_snake_case(s: &str) -> String {
             result.push(c);
         }
     }
-    let name = if result.is_empty() { s.to_string() } else { result };
+    let name = if result.is_empty() {
+        s.to_string()
+    } else {
+        result
+    };
     // Escape Rust keywords
     match name.as_str() {
-        "type" | "enum" | "struct" | "trait" | "impl" | "fn" | "mod" | "use" | "pub"
-        | "async" | "await" | "loop" | "if" | "else" | "match" | "move" | "ref"
-        | "static" | "dyn" | "where" | "for" | "while" | "let" | "const" | "box"
-        | "self" | "super" | "crate" | "return" | "true" | "false" | "in" | "abstract"
-        | "become" | "do" | "final" | "macro" | "override" | "priv" | "typeof"
-        | "unsized" | "virtual" | "yield" | "extern" => format!("r#{}", name),
+        "type" | "enum" | "struct" | "trait" | "impl" | "fn" | "mod" | "use" | "pub" | "async"
+        | "await" | "loop" | "if" | "else" | "match" | "move" | "ref" | "static" | "dyn"
+        | "where" | "for" | "while" | "let" | "const" | "box" | "self" | "super" | "crate"
+        | "return" | "true" | "false" | "in" | "abstract" | "become" | "do" | "final" | "macro"
+        | "override" | "priv" | "typeof" | "unsized" | "virtual" | "yield" | "extern" => {
+            format!("r#{}", name)
+        }
         _ => name,
     }
 }

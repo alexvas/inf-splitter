@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+pub mod control;
 pub mod diagnostics;
 pub mod error;
 pub mod interactions_types;

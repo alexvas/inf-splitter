@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod diagnostics;
 pub mod error;
+pub mod interactions_types;
 pub mod openai;
 pub mod relay;
 pub mod router;

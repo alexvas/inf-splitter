@@ -188,15 +188,15 @@
 
 ## Phase 11: Documentation & Polish
 
-- [ ] 10.1 Update `README.md` — add `endpoint_interactions` to config reference
-- [ ] 10.2 Update `README.en.md` — same
-- [ ] 10.3 Update `README.zh.md` — same
-- [ ] 10.4 Update `config/inf-splitter.toml.example` — add interactions example
-- [ ] 10.5 Update `CLAUDE.md` — add interactions module to architecture section
+- [x] 10.1 Update `README.md` — add `endpoint_interactions` to config reference ✓ 2026-06-19
+- [x] 10.2 Update `README.en.md` — same ✓ 2026-06-19
+- [x] 10.3 Update `README.zh.md` — same ✓ 2026-06-19
+- [x] 10.4 Update `config/inf-splitter.toml.example` — add interactions example ✓ 2026-06-19
+- [x] 10.5 Update `CLAUDE.md` — add interactions module to architecture section ✓ 2026-06-19
 
 **Quality Gate:**
-- [ ] Pre-commit hook passes (heading count validation)
-- [ ] All READMEs in sync
+- [x] Pre-commit hook passes (heading count validation) ✓
+- [x] All READMEs in sync ✓ (added fields: endpoint_interactions, proxy, proxy_limit, control_clean_all, control_extend_lifetime; routing matrix updated with interactions rows)
 
 ---
 

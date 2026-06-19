@@ -65,12 +65,17 @@ models = "default"
 |------|------|
 | `endpoint_openai` | 可选；OpenAI兼容上游的基础URL。设置后，传入的`/openai`请求直接转发到此而不进行转换 |
 | `endpoint_anthropic` | 可选；Anthropic兼容上游的基础URL。设置后，传入的`/anthropic`请求直接转发到此而不进行转换 |
+| `endpoint_interactions` | 可选；Gemini Interactions API上游的基础URL（`/v1beta/interactions`）。设置后，传入请求被翻译为Interactions格式。支持通过`previous_interaction_id`和会话状态进行交互链式调用 |
 | `models` | 单个模型、模型列表或`"default"`（未匹配模型的回退） |
 | `api_key` | 可选；`${VAR}`从环境变量或`secrets/VAR`文件解析 |
+| `proxy` | 可选；此段出站请求的HTTP或SOCKS5代理（例如`"http://127.0.0.1:8081"`或`"socks5://172.17.0.1:3823"`） |
 | `max_tokens` | 可选；限制出站请求中的`max_tokens`。如果客户端未设置或超出——代理注入限制 |
 | `max_output_tokens` | 可选；限制`max_output_tokens`（透传，非标准字段；OpenAI兼容上游请用`max_completion_tokens`） |
 | `max_completion_tokens` | 可选；限制`max_completion_tokens`（OpenAI兼容上游） |
 | `drop_fields` | 可选；从发送上游的请求体中移除的顶级JSON键。形式：平面列表`["a","b"]`或`[section.drop_fields]`带`all = [...]`及`"model" = [...]` |
+| `proxy_limit` | 可选；Interactions上游的最大请求体字节大小（例如`"130k"`）。超出时，消息拆分为多个交互，通过`previous_interaction_id`链式连接 |
+| `control_clean_all` | 可选；清除所有Interactions会话的触发字符串。在消息中检测到时，此段的所有会话将被取消并删除 |
+| `control_extend_lifetime` | 可选；延长Interactions会话TTL的触发字符串（带`<unix_utc>`占位符）。检测到时，当前会话的`expires_at_utc`将被更新 |
 
 可以通过`INF_SPLITTER_CONFIG`覆盖配置路径。
 
@@ -115,14 +120,16 @@ OpenAI SDK  --POST /v1/chat/completions-->
 | `deepseek-v4-pro[1m]`、`deepseek-v4-flash` | `[deepseek]` | `POST /v1/messages` |
 | 任何其他 | `[etc]`（`default`） | `POST /v1/chat/completions` |
 
-入口端点指定**传入请求格式和客户端响应格式**。TOML段通过`endpoint_openai`和/或`endpoint_anthropic`指定**目标上游**。当两者都设置时，`/openai`转到`endpoint_openai`，`/anthropic`转到`endpoint_anthropic`（直通）。当只设置一个时，相反的入口通过`anyllm_translate`进行转换。
+入口端点指定**传入请求格式和客户端响应格式**。TOML段通过`endpoint_openai`、`endpoint_anthropic`和/或`endpoint_interactions`指定**目标上游**。当两者都设置时，`/openai`转到`endpoint_openai`，`/anthropic`转到`endpoint_anthropic`（直通）。当只设置一个时，相反的入口通过`anyllm_translate`进行转换。当设置了`endpoint_interactions`时，两种入口格式都被翻译为Interactions协议（含会话状态跟踪）。
 
 | 入口 | 端点可用性 | 行为 |
 |------|------------|------|
 | `/v1/chat/completions` | 设置了`endpoint_openai` | 直通→OpenAI上游 |
 | `/v1/chat/completions` | 仅`endpoint_anthropic` | OpenAI→Anthropic→OpenAI |
+| `/v1/chat/completions` | 设置了`endpoint_interactions` | OpenAI→Interactions |
 | `/v1/messages` | 设置了`endpoint_anthropic` | 直通→Anthropic上游 |
 | `/v1/messages` | 仅`endpoint_openai` | Anthropic→OpenAI→Anthropic |
+| `/v1/messages` | 设置了`endpoint_interactions` | Anthropic→Interactions |
 
 ### API密钥
 

@@ -28,6 +28,7 @@ Client → POST /v1/chat/completions  or  /v1/messages
            3. Match ingress protocol against available endpoints:
               - endpoint_openai is set → passthrough via OpenAiHandler
               - only endpoint_anthropic → translate via AnthropicHandler
+              - endpoint_interactions → translate via InteractionsHandler
               - (and vice versa for Anthropic ingress)
        → Handler sends request upstream, translates response if needed
 ```
@@ -37,9 +38,14 @@ Client → POST /v1/chat/completions  or  /v1/messages
 | Module | Role |
 |--------|------|
 | `config.rs` | TOML parsing, model→section routing, secret resolution (`${VAR}` from env or `secrets/VAR`), duration/byte-size parsing (`15s`, `2m`, `512k`) |
-| `router.rs` | Axum routes, `AppState`, `/health` readiness probe (parallel upstream checks, 5s cache), `/openai/v1/models` + `/anthropic/v1/models`, dispatch logic |
+| `router.rs` | Axum routes, `AppState`, `/health` readiness probe (parallel upstream checks, 5s cache, GET for interactions), `/openai/v1/models` + `/anthropic/v1/models`, `/interactions/v1/control-constants`, dispatch logic |
 | `openai.rs` | `OpenAiHandler` — sends to `/v1/chat/completions`, handles Anthropic→OpenAI conversion via `anyllm_translate` and direct HTTP |
 | `anthropic.rs` | `AnthropicHandler` — sends to `/v1/messages`, handles OpenAI→Anthropic conversion |
+| `interactions_handler.rs` | `InteractionsHandler` — translates Anthropic/OpenAI ingress to Gemini Interactions API (`/v1beta/interactions`), session-aware delta computation, `proxy_limit` content splitting with system instruction chunking, control message handling |
+| `interactions.rs` | Interactions request/response translation helpers: Anthropic/OpenAI message extraction, `split_content_for_limit`, `single_element_too_large` |
+| `interactions_types.rs` | `include!` of build-time generated serde types from `schemas/interactions.openapi.json` |
+| `session.rs` | `SessionStore` — persistent session state (TOML file), TTL eviction, delta computation, startup recovery with pending verification |
+| `control.rs` | Control message scanning (`scan_control_messages`), stripping, idempotency via hash tracking |
 | `sse.rs` | Shared SSE utilities: event-stream detection, line parsing, event formatting |
 | `auth.rs` | `forward_request_headers()` — forwards non-hop-by-hop headers to upstream, applies auth override when `api_key` is set |
 | `error.rs` | `AppError` → Anthropic-format JSON error response (`{"type":"error","error":{...}}`) |
@@ -50,9 +56,12 @@ Client → POST /v1/chat/completions  or  /v1/messages
 Top-level: `listen_host`, `listen_port`, `upstream_timeout`, `max_request_body`, optional `[[error_translation]]` (array of tables: `status`, optional `ingress`, `egress`), optional `[defaults]`.
 
 Each provider section has:
-- `endpoint_openai` / `endpoint_anthropic` — at least one required; determines routing direction
+- `endpoint_openai` / `endpoint_anthropic` / `endpoint_interactions` — at least one required; determines routing direction
 - `models` — single string, list, or `"default"` (catch-all)
 - `api_key`, `max_tokens`, `max_output_tokens`, `max_completion_tokens` — optional
+- `proxy` — optional HTTP/SOCKS5 proxy URL for outgoing requests from this section
+- `proxy_limit` — optional byte-size limit for interactions content splitting (e.g. `"130k"`)
+- `control_clean_all`, `control_extend_lifetime` — optional control message trigger strings for interactions sessions
 
 Per-section token limits override `[defaults]`, which override nothing (no limit applied).
 

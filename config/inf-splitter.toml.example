@@ -30,6 +30,16 @@ max_tokens = 10_000
 max_output_tokens = 10_000
 max_completion_tokens = 10_000
 
+# Пример: Gemini Interactions API с сессионным состоянием
+#[gemini]
+#endpoint_interactions = "https://generativelanguage.googleapis.com/v1beta/interactions?model"
+#api_key = "${GEMINI_API_KEY}"
+#models = "gemini-3.1-flash-lite"
+#proxy_limit = "130k"
+#proxy = "socks5://127.0.0.1:1080"
+#control_clean_all = "***!___!--- очисти все сессии gemini interactions ---!___!***"
+#control_extend_lifetime = "***!___!--- текущую сессию gemini interactions храни до <unix_utc> ---!___!***"
+
 # Опционально: удаление полей из исходящего запроса (напр., для совместимости).
 # Две формы:
 # 1. Плоский список — одни и те же поля для всех моделей секции:

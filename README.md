@@ -65,12 +65,17 @@ models = "default"
 |-------------|----------|
 | `endpoint_openai` | Опционально; base URL OpenAI-совместимого upstream. Если задан, входящие запросы `/openai` идут сюда без конверсии |
 | `endpoint_anthropic` | Опционально; base URL Anthropic-совместимого upstream. Если задан, входящие запросы `/anthropic` идут сюда без конверсии |
+| `endpoint_interactions` | Опционально; base URL Gemini Interactions API upstream (`/v1beta/interactions`). Если задан, входящие запросы транслируются в Interactions-формат. Поддерживается цепочка взаимодействий через `previous_interaction_id` и сессионное состояние |
 | `models` | Одна модель, список моделей или `"default"` (fallback для несматчившихся) |
 | `api_key` | Опционально; `${VAR}` резолвится из env или файла `secrets/VAR` |
+| `proxy` | Опционально; HTTP или SOCKS5 прокси для исходящих запросов этой секции (напр. `"http://127.0.0.1:8081"` или `"socks5://172.17.0.1:3823"`) |
 | `max_tokens` | Опционально; лимит на `max_tokens` в исходящем запросе. Если клиент не задал или превысил — прокси подставляет лимит |
 | `max_output_tokens` | Опционально; лимит на `max_output_tokens` (passthrough, нестандартное поле; для OpenAI-совместимых upstream используйте `max_completion_tokens`) |
 | `max_completion_tokens` | Опционально; лимит на `max_completion_tokens` (OpenAI-совместимые upstream) |
 | `drop_fields` | Опционально; список полей верхнего уровня, удаляемых из тела запроса перед отправкой в upstream. Формы: плоский список `["a","b"]` или `[section.drop_fields]` с `all = [...]` и `"модель" = [...]` |
+| `proxy_limit` | Опционально; максимальный размер тела запроса в байтах для Interactions upstream (напр. `"130k"`). При превышении сообщения разбиваются на несколько взаимодействий, скреплённых через `previous_interaction_id` |
+| `control_clean_all` | Опционально; строка-триггер для очистки всех сессий Interactions. При обнаружении в сообщении — все сессии данной секции отменяются и удаляются |
+| `control_extend_lifetime` | Опционально; строка-триггер для продления TTL сессии Interactions (с unix-меткой `<unix_utc>`). При обнаружении — `expires_at_utc` текущей сессии обновляется |
 
 Путь к конфигу можно переопределить через `INF_SPLITTER_CONFIG`.
 
@@ -115,14 +120,16 @@ OpenAI SDK  --POST /v1/chat/completions-->
 | `deepseek-v4-pro[1m]`, `deepseek-v4-flash` | `[deepseek]` | `POST /v1/messages` |
 | любая другая | `[etc]` (`default`) | `POST /v1/chat/completions` |
 
-Ingress endpoint задаёт **формат входящего запроса и ответа клиенту**. Секция TOML задаёт **целевой upstream** через `endpoint_openai` и/или `endpoint_anthropic`. Если заданы оба — `/openai` идёт на `endpoint_openai`, `/anthropic` — на `endpoint_anthropic` (passthrough). Если задан только один — встречный ingress конвертируется через `anyllm_translate`.
+Ingress endpoint задаёт **формат входящего запроса и ответа клиенту**. Секция TOML задаёт **целевой upstream** через `endpoint_openai`, `endpoint_anthropic` и/или `endpoint_interactions`. Если заданы оба — `/openai` идёт на `endpoint_openai`, `/anthropic` — на `endpoint_anthropic` (passthrough). Если задан только один — встречный ingress конвертируется через `anyllm_translate`. Если задан `endpoint_interactions` — оба ingress-формата транслируются в Interactions-протокол (с сохранением сессионного состояния).
 
 | Ingress | Наличие endpoint | Поведение |
 |---------|-------------------|-----------|
 | `/v1/chat/completions` | `endpoint_openai` задан | passthrough → OpenAI upstream |
 | `/v1/chat/completions` | только `endpoint_anthropic` | OpenAI → Anthropic → OpenAI |
+| `/v1/chat/completions` | `endpoint_interactions` задан | OpenAI → Interactions |
 | `/v1/messages` | `endpoint_anthropic` задан | passthrough → Anthropic upstream |
 | `/v1/messages` | только `endpoint_openai` | Anthropic → OpenAI → Anthropic |
+| `/v1/messages` | `endpoint_interactions` задан | Anthropic → Interactions |
 
 ### API-ключи
 

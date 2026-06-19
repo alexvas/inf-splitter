@@ -65,12 +65,17 @@ Global token limits for all providers. Individual providers can override these.
 |-------|-------------|
 | `endpoint_openai` | Optional; base URL of an OpenAI-compatible upstream. When set, incoming `/openai` requests go here without conversion |
 | `endpoint_anthropic` | Optional; base URL of an Anthropic-compatible upstream. When set, incoming `/anthropic` requests go here without conversion |
+| `endpoint_interactions` | Optional; base URL of a Gemini Interactions API upstream (`/v1beta/interactions`). When set, incoming requests are translated to Interactions format. Supports interaction chaining via `previous_interaction_id` and session state |
 | `models` | A single model, a list of models, or `"default"` (fallback for unmatched models) |
 | `api_key` | Optional; `${VAR}` resolves from the environment or `secrets/VAR` file |
+| `proxy` | Optional; HTTP or SOCKS5 proxy for outgoing requests from this section (e.g. `"http://127.0.0.1:8081"` or `"socks5://172.17.0.1:3823"`) |
 | `max_tokens` | Optional; caps `max_tokens` in the outgoing request. If the client omits or exceeds it, the proxy injects the limit |
 | `max_output_tokens` | Optional; caps `max_output_tokens` (passthrough, non-standard; prefer `max_completion_tokens` for OpenAI-compatible upstreams) |
 | `max_completion_tokens` | Optional; caps `max_completion_tokens` (OpenAI-compatible upstreams) |
 | `drop_fields` | Optional; top-level JSON keys to remove from the request body before sending upstream. Forms: flat list `["a","b"]` or `[section.drop_fields]` with `all = [...]` and `"model" = [...]` |
+| `proxy_limit` | Optional; max request body byte size for Interactions upstream (e.g. `"130k"`). When exceeded, messages are split into multiple interactions chained via `previous_interaction_id` |
+| `control_clean_all` | Optional; trigger string to clean all Interactions sessions. When detected in a message, all sessions for this section are cancelled and deleted |
+| `control_extend_lifetime` | Optional; trigger string to extend Interactions session TTL (with a `<unix_utc>` placeholder). When detected, the current session's `expires_at_utc` is updated |
 
 The config path can be overridden via `INF_SPLITTER_CONFIG`.
 
@@ -115,14 +120,16 @@ OpenAI SDK  --POST /v1/chat/completions-->
 | `deepseek-v4-pro[1m]`, `deepseek-v4-flash` | `[deepseek]` | `POST /v1/messages` |
 | any other | `[etc]` (`default`) | `POST /v1/chat/completions` |
 
-The ingress endpoint specifies the **incoming request format and client response format**. The TOML section specifies the **target upstream** via `endpoint_openai` and/or `endpoint_anthropic`. When both are set, `/openai` goes to `endpoint_openai`, `/anthropic` goes to `endpoint_anthropic` (passthrough). When only one is set, the opposite ingress is converted via `anyllm_translate`.
+The ingress endpoint specifies the **incoming request format and client response format**. The TOML section specifies the **target upstream** via `endpoint_openai`, `endpoint_anthropic`, and/or `endpoint_interactions`. When both are set, `/openai` goes to `endpoint_openai`, `/anthropic` goes to `endpoint_anthropic` (passthrough). When only one is set, the opposite ingress is converted via `anyllm_translate`. When `endpoint_interactions` is set, both ingress formats are translated to the Interactions protocol (with session state tracking).
 
 | Ingress | Endpoint availability | Behavior |
 |---------|----------------------|----------|
 | `/v1/chat/completions` | `endpoint_openai` set | passthrough → OpenAI upstream |
 | `/v1/chat/completions` | only `endpoint_anthropic` | OpenAI → Anthropic → OpenAI |
+| `/v1/chat/completions` | `endpoint_interactions` set | OpenAI → Interactions |
 | `/v1/messages` | `endpoint_anthropic` set | passthrough → Anthropic upstream |
 | `/v1/messages` | only `endpoint_openai` | Anthropic → OpenAI → Anthropic |
+| `/v1/messages` | `endpoint_interactions` set | Anthropic → Interactions |
 
 ### API keys
 

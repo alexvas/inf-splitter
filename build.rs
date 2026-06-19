@@ -68,6 +68,16 @@ fn main() {
 
     code.push_str(&types_code);
 
+    // Post-process: add #[serde(default)] to r#type: serde_json::Value fields.
+    // These fields capture the JSON "type" discriminator when a struct is used
+    // both standalone and as a variant in a #[serde(tag = "type")] enum.
+    // Without default, deserialization of enum variants fails because the tag
+    // is consumed by the enum and the struct's r#type field finds no value.
+    let code = code.replace(
+        "pub r#type: serde_json::Value,",
+        "#[serde(default)]\n    pub r#type: serde_json::Value,",
+    );
+
     // Write to OUT_DIR
     let out_path = out_dir.join("interactions_types.rs");
     fs::write(&out_path, code).expect("failed to write generated types");

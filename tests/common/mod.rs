@@ -48,6 +48,20 @@ pub fn anthropic_upstream_response(model: &str, text: &str) -> serde_json::Value
     })
 }
 
+pub fn interactions_upstream_response(id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "status": "completed",
+        "created": "2026-01-01T00:00:00Z",
+        "updated": "2026-01-01T00:00:00Z",
+        "steps": [{
+            "type": "model_output",
+            "content": [{"type": "text", "text": text}]
+        }],
+        "usage": {"total_input_tokens": 5, "total_output_tokens": 10}
+    })
+}
+
 /// Send a POST to `/v1/chat/completions` on the proxy with a JSON body.
 pub async fn post_openai(proxy_addr: &SocketAddr, body: serde_json::Value) -> reqwest::Response {
     reqwest::Client::new()

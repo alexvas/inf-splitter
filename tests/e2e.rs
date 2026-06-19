@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use anyllm_translate::anthropic::{Content, MessageCreateRequest, MessageResponse};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatCompletionResponse, ChatContent};
 use common::{
-    anthropic_upstream_response, openai_upstream_response, post_anthropic, post_openai,
-    spawn_router, spawn_upstream,
+    anthropic_upstream_response, interactions_upstream_response, openai_upstream_response,
+    post_anthropic, post_openai, spawn_router, spawn_upstream,
 };
 
 const PROMPT: &str = "hello-from-typed-client";
@@ -416,5 +416,254 @@ models = "sole-model"
     assert!(
         body.to_string().contains("ghost-model"),
         "error must mention the unknown model, got: {body}"
+    );
+}
+
+// ── Interactions API E2E ──
+
+/// Helper: POST to `/v1/messages` with a request_id header.
+async fn post_anthropic_with_session(
+    proxy_addr: &std::net::SocketAddr,
+    body: serde_json::Value,
+    session_id: &str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("x-request-id", session_id)
+        .json(&body)
+        .send()
+        .await
+        .expect("proxy request")
+}
+
+/// POST to `/v1/chat/completions` with a request_id header.
+async fn post_openai_with_session(
+    proxy_addr: &std::net::SocketAddr,
+    body: serde_json::Value,
+    session_id: &str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("x-request-id", session_id)
+        .json(&body)
+        .send()
+        .await
+        .expect("proxy request")
+}
+
+#[tokio::test]
+async fn anthropic_ingress_to_interactions_roundtrip() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-001", "Hello from Gemini Interactions!"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = make_anthropic_request("gemini-3.1-flash-lite");
+    let response = post_anthropic(&proxy_addr, serde_json::to_value(&request).unwrap()).await;
+
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "got status {status}, body: {body_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("valid json");
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(
+        body["content"][0]["text"],
+        "Hello from Gemini Interactions!"
+    );
+    // Upstream must have received the interactions-format request
+    let upstream_body = captured.lock().unwrap().clone().expect("captured body");
+    assert!(upstream_body["input"].is_array(), "must have 'input' array");
+}
+
+#[tokio::test]
+async fn openai_ingress_to_interactions_roundtrip() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-002", "OpenAI→Interactions reply"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = make_openai_request("gemini-3.1-flash-lite");
+    let response = post_openai(&proxy_addr, serde_json::to_value(&request).unwrap()).await;
+
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "got status {status}, body: {body_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("valid json");
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert!(body["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("OpenAI→Interactions reply"));
+    // Verify the upstream received interactions-format input
+    let upstream_body = captured.lock().unwrap().clone().expect("captured body");
+    assert!(upstream_body["input"].is_array());
+}
+
+#[tokio::test]
+async fn interactions_multi_turn_session_delta() {
+    // First turn: 1 message
+    let captured1 = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured1.clone(),
+        interactions_upstream_response("int-100", "Turn 1 reply"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    // Turn 1: send 1 message
+    let request1 = make_anthropic_request("gemini-3.1-flash-lite");
+    let response1 = post_anthropic_with_session(
+        &proxy_addr,
+        serde_json::to_value(&request1).unwrap(),
+        "sess-delta-1",
+    )
+    .await;
+    assert_eq!(response1.status(), reqwest::StatusCode::OK);
+    let body1: serde_json::Value = response1.json().await.unwrap();
+    assert_eq!(body1["id"], "int-100");
+
+    // Verify turn 1 sent exactly 1 message
+    let upstream1 = captured1.lock().unwrap().clone().expect("turn 1 body");
+    let input1 = upstream1["input"].as_array().unwrap();
+    assert_eq!(input1.len(), 1, "turn 1 should send 1 message");
+
+    // Turn 2: send 2 messages (1 old + 1 new) — same session, same proxy instance
+    // After turn 1, message_count=1. Turn 2 sends 2 messages total → delta skips 1
+    let request2 = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": "second message"}
+        ]
+    });
+    let response2 = post_anthropic_with_session(&proxy_addr, request2, "sess-delta-1").await;
+    assert_eq!(response2.status(), reqwest::StatusCode::OK);
+
+    let upstream2 = captured1.lock().unwrap().clone().expect("turn 2 body");
+    let input2 = upstream2["input"].as_array().unwrap();
+    // Delta should skip the first message: only "second message" is new
+    assert_eq!(
+        input2.len(),
+        1,
+        "turn 2 delta should send only 1 new message"
+    );
+}
+
+#[tokio::test]
+async fn interactions_error_translation_e2e() {
+    // Error translation requires a mock upstream that returns non-2xx status codes.
+    // The standard spawn_upstream helper returns 200 OK unconditionally.
+    // Full error translation testing is covered by unit tests in config.rs.
+    // This test verifies the interactions error path is exercised.
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        serde_json::json!({"error": {"message": "quota exceeded", "code": 429}}),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = make_anthropic_request("gemini-3.1-flash-lite");
+    let response = post_anthropic(&proxy_addr, serde_json::to_value(&request).unwrap()).await;
+
+    // A non-Interaction response body that's still 200 OK will cause an upstream parse error
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn interactions_token_limits_injected() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-200", "Limited reply"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+max_tokens = 42
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = make_anthropic_request("gemini-3.1-flash-lite");
+    let response = post_anthropic(&proxy_addr, serde_json::to_value(&request).unwrap()).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // Verify max_tokens was injected into the request
+    let upstream_body = captured.lock().unwrap().clone().expect("captured body");
+    let gen_config = &upstream_body["generation_config"];
+    assert_eq!(
+        gen_config["max_output_tokens"], 42,
+        "max_tokens should be injected as generation_config.max_output_tokens"
     );
 }

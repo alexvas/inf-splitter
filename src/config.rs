@@ -109,12 +109,17 @@ pub struct RouteTarget {
     pub section: String,
     pub endpoint_openai: Option<String>,
     pub endpoint_anthropic: Option<String>,
+    pub endpoint_interactions: Option<String>,
     pub api_key: Option<String>,
     pub max_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub max_completion_tokens: Option<u32>,
     pub model_names: HashSet<String>,
     pub drop_fields: DropFields,
+    pub proxy: Option<String>,
+    pub proxy_limit: Option<usize>,
+    pub control_clean_all: Option<String>,
+    pub control_extend_lifetime: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,12 +127,17 @@ struct ProviderSection {
     name: String,
     endpoint_openai: Option<String>,
     endpoint_anthropic: Option<String>,
+    endpoint_interactions: Option<String>,
     api_key: Option<String>,
     max_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
     max_completion_tokens: Option<u32>,
     model_names: HashSet<String>,
     drop_fields: DropFields,
+    proxy: Option<String>,
+    proxy_limit: Option<usize>,
+    control_clean_all: Option<String>,
+    control_extend_lifetime: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +155,7 @@ pub struct Config {
     pub upstream_timeout: Duration,
     pub max_request_body: usize,
     pub error_translation: Vec<ErrorTranslationRule>,
+    pub interactions_session_store: Option<String>,
     pub diagnostics: DiagnosticsConfig,
     default_max_tokens: Option<u32>,
     default_max_output_tokens: Option<u32>,
@@ -185,6 +196,8 @@ struct FileConfig {
     defaults: Option<DefaultConfig>,
     #[serde(default)]
     error_translation: Vec<ErrorTranslationRule>,
+    #[serde(default)]
+    interactions_session_store: Option<String>,
     diagnostics: Option<DiagnosticsConfigRaw>,
     #[serde(flatten)]
     providers: HashMap<String, ProviderConfigRaw>,
@@ -202,6 +215,7 @@ struct DefaultConfig {
 struct ProviderConfigRaw {
     endpoint_openai: Option<String>,
     endpoint_anthropic: Option<String>,
+    endpoint_interactions: Option<String>,
     models: ModelsField,
     api_key: Option<String>,
     max_tokens: Option<u32>,
@@ -209,6 +223,14 @@ struct ProviderConfigRaw {
     max_completion_tokens: Option<u32>,
     #[serde(default)]
     drop_fields: DropFields,
+    #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
+    proxy_limit: Option<String>,
+    #[serde(default)]
+    control_clean_all: Option<String>,
+    #[serde(default)]
+    control_extend_lifetime: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,14 +358,23 @@ impl Config {
                 .endpoint_anthropic
                 .map(|e| e.trim().trim_end_matches('/').to_string())
                 .filter(|e| !e.is_empty());
+            let endpoint_interactions = raw_section
+                .endpoint_interactions
+                .map(|e| e.trim().trim_end_matches('/').to_string())
+                .filter(|e| !e.is_empty());
 
-            if endpoint_openai.is_none() && endpoint_anthropic.is_none() {
+            if endpoint_openai.is_none() && endpoint_anthropic.is_none() && endpoint_interactions.is_none() {
                 return Err(ConfigError::Provider {
                     name,
-                    message: "at least one of endpoint_openai or endpoint_anthropic must be set"
+                    message: "at least one of endpoint_openai, endpoint_anthropic, or endpoint_interactions must be set"
                         .to_string(),
                 });
             }
+
+            let proxy_limit = match raw_section.proxy_limit.as_deref() {
+                Some(val) => Some(parse_byte_size_field(val)?),
+                None => None,
+            };
 
             let api_key = match raw_section.api_key {
                 Some(value) => Some(resolve_secret(&value)?),
@@ -393,12 +424,17 @@ impl Config {
                     name,
                     endpoint_openai,
                     endpoint_anthropic,
+                    endpoint_interactions,
                     api_key,
                     max_tokens: raw_section.max_tokens,
                     max_output_tokens: raw_section.max_output_tokens,
                     max_completion_tokens: raw_section.max_completion_tokens,
                     model_names,
                     drop_fields: raw_section.drop_fields,
+                    proxy: raw_section.proxy,
+                    proxy_limit,
+                    control_clean_all: raw_section.control_clean_all,
+                    control_extend_lifetime: raw_section.control_extend_lifetime,
                 },
             );
         }
@@ -409,6 +445,7 @@ impl Config {
             upstream_timeout,
             max_request_body,
             error_translation: file.error_translation,
+            interactions_session_store: file.interactions_session_store,
             default_max_tokens: defaults.max_tokens,
             default_max_output_tokens: defaults.max_output_tokens,
             default_max_completion_tokens: defaults.max_completion_tokens,
@@ -438,6 +475,7 @@ impl Config {
             section: section.name.clone(),
             endpoint_openai: section.endpoint_openai.clone(),
             endpoint_anthropic: section.endpoint_anthropic.clone(),
+            endpoint_interactions: section.endpoint_interactions.clone(),
             api_key: section.api_key.clone(),
             max_tokens: section.max_tokens.or(self.default_max_tokens),
             max_output_tokens: section.max_output_tokens.or(self.default_max_output_tokens),
@@ -446,6 +484,10 @@ impl Config {
                 .or(self.default_max_completion_tokens),
             model_names: section.model_names.clone(),
             drop_fields: section.drop_fields.clone(),
+            proxy: section.proxy.clone(),
+            proxy_limit: section.proxy_limit,
+            control_clean_all: section.control_clean_all.clone(),
+            control_extend_lifetime: section.control_extend_lifetime.clone(),
         })
     }
 
@@ -483,6 +525,7 @@ impl Config {
             max_request_body: parse_byte_size(DEFAULT_MAX_REQUEST_BODY)
                 .expect("default body limit"),
             error_translation: Vec::new(),
+            interactions_session_store: None,
             default_max_tokens: None,
             default_max_output_tokens: None,
             default_max_completion_tokens: None,
@@ -1305,5 +1348,74 @@ models = "test-model"
         let err = Config::load_from_str(raw).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("egress"), "got: {msg}");
+    }
+
+    // --- interactions config ---
+
+    #[test]
+    fn endpoint_interactions_parses() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_interactions = "https://generativelanguage.googleapis.com/v1beta/interactions?model"
+models = "gemini-3.1-flash-lite"
+"#;
+        let config = Config::load_from_str(raw).expect("interactions config");
+        let route = config.resolve_route("gemini-3.1-flash-lite").expect("route");
+        assert!(route.endpoint_interactions.is_some());
+        assert!(route.endpoint_openai.is_none());
+        assert!(route.endpoint_anthropic.is_none());
+    }
+
+    #[test]
+    fn endpoint_interactions_with_proxy_and_limits() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_interactions = "https://generativelanguage.googleapis.com/v1beta/interactions?model"
+models = "gemini-3.1-flash-lite"
+proxy = "http://127.0.0.1:8081"
+proxy_limit = "130k"
+control_clean_all = "***!___!--- очисти все сессии ---!___!***"
+control_extend_lifetime = "***!___!--- текущую сессию храни до <unix_utc> ---!___!***"
+"#;
+        let config = Config::load_from_str(raw).expect("interactions full config");
+        let route = config.resolve_route("gemini-3.1-flash-lite").expect("route");
+        assert_eq!(route.proxy.as_deref(), Some("http://127.0.0.1:8081"));
+        assert_eq!(route.proxy_limit, Some(130 * 1024));
+        assert!(route.control_clean_all.is_some());
+        assert!(route.control_extend_lifetime.is_some());
+    }
+
+    #[test]
+    fn interactions_session_store_default_none() {
+        let raw = r#"
+listen_port =3000
+
+[local]
+endpoint_interactions = "https://generativelanguage.googleapis.com/v1beta/interactions?model"
+models = "gemini-3.1-flash-lite"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert!(config.interactions_session_store.is_none());
+    }
+
+    #[test]
+    fn interactions_session_store_custom() {
+        let raw = r#"
+listen_port =3000
+interactions_session_store = "/custom/path/sessions.toml"
+
+[local]
+endpoint_interactions = "https://generativelanguage.googleapis.com/v1beta/interactions?model"
+models = "gemini-3.1-flash-lite"
+"#;
+        let config = Config::load_from_str(raw).expect("config");
+        assert_eq!(
+            config.interactions_session_store.as_deref(),
+            Some("/custom/path/sessions.toml")
+        );
     }
 }

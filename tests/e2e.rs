@@ -1017,3 +1017,115 @@ control_extend_lifetime = "{CTRL_EXTEND}"
 
     let _ = std::fs::remove_file(&session_path);
 }
+
+// ── Interactions streaming E2E ──
+
+#[tokio::test]
+async fn interactions_streaming_anthropic_sse_roundtrip() {
+    let sse_body = format!(
+        "data: {created}\n\ndata: {delta1}\n\ndata: {delta2}\n\ndata: {completed}\n\n",
+        created = serde_json::json!({
+            "event_type": "INTERACTION_CREATED",
+            "interaction": {
+                "id": "int-stream-e2e-1",
+                "status": "started",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:00:00Z",
+                "steps": []
+            }
+        }),
+        delta1 = serde_json::json!({
+            "event_type": "CONTENT_DELTA",
+            "delta": {"type": "text_delta", "text": "Hello"},
+            "index": 0
+        }),
+        delta2 = serde_json::json!({
+            "event_type": "CONTENT_DELTA",
+            "delta": {"type": "text_delta", "text": " from stream!"},
+            "index": 0
+        }),
+        completed = serde_json::json!({
+            "event_type": "INTERACTION_COMPLETED",
+            "interaction": {
+                "id": "int-stream-e2e-1",
+                "status": "completed",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:00:01Z",
+                "steps": [],
+                "usage": {"total_input_tokens": 5, "total_output_tokens": 15}
+            }
+        }),
+    );
+
+    let session_store_path =
+        std::env::temp_dir().join(format!("inf-splitter-stream-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&session_store_path);
+
+    let upstream_addr = common::spawn_stream_upstream("/v1beta/interactions", sse_body).await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#,
+        store_path = session_store_path.display(),
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let response = post_anthropic(&proxy_addr, request).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("event: message_start"),
+        "missing message_start"
+    );
+    assert!(
+        body.contains("event: content_block_start"),
+        "missing content_block_start"
+    );
+    assert!(
+        body.contains("event: content_block_delta"),
+        "missing content_block_delta"
+    );
+    assert!(body.contains("\"text\":\"Hello\""), "missing Hello text");
+    assert!(
+        body.contains("\"text\":\" from stream!\""),
+        "missing ' from stream!' text"
+    );
+    assert!(
+        body.contains("event: content_block_stop"),
+        "missing content_block_stop"
+    );
+    assert!(
+        body.contains("event: message_delta"),
+        "missing message_delta"
+    );
+    assert!(body.contains("event: message_stop"), "missing message_stop");
+    assert!(
+        body.contains("\"output_tokens\":15"),
+        "missing usage output_tokens"
+    );
+
+    let _ = std::fs::remove_file(&session_store_path);
+}

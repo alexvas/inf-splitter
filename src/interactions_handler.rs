@@ -10,6 +10,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
 use crate::auth::forward_request_headers;
@@ -18,8 +19,11 @@ use crate::control::{scan_control_messages, ControlAction};
 use crate::diagnostics::{Diagnostics, DumpBody, StatsEvent};
 use crate::error::AppError;
 use crate::interactions as interactions_lib;
-use crate::interactions_types::Interaction;
+use crate::interactions_types::{
+    ContentDelta, ContentDeltaData, Interaction, InteractionCompletedEvent, InteractionCreatedEvent,
+};
 use crate::session::SessionStore;
+use crate::sse;
 
 pub const API_REVISION: &str = "2026-05-20";
 
@@ -430,6 +434,21 @@ impl InteractionsHandler {
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
 
+        if stream {
+            return self
+                .handle_stream_response(
+                    upstream,
+                    route,
+                    session_id,
+                    new_count,
+                    model,
+                    upstream_label,
+                    request_size,
+                    direction,
+                )
+                .await;
+        }
+
         let response_body = upstream.text().await?;
         let interaction: Interaction = serde_json::from_str(&response_body).map_err(|e| {
             AppError::Upstream(format!("failed to parse interaction response: {e}"))
@@ -479,6 +498,123 @@ impl InteractionsHandler {
         });
 
         Ok((StatusCode::OK, axum::Json(resp)).into_response())
+    }
+
+    /// Stream interactions response events translated to Anthropic SSE format.
+    async fn handle_stream_response(
+        &self,
+        upstream: reqwest::Response,
+        route: &RouteTarget,
+        session_id: &str,
+        new_count: usize,
+        model: &str,
+        upstream_label: &str,
+        request_size: usize,
+        direction: &str,
+    ) -> Result<Response, AppError> {
+        let mut byte_stream = upstream.bytes_stream();
+        let mut buffer = String::new();
+        let mut interaction_id = String::new();
+        let mut total_bytes: usize = 0;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+
+        let model_owned = model.to_string();
+        let session_store = self.session_store.clone();
+        let sid = session_id.to_string();
+        let diagnostics = self.diagnostics.clone();
+        let section = route.section.clone();
+        let dir = direction.to_string();
+        let label = upstream_label.to_string();
+        let start = std::time::Instant::now();
+
+        tokio::spawn(async move {
+            while let Some(chunk_result) = byte_stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        total_bytes += chunk.len();
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                        // Parse complete SSE events separated by \n\n
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let event_str = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+
+                            for line in event_str.lines() {
+                                let data = line
+                                    .strip_prefix("data: ")
+                                    .or_else(|| line.strip_prefix("data:"));
+                                let data = match data {
+                                    Some(d) => d.trim(),
+                                    None => continue,
+                                };
+                                if data.is_empty() || data == "[DONE]" {
+                                    continue;
+                                }
+                                if let Some(events) =
+                                    translate_stream_event(data, &model_owned, &model_owned)
+                                {
+                                    for event in &events {
+                                        let payload = sse::format_sse_event(event);
+                                        if tx.send(Ok(payload)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    // Track interaction_id from INTERACTION_CREATED events
+                                    if data.contains("INTERACTION_CREATED") {
+                                        if let Ok(ev) =
+                                            serde_json::from_str::<InteractionCreatedEvent>(data)
+                                        {
+                                            interaction_id = ev.interaction.id;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("stream error: {e}"),
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            // Update session after stream completes
+            if !interaction_id.is_empty() {
+                let _ = session_store
+                    .update(&sid, interaction_id, new_count, false)
+                    .await;
+            }
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let request_id = diagnostics.new_request_id();
+            diagnostics.record_stats(&StatsEvent {
+                section,
+                request_id,
+                ts: crate::diagnostics::ts_string(),
+                direction: dir,
+                model: model_owned,
+                upstream: label,
+                status: 200,
+                duration_ms,
+                request_size_bytes: request_size,
+                response_size_bytes: Some(total_bytes),
+                streaming: true,
+                input_messages: None,
+                max_tokens: None,
+                messages_detail_ingress: None,
+                messages_detail_egress: None,
+                error: None,
+            });
+        });
+
+        let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        sse::sse_response(&HeaderMap::new(), sse_stream)
     }
 
     /// Handle split sending: break content into chunks under proxy_limit.
@@ -929,6 +1065,95 @@ fn split_by_best_delimiter(text: &str, limit: usize, delimiters: &[&str]) -> Vec
     }
 }
 
+/// Translate a single Interactions stream event (JSON data line) into
+/// one or more Anthropic `StreamEvent` objects.
+///
+/// Uses build-time generated types (`InteractionCreatedEvent`, `ContentDelta`,
+/// `InteractionCompletedEvent`) for type-safe deserialization of incoming
+/// interactions events, and `anyllm_translate::anthropic::StreamEvent` for
+/// type-safe construction of outgoing SSE payloads.
+///
+/// Returns `None` for unrecognised or malformed events (they are silently skipped).
+fn translate_stream_event(
+    data: &str,
+    _message_id: &str,
+    model: &str,
+) -> Option<Vec<anyllm_translate::anthropic::StreamEvent>> {
+    use anyllm_translate::anthropic::StreamEvent;
+
+    let peek: serde_json::Value = serde_json::from_str(data).ok()?;
+    let event_type = peek.get("event_type")?.as_str()?;
+
+    match event_type {
+        "INTERACTION_CREATED" => {
+            let ev: InteractionCreatedEvent = serde_json::from_str(data).ok()?;
+            // MessageStartData and DeltaUsage are not public in anyllm_translate;
+            // construction via serde is the intended API for complex variants.
+            let msg_start: StreamEvent = serde_json::from_value(serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": ev.interaction.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }))
+            .ok()?;
+            let block_start: StreamEvent = serde_json::from_value(serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }))
+            .ok()?;
+            Some(vec![msg_start, block_start])
+        }
+        "CONTENT_DELTA" => {
+            let ev: ContentDelta = serde_json::from_str(data).ok()?;
+            let ContentDeltaData::TextDelta(td) = ev.delta else {
+                return None;
+            };
+            let delta: StreamEvent = serde_json::from_value(serde_json::json!({
+                "type": "content_block_delta",
+                "index": ev.index,
+                "delta": {"type": "text_delta", "text": td.text}
+            }))
+            .ok()?;
+            Some(vec![delta])
+        }
+        "INTERACTION_COMPLETED" => {
+            let ev: InteractionCompletedEvent = serde_json::from_str(data).ok()?;
+            let input_tokens = ev
+                .interaction
+                .usage
+                .as_ref()
+                .and_then(|u| u.total_input_tokens)
+                .unwrap_or(0);
+            let output_tokens = ev
+                .interaction
+                .usage
+                .as_ref()
+                .and_then(|u| u.total_output_tokens)
+                .unwrap_or(0);
+            let msg_delta: StreamEvent = serde_json::from_value(serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            }))
+            .ok()?;
+            Some(vec![
+                StreamEvent::ContentBlockStop { index: 0 },
+                msg_delta,
+                StreamEvent::MessageStop {},
+            ])
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,5 +1442,65 @@ If you don't know the answer, say so honestly.";
         // "three four" = 11 > 10 → split
         // "three" = 5, "four five" = 9 → probably 3 chunks
         assert!(result.len() >= 3);
+    }
+
+    // --- Streaming SSE event translation tests (RED) ---
+
+    /// Helper to extract the data portion from an SSE event's Debug representation.
+
+    /// An interactions CONTENT_DELTA event with text content.
+    const STREAM_CONTENT_DELTA: &str =
+        r#"{"event_type":"CONTENT_DELTA","delta":{"type":"text_delta","text":"Hello"},"index":0}"#;
+
+    /// An interactions INTERACTION_CREATED event.
+    const STREAM_INTERACTION_CREATED: &str = r#"{"event_type":"INTERACTION_CREATED","interaction":{"id":"int-stream-1","status":"started","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z","steps":[]}}"#;
+
+    /// An interactions INTERACTION_COMPLETED event with usage.
+    const STREAM_INTERACTION_COMPLETED: &str = r#"{"event_type":"INTERACTION_COMPLETED","interaction":{"id":"int-stream-1","status":"completed","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:01Z","steps":[],"usage":{"total_input_tokens":10,"total_output_tokens":20}}}"#;
+
+    #[test]
+    fn translate_content_delta_produces_block_delta() {
+        let events = translate_stream_event(STREAM_CONTENT_DELTA, "msg-1", "test-model").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn translate_interaction_created_produces_message_and_block_start() {
+        let events =
+            translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "test-model").unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn translate_interaction_completed_produces_stop_events() {
+        let events =
+            translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "test-model").unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn translate_returns_none_for_unknown_event_type() {
+        let unknown = r#"{"event_type":"RANDOM_EVENT","data":"ignore"}"#;
+        let events = translate_stream_event(unknown, "msg-1", "test-model");
+        assert!(events.is_none());
+    }
+
+    #[test]
+    fn translate_returns_none_for_malformed_json() {
+        let events = translate_stream_event("not valid json", "msg-1", "test-model");
+        assert!(events.is_none());
+    }
+
+    #[test]
+    fn translate_multiple_deltas_accumulate() {
+        let events1 = translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "m").unwrap();
+        assert!(!events1.is_empty());
+        let events2 = translate_stream_event(STREAM_CONTENT_DELTA, "msg-1", "m").unwrap();
+        assert!(!events2.is_empty());
+        let delta2 = r#"{"event_type":"CONTENT_DELTA","delta":{"type":"text_delta","text":" World"},"index":0}"#;
+        let events3 = translate_stream_event(delta2, "msg-1", "m").unwrap();
+        assert!(!events3.is_empty());
+        let events4 = translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "m").unwrap();
+        assert_eq!(events4.len(), 3);
     }
 }

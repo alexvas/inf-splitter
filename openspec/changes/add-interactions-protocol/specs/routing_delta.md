@@ -18,15 +18,36 @@ When a model resolves to a section with `endpoint_interactions` set, requests ar
 
 When both `endpoint_interactions` and another endpoint are set, the ingress protocol matching its direct endpoint takes priority.
 
-#### Scenario: Anthropic ingress → Interactions
-- GIVEN section has only `endpoint_interactions`
-- WHEN `POST /v1/messages` arrives
-- THEN the request is translated Anthropic→Interactions and sent upstream
+The handler MUST translate the response back to the client's ingress protocol:
 
-#### Scenario: OpenAI ingress → Interactions
+| Ingress | Non-streaming response | Streaming response |
+|---------|----------------------|--------------------|
+| Anthropic | `MessageResponse` JSON | `StreamEvent` SSE |
+| OpenAI | `ChatCompletionResponse` JSON | `ChatCompletionChunk` SSE |
+
+#### Scenario: Anthropic ingress → Interactions (non-streaming)
 - GIVEN section has only `endpoint_interactions`
-- WHEN `POST /v1/chat/completions` arrives
+- WHEN `POST /v1/messages` arrives without `stream: true`
+- THEN the request is translated Anthropic→Interactions and sent upstream
+- AND the response is translated Interactions→Anthropic format
+
+#### Scenario: OpenAI ingress → Interactions (non-streaming)
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/chat/completions` arrives without `stream: true`
 - THEN the request is translated OpenAI→Interactions and sent upstream
+- AND the response is translated Interactions→OpenAI format
+
+#### Scenario: Anthropic ingress → Interactions (streaming)
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/messages` arrives with `stream: true`
+- THEN the request is translated Anthropic→Interactions and sent upstream
+- AND the streaming response is translated Interactions→Anthropic SSE
+
+#### Scenario: OpenAI ingress → Interactions (streaming)
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/chat/completions` arrives with `stream: true`
+- THEN the request is translated OpenAI→Interactions and sent upstream
+- AND the streaming response is translated Interactions→OpenAI SSE chunks
 
 #### Scenario: Both endpoints — ingress preference
 - GIVEN section has `endpoint_interactions` and `endpoint_anthropic`

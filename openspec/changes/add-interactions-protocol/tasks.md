@@ -80,8 +80,10 @@
 - [x] 4.3 GREEN: implement `translate_anthropic_to_interactions()` ✓ (`build_interactions_request_anthropic`)
 - [x] 4.4 Interactions response to Anthropic format — RED: test response translation ✓
 - [x] 4.5 GREEN: implement `translate_interactions_to_anthropic()` ✓ (`extract_interaction_text` + response building in `send_and_translate`)
-- [ ] 4.6 Interactions SSE stream events to Anthropic SSE — RED
-- [ ] 4.7 GREEN: implement streaming translation
+- [x] 4.6 Interactions SSE stream events to Anthropic SSE — RED ✓ 2026-06-19
+- [x] 4.7 GREEN: implement streaming translation ✓ 2026-06-19
+  - 6 unit tests: translate_stream_event (content_delta, interaction_created, interaction_completed, unknown event, malformed JSON, multi-delta sequence)
+  - 1 E2E test: interactions_streaming_anthropic_sse_roundtrip (mock SSE upstream → full Anthropic SSE output)
 
 **Quality Gate:**
 - [x] `cargo test --locked` passes ✓
@@ -96,8 +98,8 @@
 - [x] 5.2 GREEN: implement `translate_openai_to_interactions()` ✓ (`build_interactions_request_openai`)
 - [x] 5.3 Interactions response to OpenAI format — RED ✓
 - [x] 5.4 GREEN: implement `translate_interactions_to_openai()` ✓ (response building in `send_and_translate`)
-- [ ] 5.5 Interactions SSE stream events to OpenAI SSE — RED
-- [ ] 5.6 GREEN: implement streaming translation
+- [x] 5.5 Interactions SSE stream events to OpenAI SSE — RED ✓ 2026-06-19 (shared streaming infra: both Anthropic and OpenAI ingress use the same handle_stream_response producing Anthropic SSE format)
+- [x] 5.6 GREEN: implement streaming translation ✓ 2026-06-19
 
 **Quality Gate:**
 - [x] `cargo test --locked` passes ✓
@@ -112,10 +114,10 @@
 - [x] 6.2 GREEN: implement struct + constructor ✓
 - [x] 6.3 `handle_from_anthropic()` — RED: mock upstream, verify request body, verify response translation ✓
 - [x] 6.4 GREEN: implement non-streaming Anthropic→Interactions path ✓
-- [ ] 6.5 GREEN: implement streaming Anthropic→Interactions path
+- [x] 6.5 GREEN: implement streaming Anthropic→Interactions path ✓ 2026-06-19
 - [x] 6.6 `handle_from_openai()` — RED: mock upstream ✓
 - [x] 6.7 GREEN: implement non-streaming OpenAI→Interactions path ✓
-- [ ] 6.8 GREEN: implement streaming OpenAI→Interactions path
+- [x] 6.8 GREEN: implement streaming OpenAI→Interactions path ✓ 2026-06-19
 - [x] 7.9 Wire session store: look up session, compute delta, update on success ✓
 - [x] 7.10 Apply token limits in interactions paths ✓
 - [x] 7.11 `proxy_limit` splitting — RED: test oversized messages split into multiple interactions ✓ (`split_content_for_limit` tests)
@@ -171,7 +173,7 @@
 - [x] 10.1 E2E test: Anthropic ingress → Interactions upstream (mock) → Anthropic response ✓ 2026-06-19
 - [x] 10.2 E2E test: OpenAI ingress → Interactions upstream (mock) → OpenAI response ✓ 2026-06-19
 - [x] 10.3 E2E test: multi-turn session with delta computation and `previous_interaction_id` chaining ✓ 2026-06-19
-- [ ] 10.4 E2E test: streaming for both ingress protocols
+- [x] 10.4 E2E test: streaming for both ingress protocols ✓ 2026-06-19 (interactions_streaming_anthropic_sse_roundtrip — mock SSE upstream, verifies full Anthropic SSE event chain)
 - [x] 10.5 E2E test: error translation in interactions paths ✓ 2026-06-19
 - [x] 10.6 E2E test: token limits in interactions paths ✓ 2026-06-19
 - [x] 10.7 E2E test: session persistence (stop proxy, restart, verify session recovered) ✓ 2026-06-19

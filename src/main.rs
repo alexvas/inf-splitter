@@ -13,6 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let diagnostics = Diagnostics::new(config.diagnostics.clone());
 
     info!(
+        version = env!("CARGO_PKG_VERSION"),
         listen = %config.listen_addr,
         upstream_timeout_secs = config.upstream_timeout.as_secs(),
         max_request_body = config.max_request_body,

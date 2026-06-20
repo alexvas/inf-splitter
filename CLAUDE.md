@@ -86,6 +86,7 @@ Both streaming and non-streaming paths are handled. `stream_options` is always d
 
 ## Scope constraints
 
+- Serialization and deserialization must use strict type-checked structs from the protocol schemas whenever possible — never raw `json!()` or string snippets when a typed constructor or serde struct exists
 - Ingress is **no-auth** by design; do not add authentication without explicit product decision
 - Default listen address is `127.0.0.1:{port}` from TOML (no `LISTEN_ADDR` env var)
 - Limits use suffix notation: `s`/`m` for durations, `k`/`m` for byte sizes

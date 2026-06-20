@@ -133,6 +133,56 @@ All error responses follow the Anthropic API error shape: `{"type":"error","erro
 - WHEN the proxy relays it to the client
 - THEN it uses the Anthropic error JSON format
 
+## Requirement: Interactions Dispatch
+
+When a model resolves to a section with `endpoint_interactions` set, requests are routed to `InteractionsHandler`:
+
+| Ingress | Interactions endpoint set | Action |
+|---------|--------------------------|--------|
+| OpenAI | Yes | `InteractionsHandler::handle_from_openai()` → returns OpenAI format |
+| Anthropic | Yes | `InteractionsHandler::handle_from_anthropic()` → returns Anthropic format |
+
+When both `endpoint_interactions` and another endpoint are set, the ingress protocol matching its direct endpoint takes priority.
+
+### Scenario: Anthropic ingress → Interactions
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/messages` arrives
+- THEN the request is translated Anthropic→Interactions and sent upstream
+
+### Scenario: OpenAI ingress → Interactions
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/chat/completions` arrives
+- THEN the request is translated OpenAI→Interactions and sent upstream
+
+## Requirement: Response Translation to Client Protocol
+
+When `InteractionsHandler` receives an upstream response, it translates the response back to the client's ingress protocol:
+
+| Ingress | Non-streaming response | Streaming response |
+|---------|----------------------|--------------------|
+| Anthropic | `MessageResponse` JSON (`{"type":"message","role":"assistant",...}`) | `StreamEvent` SSE (`event: content_block_delta\n...`) |
+| OpenAI | `ChatCompletionResponse` JSON (`{"object":"chat.completion","choices":[...],...}`) | `ChatCompletionChunk` SSE (`data: {json}\n\ndata: [DONE]\n\n`) |
+
+### Scenario: Anthropic ingress → Interactions → Anthropic response (non-streaming)
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/messages` arrives without `stream: true`
+- THEN the upstream `Interaction` is translated to an Anthropic `MessageResponse` JSON
+
+### Scenario: OpenAI ingress → Interactions → OpenAI response (non-streaming)
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/chat/completions` arrives without `stream: true`
+- THEN the upstream `Interaction` is translated to an OpenAI `ChatCompletionResponse` JSON
+
+### Scenario: Anthropic ingress → Interactions → Anthropic SSE (streaming)
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/messages` arrives with `stream: true`
+- THEN upstream SSE events are translated to Anthropic `StreamEvent` SSE
+
+### Scenario: OpenAI ingress → Interactions → OpenAI SSE (streaming)
+- GIVEN section has only `endpoint_interactions`
+- WHEN `POST /v1/chat/completions` arrives with `stream: true`
+- THEN upstream SSE events are converted to OpenAI `ChatCompletionChunk` SSE via `ReverseStreamingTranslator`
+
 ## Requirement: Graceful Shutdown
 
 `main.rs` handles SIGTERM/SIGINT via `tokio::signal`. On shutdown signal, the server stops accepting new connections and drains in-flight requests before exiting. This is the standard Axum graceful shutdown pattern.

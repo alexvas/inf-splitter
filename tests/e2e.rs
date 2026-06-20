@@ -527,9 +527,10 @@ models = "gemini-3.1-flash-lite"
         "got status {status}, body: {body_text}"
     );
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("valid json");
-    assert_eq!(body["type"], "message");
-    assert_eq!(body["role"], "assistant");
-    assert!(body["content"][0]["text"]
+    // OpenAI ingress → Interactions → OpenAI response format
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert!(body["choices"][0]["message"]["content"]
         .as_str()
         .unwrap()
         .contains("OpenAI→Interactions reply"));
@@ -1128,4 +1129,150 @@ models = "gemini-3.1-flash-lite"
     );
 
     let _ = std::fs::remove_file(&session_store_path);
+}
+
+// ── Interactions → OpenAI response translation (RED) ──
+
+#[tokio::test]
+async fn interactions_openai_ingress_returns_openai_format() {
+    let session_path = std::env::temp_dir().join(format!(
+        "inf-splitter-openai-resp-{}.toml",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&session_path);
+
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-oa-1", "OpenAI format reply"),
+    )
+    .await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#,
+        store_path = session_path.display(),
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = make_openai_request("gemini-3.1-flash-lite");
+    let response = post_openai(&proxy_addr, serde_json::to_value(&request).unwrap()).await;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(status, reqwest::StatusCode::OK, "got {status}: {body}");
+
+    // Response must be valid OpenAI ChatCompletionResponse
+    let typed: ChatCompletionResponse =
+        serde_json::from_str(&body).expect("must deserialize as ChatCompletionResponse");
+    assert_eq!(typed.object, "chat.completion");
+    assert!(!typed.choices.is_empty());
+    match &typed.choices[0].message.content {
+        Some(ChatContent::Text(text)) => assert_eq!(text, "OpenAI format reply"),
+        other => panic!("expected ChatContent::Text, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&session_path);
+}
+
+#[tokio::test]
+async fn interactions_openai_streaming_returns_openai_sse() {
+    let sse_body = format!(
+        "data: {created}\n\ndata: {delta}\n\ndata: {completed}\n\n",
+        created = serde_json::json!({
+            "event_type": "INTERACTION_CREATED",
+            "interaction": {
+                "id": "int-oa-stream-1",
+                "status": "started",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:00:00Z",
+                "steps": []
+            }
+        }),
+        delta = serde_json::json!({
+            "event_type": "CONTENT_DELTA",
+            "delta": {"type": "text_delta", "text": "OpenAI stream reply"},
+            "index": 0
+        }),
+        completed = serde_json::json!({
+            "event_type": "INTERACTION_COMPLETED",
+            "interaction": {
+                "id": "int-oa-stream-1",
+                "status": "completed",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:00:01Z",
+                "steps": [],
+                "usage": {"total_input_tokens": 3, "total_output_tokens": 8}
+            }
+        }),
+    );
+
+    let session_path = std::env::temp_dir().join(format!(
+        "inf-splitter-oa-stream-{}.toml",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&session_path);
+
+    let upstream_addr = common::spawn_stream_upstream("/v1beta/interactions", sse_body).await;
+
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#,
+        store_path = session_path.display(),
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let response = post_openai(&proxy_addr, request).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+
+    let body = response.text().await.unwrap();
+    // OpenAI SSE must have "data: " prefix, NOT "event: " prefix (Anthropic format)
+    assert!(
+        body.contains("data: "),
+        "must have data: prefix for OpenAI SSE, got: {body}"
+    );
+    assert!(
+        !body.contains("event: "),
+        "must NOT have event: prefix (Anthropic format), got: {body}"
+    );
+    assert!(
+        body.contains("chat.completion.chunk"),
+        "must contain chat.completion.chunk object type"
+    );
+    assert!(
+        body.contains("OpenAI stream reply"),
+        "must contain the streamed text"
+    );
+    assert!(body.contains("[DONE]"), "must end with [DONE]");
+
+    let _ = std::fs::remove_file(&session_path);
 }

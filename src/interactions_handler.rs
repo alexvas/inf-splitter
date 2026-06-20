@@ -14,7 +14,7 @@ use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
 use crate::auth::forward_request_headers;
-use crate::config::{Config, RouteTarget};
+use crate::config::{Config, Protocol, RouteTarget};
 use crate::control::{scan_control_messages, ControlAction};
 use crate::diagnostics::{Diagnostics, DumpBody, StatsEvent};
 use crate::error::AppError;
@@ -24,6 +24,10 @@ use crate::interactions_types::{
 };
 use crate::session::SessionStore;
 use crate::sse;
+use anyllm_translate::anthropic::{ContentBlock, MessageResponse, Role, StopReason, Usage};
+use anyllm_translate::openai::{
+    ChatCompletionResponse, ChatContent, ChatMessage, ChatRole, ChatUsage, Choice, FinishReason,
+};
 
 pub const API_REVISION: &str = "2026-05-20";
 
@@ -220,6 +224,7 @@ impl InteractionsHandler {
             endpoint,
             body.len(),
             "anthropic->interactions",
+            Protocol::Anthropic,
         )
         .await
     }
@@ -374,6 +379,7 @@ impl InteractionsHandler {
             endpoint,
             body.len(),
             "openai->interactions",
+            Protocol::OpenAi,
         )
         .await
     }
@@ -391,6 +397,7 @@ impl InteractionsHandler {
         upstream_label: &str,
         request_size: usize,
         direction: &str,
+        ingress: Protocol,
     ) -> Result<Response, AppError> {
         let builder = build_interactions_headers(
             self.http
@@ -445,6 +452,7 @@ impl InteractionsHandler {
                     upstream_label,
                     request_size,
                     direction,
+                    ingress,
                 )
                 .await;
         }
@@ -484,23 +492,74 @@ impl InteractionsHandler {
 
         // Translate response back to ingress protocol
         let text = interactions_lib::extract_interaction_text(&interaction);
-        let resp = serde_json::json!({
-            "id": interaction.id,
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": [{"type": "text", "text": text}],
-            "stop_reason": "end_turn",
-            "usage": {
-                "input_tokens": interaction.usage.as_ref().and_then(|u| u.total_input_tokens).unwrap_or(0),
-                "output_tokens": interaction.usage.as_ref().and_then(|u| u.total_output_tokens).unwrap_or(0)
+        let input_tokens = interaction
+            .usage
+            .as_ref()
+            .and_then(|u| u.total_input_tokens)
+            .unwrap_or(0);
+        let output_tokens = interaction
+            .usage
+            .as_ref()
+            .and_then(|u| u.total_output_tokens)
+            .unwrap_or(0);
+
+        let resp = match ingress {
+            Protocol::OpenAi => {
+                let typed = ChatCompletionResponse {
+                    id: interaction.id.clone(),
+                    object: "chat.completion".to_string(),
+                    model: model.to_string(),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: ChatMessage {
+                            role: ChatRole::Assistant,
+                            content: Some(ChatContent::Text(text.clone())),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            refusal: None,
+                            reasoning_content: None,
+                        },
+                        finish_reason: Some(FinishReason::Stop),
+                        logprobs: None,
+                    }],
+                    usage: Some(ChatUsage {
+                        prompt_tokens: input_tokens as u32,
+                        completion_tokens: output_tokens as u32,
+                        total_tokens: (input_tokens + output_tokens) as u32,
+                        completion_tokens_details: None,
+                        prompt_tokens_details: None,
+                    }),
+                    created: None,
+                    system_fingerprint: None,
+                    service_tier: None,
+                };
+                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
             }
-        });
+            Protocol::Anthropic => {
+                let typed = MessageResponse {
+                    id: interaction.id.clone(),
+                    response_type: "message".to_string(),
+                    role: Role::Assistant,
+                    model: model.to_string(),
+                    content: vec![ContentBlock::Text { text: text.clone() }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: Usage {
+                        input_tokens: input_tokens as u32,
+                        output_tokens: output_tokens as u32,
+                        ..Default::default()
+                    },
+                    created: None,
+                };
+                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+            }
+        };
 
         Ok((StatusCode::OK, axum::Json(resp)).into_response())
     }
 
-    /// Stream interactions response events translated to Anthropic SSE format.
+    /// Stream interactions response events translated to the client's protocol.
     async fn handle_stream_response(
         &self,
         upstream: reqwest::Response,
@@ -511,6 +570,7 @@ impl InteractionsHandler {
         upstream_label: &str,
         request_size: usize,
         direction: &str,
+        ingress: Protocol,
     ) -> Result<Response, AppError> {
         let mut byte_stream = upstream.bytes_stream();
         let mut buffer = String::new();
@@ -527,8 +587,12 @@ impl InteractionsHandler {
         let dir = direction.to_string();
         let label = upstream_label.to_string();
         let start = std::time::Instant::now();
+        let is_openai = matches!(ingress, Protocol::OpenAi);
 
         tokio::spawn(async move {
+            let mut translator: Option<
+                anyllm_translate::mapping::reverse_streaming_map::ReverseStreamingTranslator,
+            > = None;
             while let Some(chunk_result) = byte_stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
@@ -555,9 +619,40 @@ impl InteractionsHandler {
                                     translate_stream_event(data, &model_owned, &model_owned)
                                 {
                                     for event in &events {
-                                        let payload = sse::format_sse_event(event);
-                                        if tx.send(Ok(payload)).await.is_err() {
-                                            return;
+                                        if is_openai {
+                                            // Pipe StreamEvent through ReverseStreamingTranslator
+                                            // to produce OpenAI ChatCompletionChunk SSE.
+                                            if matches!(
+                                                event,
+                                                anyllm_translate::anthropic::StreamEvent::MessageStart { .. }
+                                            ) {
+                                                if let anyllm_translate::anthropic::StreamEvent::MessageStart { message } = event {
+                                                    translator = Some(
+                                                        anyllm_translate::new_reverse_stream_translator(
+                                                            message.id.clone(),
+                                                            model_owned.clone(),
+                                                        ),
+                                                    );
+                                                }
+                                                continue;
+                                            }
+                                            if let Some(ref mut active) = translator {
+                                                if let Some(chunk) =
+                                                    active.process_event(event).into_iter().next()
+                                                {
+                                                    let payload =
+                                                        sse::format_openai_sse_chunk(&chunk);
+                                                    let payload = bytes::Bytes::from(payload);
+                                                    if tx.send(Ok(payload)).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let payload = sse::format_sse_event(event);
+                                            if tx.send(Ok(payload)).await.is_err() {
+                                                return;
+                                            }
                                         }
                                     }
                                     // Track interaction_id from INTERACTION_CREATED events
@@ -582,6 +677,11 @@ impl InteractionsHandler {
                         return;
                     }
                 }
+            }
+
+            // Flush remaining OpenAI chunks on stream end
+            if translator.is_some() {
+                let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
             }
 
             // Update session after stream completes

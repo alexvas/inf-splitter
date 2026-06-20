@@ -89,4 +89,38 @@ mod tests {
         assert_eq!(usage.total_input_tokens, Some(50));
         assert_eq!(usage.total_output_tokens, Some(100));
     }
+
+    #[test]
+    fn content_serialization_has_correct_type_field() {
+        let c = Content::TextContent(TextContent {
+            text: "hello".into(),
+            annotations: None,
+            r#type: serde_json::Value::Null,
+        });
+        let v = serde_json::to_value(&c).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.get("type").and_then(|v| v.as_str()),
+            Some("text"),
+            "Content serialization must produce \"type\": \"text\", not null"
+        );
+    }
+
+    #[test]
+    fn sse_event_serialization_has_correct_event_type_field() {
+        let ev = InteractionSseEvent::InteractionStatusUpdate(InteractionStatusUpdate {
+            event_id: None,
+            interaction_id: "int1".into(),
+            event_type: serde_json::Value::Null,
+            metadata: None,
+            status: "running".into(),
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.get("event_type").and_then(|v| v.as_str()),
+            Some("interaction_status_update"),
+            "InteractionSseEvent serialization must preserve event_type tag, not null"
+        );
+    }
 }

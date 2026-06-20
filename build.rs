@@ -67,14 +67,26 @@ fn main() {
 
     code.push_str(&types_code);
 
-    // Post-process: add #[serde(default)] to r#type: serde_json::Value fields.
-    // These fields capture the JSON "type" discriminator when a struct is used
-    // both standalone and as a variant in a #[serde(tag = "type")] enum.
-    // Without default, deserialization of enum variants fails because the tag
-    // is consumed by the enum and the struct's r#type field finds no value.
+    // Post-process: add #[serde(default, skip_serializing_if = "...")] to type fields.
+    // These fields capture the JSON "type" / "event_type" discriminator when a struct
+    // is used both standalone and as a variant in a tagged enum.
+    // - #[serde(default)] is needed for deserialization: the enum tag consumes the field,
+    //   so the struct finds no value.
+    // - skip_serializing_if = "Value::is_null" is needed for serialization: without it,
+    //   the struct writes "type": null (or "event_type": null), overwriting the enum's
+    //   discriminator value in the JSON map.
     let code = code.replace(
         "pub r#type: serde_json::Value,",
-        "#[serde(default)]\n    pub r#type: serde_json::Value,",
+        "#[serde(default, skip_serializing_if = \"serde_json::Value::is_null\")]\n    pub r#type: serde_json::Value,",
+    );
+    let code = code.replace(
+        "pub event_type: serde_json::Value,",
+        "#[serde(default, skip_serializing_if = \"serde_json::Value::is_null\")]\n    pub event_type: serde_json::Value,",
+    );
+    // Suppress clippy::large_enum_variant for large oneOf types
+    let code = code.replace(
+        "pub enum Tool {",
+        "#[allow(clippy::large_enum_variant)]\npub enum Tool {",
     );
 
     // Write to OUT_DIR
@@ -85,7 +97,7 @@ fn main() {
     let mod_path = out_dir.join("interactions_types_mod.rs");
     fs::write(
         &mod_path,
-        format!("include!(concat!(env!(\"OUT_DIR\"), \"/interactions_types.rs\"));\n"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/interactions_types.rs\"));\n",
     )
     .expect("failed to write mod file");
 }
@@ -95,6 +107,7 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum ResolvedType {
     Object {
         description: Option<String>,
@@ -142,7 +155,7 @@ fn resolve_schema(
 
     // Handle $ref
     if let Some(ref_path) = schema.get("$ref").and_then(|v| v.as_str()) {
-        let ref_name = ref_path.split('/').last().unwrap();
+        let ref_name = ref_path.split('/').next_back().unwrap();
         if let Some(ref_schema) = all_schemas.get(ref_name) {
             return resolve_schema(ref_name, ref_schema, all_schemas, visited);
         }
@@ -160,7 +173,7 @@ fn resolve_schema(
                     }
                 }
             }
-            if let Some(req) = part.get("required") {
+            if part.get("required").is_some() {
                 // handled separately
             }
         }
@@ -203,7 +216,7 @@ fn resolve_schema(
                             .as_str()
                             .unwrap_or("")
                             .split('/')
-                            .last()
+                            .next_back()
                             .unwrap_or("")
                             .to_string();
                         (tag.clone(), name)
@@ -221,7 +234,7 @@ fn resolve_schema(
                 .map(String::from);
 
             if let Some(ref_path) = variant.get("$ref").and_then(|v| v.as_str()) {
-                let ref_name = ref_path.split('/').last().unwrap();
+                let ref_name = ref_path.split('/').next_back().unwrap();
                 let vname = variant_name.unwrap_or_else(|| ref_name.to_string());
                 // Use explicit mapping if available, otherwise derive from variant name
                 let tag = if mapping.is_empty() {
@@ -344,7 +357,7 @@ fn resolve_schema(
     if schema.get("type").and_then(|v| v.as_str()) == Some("array") {
         if let Some(items) = schema.get("items") {
             let items_type = if let Some(ref_path) = items.get("$ref").and_then(|v| v.as_str()) {
-                let ref_name = ref_path.split('/').last().unwrap();
+                let ref_name = ref_path.split('/').next_back().unwrap();
                 PropertyType {
                     variant_name: None,
                     variant_tag: None,
@@ -381,7 +394,7 @@ fn resolve_schema(
 
 fn rust_type_from_schema(schema: &serde_json::Value) -> String {
     if let Some(ref_path) = schema.get("$ref").and_then(|v| v.as_str()) {
-        return ref_path.split('/').last().unwrap().to_string();
+        return ref_path.split('/').next_back().unwrap().to_string();
     }
 
     match schema.get("type").and_then(|v| v.as_str()) {
@@ -471,7 +484,7 @@ fn generate_struct(
         }
         let rust_name = to_snake_case(prop_name);
         let serde_attr = if prop.is_optional {
-            format!("    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n")
+            "    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n".to_string()
         } else {
             String::new()
         };
@@ -556,16 +569,12 @@ fn generate_string_enum(name: &str, description: &Option<String>, values: &[Stri
         }
     }
 
-    code.push_str(&format!(
-        "#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n"
-    ));
-    code.push_str(&format!(
-        "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]\n"
-    ));
+    code.push_str("#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n");
+    code.push_str("#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]\n");
     code.push_str(&format!("pub enum {} {{\n", to_pascal_case(name)));
 
     for value in values {
-        let variant = value.replace('/', "_").replace('.', "_").replace('-', "_");
+        let variant = value.replace(['/', '.', '-'], "_");
         code.push_str(&format!("    {},\n", variant));
     }
 
@@ -587,7 +596,7 @@ fn collect_deps(
     if let Some(rt) = all_types.get(name) {
         match rt {
             ResolvedType::Object { properties, .. } => {
-                for (_, prop) in properties {
+                for prop in properties.values() {
                     let type_name = prop.rust_type.replace("Vec<", "").replace('>', "");
                     if all_types.contains_key(&type_name) && !visited.contains(&type_name) {
                         let sub_deps = collect_deps(&type_name, all_types, visited);

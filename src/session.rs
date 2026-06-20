@@ -206,8 +206,8 @@ impl SessionStore {
 /// `incoming` is the total count in the current request.
 pub fn compute_delta(delivered: usize, incoming: usize) -> (usize, usize) {
     if incoming <= delivered {
-        // No new messages — client may have reset or is replaying
-        (delivered, delivered)
+        // Client may have reset context — re-send all current messages
+        (0, incoming)
     } else {
         (delivered, incoming)
     }
@@ -244,17 +244,19 @@ mod tests {
 
     #[test]
     fn compute_delta_returns_same_when_no_new_messages() {
+        // Same count as delivered — re-send all since we can't distinguish
+        // replay of old messages from a fresh set of the same size
         let (start, new_count) = compute_delta(5, 5);
-        assert_eq!(start, 5);
+        assert_eq!(start, 0);
         assert_eq!(new_count, 5);
     }
 
     #[test]
     fn compute_delta_handles_reset() {
-        // Client sends fewer messages than before — context was reset
+        // Client sends fewer messages than before — context was reset, re-send all
         let (start, new_count) = compute_delta(5, 2);
-        assert_eq!(start, 5); // all messages need to be re-sent
-        assert_eq!(new_count, 5); // unchanged
+        assert_eq!(start, 0); // re-send from beginning
+        assert_eq!(new_count, 2); // track current message count
     }
 
     // --- Delta accounting with proxy_limit splits ---
@@ -306,10 +308,10 @@ mod tests {
     #[test]
     fn delta_no_new_messages_after_split() {
         // 7 messages delivered across 3 chunks (3+2+2)
-        // Next request: same 7 messages (no new ones)
+        // Next request: same 7 messages (can't distinguish replay from new set of same size)
         let (start, new_count) = compute_delta(7, 7);
-        assert_eq!(start, 7);
-        assert_eq!(new_count, 7); // delta empty — nothing new to send
+        assert_eq!(start, 0); // re-send all — can't tell if replay or fresh
+        assert_eq!(new_count, 7);
     }
 
     #[test]
@@ -317,8 +319,8 @@ mod tests {
         // 6 messages delivered across 2 chunks (3+3)
         // Next request: only 2 messages (client reset conversation)
         let (start, new_count) = compute_delta(6, 2);
-        assert_eq!(start, 6); // all 6 prior messages need re-sending
-        assert_eq!(new_count, 6); // new_count stays at 6 (re-send all)
+        assert_eq!(start, 0); // re-send from beginning
+        assert_eq!(new_count, 2); // track current message count
     }
 
     #[tokio::test]

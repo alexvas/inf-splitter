@@ -4,6 +4,8 @@
 //! session state management, control messages, proxy_limit splitting,
 //! and response translation back to the client's protocol.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -13,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
+use crate::auth::forward_request_headers;
 use crate::config::{Config, Protocol, RouteTarget};
 use crate::control::{scan_control_messages, ControlAction};
 use crate::diagnostics::{Diagnostics, StatsEvent};
@@ -108,20 +111,41 @@ impl InteractionsHandler {
                     })?;
                     let mut cancelled = 0usize;
                     let mut deleted = 0usize;
+                    let mut errors: Vec<String> = Vec::new();
                     for (_sid, state) in &all {
                         if !state.interaction_id.is_empty() {
-                            let _ = self.cancel_interaction(&state.interaction_id, route).await;
-                            let _ = self.delete_interaction(&state.interaction_id, route).await;
-                            cancelled += 1;
-                            deleted += 1;
+                            if let Err(e) =
+                                self.cancel_interaction(&state.interaction_id, route).await
+                            {
+                                errors.push(format!("cancel {}: {}", state.interaction_id, e));
+                            } else {
+                                cancelled += 1;
+                            }
+                            if let Err(e) =
+                                self.delete_interaction(&state.interaction_id, route).await
+                            {
+                                errors.push(format!("delete {}: {}", state.interaction_id, e));
+                            } else {
+                                deleted += 1;
+                            }
                         }
                     }
-                    let msg = format!(
-                        "Cleaned all {} sessions ({} cancelled, {} deleted)",
-                        all.len(),
-                        cancelled,
-                        deleted
-                    );
+                    let msg = if errors.is_empty() {
+                        format!(
+                            "Cleaned all {} sessions ({} cancelled, {} deleted)",
+                            all.len(),
+                            cancelled,
+                            deleted
+                        )
+                    } else {
+                        format!(
+                            "Cleaned all {} sessions ({} cancelled, {} deleted). Errors: {}",
+                            all.len(),
+                            cancelled,
+                            deleted,
+                            errors.join("; ")
+                        )
+                    };
                     return Ok((
                         StatusCode::OK,
                         axum::Json(serde_json::json!({"status": "ok", "message": msg})),
@@ -149,9 +173,18 @@ impl InteractionsHandler {
         let incoming_count = messages.len() - control_result.stripped_count;
         let (start_index, new_count) = crate::session::compute_delta(delivered, incoming_count);
 
+        // Use cleaned messages (control messages removed) for the upstream request
+        let request_body_val = if control_result.stripped_count > 0 {
+            let mut cleaned = body_val.clone();
+            cleaned["messages"] = serde_json::json!(control_result.cleaned_messages);
+            cleaned
+        } else {
+            body_val.clone()
+        };
+
         // Build the request
         let req_body_lib = interactions_lib::build_interactions_request_anthropic(
-            &body_val,
+            &request_body_val,
             start_index,
             route,
             if session.interaction_id.is_empty() {
@@ -207,6 +240,8 @@ impl InteractionsHandler {
                         endpoint,
                         body.len(),
                         "anthropic->interactions",
+                        request_headers,
+                        Protocol::Anthropic,
                     )
                     .await;
             }
@@ -224,6 +259,7 @@ impl InteractionsHandler {
             body.len(),
             "anthropic->interactions",
             Protocol::Anthropic,
+            request_headers,
         )
         .await
     }
@@ -268,20 +304,41 @@ impl InteractionsHandler {
                     })?;
                     let mut cancelled = 0usize;
                     let mut deleted = 0usize;
+                    let mut errors: Vec<String> = Vec::new();
                     for (_sid, state) in &all {
                         if !state.interaction_id.is_empty() {
-                            let _ = self.cancel_interaction(&state.interaction_id, route).await;
-                            let _ = self.delete_interaction(&state.interaction_id, route).await;
-                            cancelled += 1;
-                            deleted += 1;
+                            if let Err(e) =
+                                self.cancel_interaction(&state.interaction_id, route).await
+                            {
+                                errors.push(format!("cancel {}: {}", state.interaction_id, e));
+                            } else {
+                                cancelled += 1;
+                            }
+                            if let Err(e) =
+                                self.delete_interaction(&state.interaction_id, route).await
+                            {
+                                errors.push(format!("delete {}: {}", state.interaction_id, e));
+                            } else {
+                                deleted += 1;
+                            }
                         }
                     }
-                    let msg = format!(
-                        "Cleaned all {} sessions ({} cancelled, {} deleted)",
-                        all.len(),
-                        cancelled,
-                        deleted
-                    );
+                    let msg = if errors.is_empty() {
+                        format!(
+                            "Cleaned all {} sessions ({} cancelled, {} deleted)",
+                            all.len(),
+                            cancelled,
+                            deleted
+                        )
+                    } else {
+                        format!(
+                            "Cleaned all {} sessions ({} cancelled, {} deleted). Errors: {}",
+                            all.len(),
+                            cancelled,
+                            deleted,
+                            errors.join("; ")
+                        )
+                    };
                     return Ok((
                         StatusCode::OK,
                         axum::Json(serde_json::json!({"status": "ok", "message": msg})),
@@ -308,8 +365,17 @@ impl InteractionsHandler {
         let incoming_count = messages.len() - control_result.stripped_count;
         let (start_index, new_count) = crate::session::compute_delta(delivered, incoming_count);
 
+        // Use cleaned messages (control messages removed) for the upstream request
+        let request_body_val = if control_result.stripped_count > 0 {
+            let mut cleaned = body_val.clone();
+            cleaned["messages"] = serde_json::json!(control_result.cleaned_messages);
+            cleaned
+        } else {
+            body_val.clone()
+        };
+
         let req_body_lib = interactions_lib::build_interactions_request_openai(
-            &body_val,
+            &request_body_val,
             start_index,
             route,
             if session.interaction_id.is_empty() {
@@ -362,6 +428,8 @@ impl InteractionsHandler {
                         endpoint,
                         body.len(),
                         "openai->interactions",
+                        request_headers,
+                        Protocol::OpenAi,
                     )
                     .await;
             }
@@ -379,11 +447,13 @@ impl InteractionsHandler {
             body.len(),
             "openai->interactions",
             Protocol::OpenAi,
+            request_headers,
         )
         .await
     }
 
     /// Send a single interaction request and translate response.
+    #[allow(clippy::too_many_arguments)]
     async fn send_and_translate(
         &self,
         url: &str,
@@ -397,12 +467,14 @@ impl InteractionsHandler {
         request_size: usize,
         direction: &str,
         ingress: Protocol,
+        request_headers: &HeaderMap,
     ) -> Result<Response, AppError> {
         let builder = build_interactions_headers(
             self.http
                 .post(url)
                 .header(header::CONTENT_TYPE, "application/json"),
             route.api_key.as_deref(),
+            request_headers,
         );
 
         let start = std::time::Instant::now();
@@ -559,6 +631,7 @@ impl InteractionsHandler {
     }
 
     /// Stream interactions response events translated to the client's protocol.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_stream_response(
         &self,
         upstream: reqwest::Response,
@@ -587,6 +660,13 @@ impl InteractionsHandler {
         let label = upstream_label.to_string();
         let start = std::time::Instant::now();
         let is_openai = matches!(ingress, Protocol::OpenAi);
+
+        // Eagerly commit message_count to prevent racing follow-up requests
+        // from re-sending messages the in-flight stream is about to deliver.
+        // interaction_id is set to empty (pending) — updated after stream completes.
+        let _ = session_store
+            .update(&sid, String::new(), new_count, false)
+            .await;
 
         tokio::spawn(async move {
             let mut translator: Option<
@@ -728,6 +808,8 @@ impl InteractionsHandler {
         upstream_label: &str,
         request_size: usize,
         direction: &str,
+        request_headers: &HeaderMap,
+        ingress: Protocol,
     ) -> Result<Response, AppError> {
         let content_types: Vec<crate::interactions_types::Content> = contents
             .iter()
@@ -735,6 +817,7 @@ impl InteractionsHandler {
             .collect();
         let chunks = interactions_lib::split_content_for_limit(&content_types, limit);
         let mut last_id: Option<String> = None;
+        let mut last_interaction: Option<Interaction> = None;
 
         // Check if there's a system_instruction that needs splitting
         let system_instruction = req_body
@@ -767,6 +850,8 @@ impl InteractionsHandler {
                         upstream_label,
                         request_size,
                         direction,
+                        request_headers,
+                        ingress,
                     )
                     .await;
             }
@@ -797,6 +882,7 @@ impl InteractionsHandler {
                     .post(url)
                     .header(header::CONTENT_TYPE, "application/json"),
                 route.api_key.as_deref(),
+                request_headers,
             );
             let upstream = builder.body(chunk_body).send().await?;
             if !upstream.status().is_success() {
@@ -815,7 +901,8 @@ impl InteractionsHandler {
                 AppError::Upstream(format!("failed to parse split interaction: {e}"))
             })?;
             current_prev = Some(interaction.id.clone());
-            last_id = Some(interaction.id);
+            last_id = Some(interaction.id.clone());
+            last_interaction = Some(interaction);
         }
 
         // Store the LAST chunk's interaction ID
@@ -826,16 +913,74 @@ impl InteractionsHandler {
                 .await;
         }
 
-        // Return the last response
-        let text = "Split interactions completed".to_string();
-        let resp = serde_json::json!({
-            "id": last_id.unwrap_or_default(),
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": [{"type": "text", "text": text}],
-            "stop_reason": "end_turn"
-        });
+        // Return the last response, translated to the ingress protocol
+        let text = last_interaction
+            .as_ref()
+            .map(interactions_lib::extract_interaction_text)
+            .unwrap_or_default();
+        let input_tokens = last_interaction
+            .as_ref()
+            .and_then(|i| i.usage.as_ref())
+            .and_then(|u| u.total_input_tokens)
+            .unwrap_or(0);
+        let output_tokens = last_interaction
+            .as_ref()
+            .and_then(|i| i.usage.as_ref())
+            .and_then(|u| u.total_output_tokens)
+            .unwrap_or(0);
+
+        let resp = match ingress {
+            Protocol::OpenAi => {
+                let typed = ChatCompletionResponse {
+                    id: last_id.unwrap_or_default(),
+                    object: "chat.completion".to_string(),
+                    model: model.to_string(),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: ChatMessage {
+                            role: ChatRole::Assistant,
+                            content: Some(ChatContent::Text(text)),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            refusal: None,
+                            reasoning_content: None,
+                        },
+                        finish_reason: Some(FinishReason::Stop),
+                        logprobs: None,
+                    }],
+                    usage: Some(ChatUsage {
+                        prompt_tokens: input_tokens as u32,
+                        completion_tokens: output_tokens as u32,
+                        total_tokens: (input_tokens + output_tokens) as u32,
+                        completion_tokens_details: None,
+                        prompt_tokens_details: None,
+                    }),
+                    created: None,
+                    system_fingerprint: None,
+                    service_tier: None,
+                };
+                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+            }
+            Protocol::Anthropic => {
+                let typed = MessageResponse {
+                    id: last_id.unwrap_or_default(),
+                    response_type: "message".to_string(),
+                    role: Role::Assistant,
+                    model: model.to_string(),
+                    content: vec![ContentBlock::Text { text: text.clone() }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: Usage {
+                        input_tokens: input_tokens as u32,
+                        output_tokens: output_tokens as u32,
+                        ..Default::default()
+                    },
+                    created: None,
+                };
+                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+            }
+        };
         Ok((StatusCode::OK, axum::Json(resp)).into_response())
     }
 
@@ -853,10 +998,13 @@ impl InteractionsHandler {
         _upstream_label: &str,
         _request_size: usize,
         _direction: &str,
+        request_headers: &HeaderMap,
+        ingress: Protocol,
     ) -> Result<Response, AppError> {
         // Split system_instruction on natural boundaries
         let sys_parts = split_text_for_limit(sys, limit).map_err(AppError::BadRequest)?;
         let mut last_id: Option<String> = None;
+        let mut last_interaction: Option<Interaction> = None;
         let mut current_prev: Option<String> = None;
 
         // Send empty interactions with system_instruction chunks
@@ -882,6 +1030,7 @@ impl InteractionsHandler {
                     .post(url)
                     .header(header::CONTENT_TYPE, "application/json"),
                 route.api_key.as_deref(),
+                request_headers,
             );
             let upstream = builder.body(chunk_body).send().await?;
             let upstream_status = upstream.status();
@@ -920,6 +1069,7 @@ impl InteractionsHandler {
                         .post(url)
                         .header(header::CONTENT_TYPE, "application/json"),
                     route.api_key.as_deref(),
+                    request_headers,
                 );
                 let upstream = builder.body(chunk_body).send().await?;
                 let upstream_status = upstream.status();
@@ -938,7 +1088,8 @@ impl InteractionsHandler {
                 let response_text = upstream.text().await?;
                 if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
                     current_prev = Some(interaction.id.clone());
-                    last_id = Some(interaction.id);
+                    last_id = Some(interaction.id.clone());
+                    last_interaction = Some(interaction);
                 }
             }
         }
@@ -950,14 +1101,74 @@ impl InteractionsHandler {
                 .await;
         }
 
-        let resp = serde_json::json!({
-            "id": last_id.unwrap_or_default(),
-            "type": "message",
-            "role": "assistant",
-            "model": _model,
-            "content": [{"type": "text", "text": "Split interactions completed"}],
-            "stop_reason": "end_turn"
-        });
+        // Translate last response to ingress protocol
+        let text = last_interaction
+            .as_ref()
+            .map(interactions_lib::extract_interaction_text)
+            .unwrap_or_default();
+        let input_tokens = last_interaction
+            .as_ref()
+            .and_then(|i| i.usage.as_ref())
+            .and_then(|u| u.total_input_tokens)
+            .unwrap_or(0);
+        let output_tokens = last_interaction
+            .as_ref()
+            .and_then(|i| i.usage.as_ref())
+            .and_then(|u| u.total_output_tokens)
+            .unwrap_or(0);
+
+        let resp = match ingress {
+            Protocol::OpenAi => {
+                let typed = ChatCompletionResponse {
+                    id: last_id.unwrap_or_default(),
+                    object: "chat.completion".to_string(),
+                    model: _model.to_string(),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: ChatMessage {
+                            role: ChatRole::Assistant,
+                            content: Some(ChatContent::Text(text)),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            refusal: None,
+                            reasoning_content: None,
+                        },
+                        finish_reason: Some(FinishReason::Stop),
+                        logprobs: None,
+                    }],
+                    usage: Some(ChatUsage {
+                        prompt_tokens: input_tokens as u32,
+                        completion_tokens: output_tokens as u32,
+                        total_tokens: (input_tokens + output_tokens) as u32,
+                        completion_tokens_details: None,
+                        prompt_tokens_details: None,
+                    }),
+                    created: None,
+                    system_fingerprint: None,
+                    service_tier: None,
+                };
+                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+            }
+            Protocol::Anthropic => {
+                let typed = MessageResponse {
+                    id: last_id.unwrap_or_default(),
+                    response_type: "message".to_string(),
+                    role: Role::Assistant,
+                    model: _model.to_string(),
+                    content: vec![ContentBlock::Text { text: text.clone() }],
+                    stop_reason: Some(StopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: Usage {
+                        input_tokens: input_tokens as u32,
+                        output_tokens: output_tokens as u32,
+                        ..Default::default()
+                    },
+                    created: None,
+                };
+                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+            }
+        };
         Ok((StatusCode::OK, axum::Json(resp)).into_response())
     }
 
@@ -966,31 +1177,42 @@ impl InteractionsHandler {
         &self,
         interaction_id: &str,
         route: &RouteTarget,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         let url = build_interaction_url(route, &format!("/{interaction_id}/cancel"));
-        let builder = build_interactions_headers(self.http.post(&url), route.api_key.as_deref());
+        let builder = build_interactions_headers(
+            self.http.post(&url),
+            route.api_key.as_deref(),
+            &HeaderMap::new(),
+        );
         match builder.send().await {
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::warn!(interaction_id = %interaction_id, error = %e, "cancel interaction failed");
-                Ok(()) // tolerate errors
+                Err(AppError::Internal(format!(
+                    "cancel interaction {interaction_id}: {e}"
+                )))
             }
         }
     }
 
-    /// Delete an interaction upstream (ignores 404).
     async fn delete_interaction(
         &self,
         interaction_id: &str,
         route: &RouteTarget,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         let url = build_interaction_url(route, &format!("/{interaction_id}"));
-        let builder = build_interactions_headers(self.http.delete(&url), route.api_key.as_deref());
+        let builder = build_interactions_headers(
+            self.http.delete(&url),
+            route.api_key.as_deref(),
+            &HeaderMap::new(),
+        );
         match builder.send().await {
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::warn!(interaction_id = %interaction_id, error = %e, "delete interaction failed");
-                Ok(()) // tolerate errors
+                Err(AppError::Internal(format!(
+                    "delete interaction {interaction_id}: {e}"
+                )))
             }
         }
     }
@@ -1002,7 +1224,11 @@ impl InteractionsHandler {
         route: &RouteTarget,
     ) -> Result<bool, String> {
         let url = build_interaction_url(route, &format!("/{interaction_id}"));
-        let builder = build_interactions_headers(self.http.get(&url), route.api_key.as_deref());
+        let builder = build_interactions_headers(
+            self.http.get(&url),
+            route.api_key.as_deref(),
+            &HeaderMap::new(),
+        );
         match builder.send().await {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(e) => {
@@ -1026,7 +1252,7 @@ impl InteractionsHandler {
                 return id.to_string();
             }
         }
-        uuid_v4()
+        uuid::Uuid::now_v7().to_string()
     }
 }
 
@@ -1034,35 +1260,31 @@ impl InteractionsHandler {
 fn build_interactions_headers(
     builder: reqwest::RequestBuilder,
     api_key: Option<&str>,
+    request_headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
-    let mut b = builder.header("Content-Type", "application/json");
-    b = b.header("Api-Revision", API_REVISION);
+    let b = builder.header("Content-Type", "application/json");
+    let b = b.header("Api-Revision", API_REVISION);
+    // Forward client tracing/observability headers (non-hop-by-hop)
+    let b = forward_request_headers(b, request_headers, None);
     if let Some(key) = api_key {
-        b = b.header("x-goog-api-key", key);
+        b.header("x-goog-api-key", key)
+    } else {
+        b
     }
-    b
 }
 
 /// Build a URL for interactions lifecycle operations.
 fn build_interaction_url(route: &RouteTarget, suffix: &str) -> String {
-    // Strip trailing query params from the endpoint to build lifecycle URLs
     let base = route
         .endpoint_interactions
         .as_deref()
         .unwrap_or("https://generativelanguage.googleapis.com/v1beta/interactions");
-    let base = base.trim_end_matches('?');
-    // Replace "?model" suffix with actual path
-    let base = base.replace("?model", "");
+    let base = match base.find('?') {
+        Some(pos) => &base[..pos],
+        None => base,
+    };
+    let base = base.trim_end_matches('/');
     format!("{base}{suffix}")
-}
-
-fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros();
-    format!("{:x}", ts)
 }
 
 /// Split text into chunks that each fit under `limit` bytes.
@@ -1075,7 +1297,7 @@ fn split_text_for_limit(text: &str, limit: usize) -> Result<Vec<String>, String>
 
     let delimiters: &[&str] = &["\n\n", "\n", ". ", "! ", "? ", ", ", "; ", " "];
     let chunks = split_by_best_delimiter(text, limit, delimiters);
-    if chunks.is_empty() || (chunks.len() == 1 && chunks[0].len() > limit) {
+    if chunks.is_empty() || chunks.iter().any(|c| c.len() > limit) {
         Err(format!(
             "Unable to split system instruction under limit {} bytes",
             limit
@@ -1125,6 +1347,8 @@ fn split_by_best_delimiter(text: &str, limit: usize, delimiters: &[&str]) -> Vec
                     // Single part too large, try finer delimiter
                     let sub = split_by_best_delimiter(part, limit, rest);
                     if sub.is_empty() {
+                        // Can't split further — preserve as-is; caller will detect oversized chunk
+                        result.push(part.to_string());
                         current = String::new();
                     } else {
                         let last = sub.len() - 1;
@@ -1156,7 +1380,8 @@ fn split_by_best_delimiter(text: &str, limit: usize, delimiters: &[&str]) -> Vec
         if bytes.len() <= limit {
             vec![text.to_string()]
         } else {
-            Vec::new()
+            // Preserve oversized text — caller will detect and return error
+            vec![text.to_string()]
         }
     }
 }
@@ -1209,16 +1434,24 @@ fn translate_stream_event(
         }
         "CONTENT_DELTA" => {
             let ev: ContentDelta = serde_json::from_str(data).ok()?;
-            let ContentDeltaData::TextDelta(td) = ev.delta else {
-                return None;
-            };
-            let delta: StreamEvent = serde_json::from_value(serde_json::json!({
-                "type": "content_block_delta",
-                "index": ev.index,
-                "delta": {"type": "text_delta", "text": td.text}
-            }))
-            .ok()?;
-            Some(vec![delta])
+            match ev.delta {
+                ContentDeltaData::TextDelta(td) => {
+                    let delta: StreamEvent = serde_json::from_value(serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": ev.index,
+                        "delta": {"type": "text_delta", "text": td.text}
+                    }))
+                    .ok()?;
+                    Some(vec![delta])
+                }
+                other => {
+                    tracing::warn!(
+                        delta = ?serde_json::to_string(&other).unwrap_or_default(),
+                        "unhandled non-text CONTENT_DELTA dropped"
+                    );
+                    None
+                }
+            }
         }
         "INTERACTION_COMPLETED" => {
             let ev: InteractionCompletedEvent = serde_json::from_str(data).ok()?;
@@ -1598,5 +1831,85 @@ If you don't know the answer, say so honestly.";
         assert!(!events3.is_empty());
         let events4 = translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "m").unwrap();
         assert_eq!(events4.len(), 3);
+    }
+
+    #[test]
+    fn build_interaction_url_strips_query_params() {
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: Some(
+                "https://host/v1beta/interactions?model=gemini-2.0-flash&alt=sse".into(),
+            ),
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: std::collections::HashSet::new(),
+            drop_fields: crate::config::DropFields::default(),
+            proxy_limit: None,
+            proxy: None,
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+        let result = build_interaction_url(&route, "/cancel");
+        assert_eq!(result, "https://host/v1beta/interactions/cancel");
+    }
+
+    #[test]
+    fn build_interaction_url_strips_trailing_slash() {
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: Some("https://host/v1beta/interactions/".into()),
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: std::collections::HashSet::new(),
+            drop_fields: crate::config::DropFields::default(),
+            proxy_limit: None,
+            proxy: None,
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+        let result = build_interaction_url(&route, "/cancel");
+        assert_eq!(result, "https://host/v1beta/interactions/cancel");
+    }
+
+    #[test]
+    fn build_interaction_url_strips_bare_qmark() {
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: Some("https://host/v1beta/interactions?model".into()),
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: std::collections::HashSet::new(),
+            drop_fields: crate::config::DropFields::default(),
+            proxy_limit: None,
+            proxy: None,
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+        let result = build_interaction_url(&route, "/cancel");
+        assert_eq!(result, "https://host/v1beta/interactions/cancel");
+    }
+
+    #[test]
+    fn split_text_rejects_oversized_contiguous_segment() {
+        // Mixed content: splittable parts + one unsplittable word
+        // Without fix, the unsplittable word is silently dropped and Ok is returned
+        let text = "hello world SUPERCALIFRAGILISTICEXPEALIDOCIOUS foo bar";
+        let result = split_text_for_limit(text, 10);
+        assert!(
+            result.is_err(),
+            "unsplittable contiguous segment must cause an error"
+        );
     }
 }

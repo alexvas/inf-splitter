@@ -100,7 +100,12 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             let name = name.clone();
             let use_get = *is_interactions;
             async move {
-                let url = format!("{endpoint}/");
+                // Strip query params before appending health-check path
+                let base = match endpoint.find('?') {
+                    Some(pos) => &endpoint[..pos],
+                    None => endpoint.as_str(),
+                };
+                let url = format!("{base}/");
                 let req = if use_get {
                     client.get(&url)
                 } else {

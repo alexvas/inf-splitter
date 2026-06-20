@@ -248,8 +248,24 @@ fn extract_openai_system(body: &serde_json::Value) -> Option<String> {
         .and_then(|m| m.as_array())
         .and_then(|arr| arr.first())
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-        .map(String::from)
+        .and_then(|m| {
+            m.get("content").and_then(|c| {
+                if let Some(s) = c.as_str() {
+                    return Some(s.to_string());
+                }
+                if let Some(blocks) = c.as_array() {
+                    let text: String = blocks
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
+                }
+                None
+            })
+        })
 }
 
 #[cfg(test)]
@@ -390,5 +406,17 @@ mod tests {
             r#type: serde_json::Value::Null,
         });
         assert!(serialized_content_size(&[c]) > 0);
+    }
+
+    #[test]
+    fn extract_openai_system_handles_array_content() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "You are helpful."}]},
+                {"role": "user", "content": "Hi"}
+            ]
+        });
+        let sys = extract_openai_system(&body);
+        assert_eq!(sys, Some("You are helpful.".to_string()));
     }
 }

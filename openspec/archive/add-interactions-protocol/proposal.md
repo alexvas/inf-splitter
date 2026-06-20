@@ -2,7 +2,8 @@
 
 **Change ID:** `add-interactions-protocol`
 **Created:** 2026-06-18
-**Status:** Draft
+**Status:** Implementation Complete
+**Completed:** 2026-06-20
 
 ---
 
@@ -403,3 +404,32 @@ The interactions endpoint won't respond to HEAD. We probe the base URL of the en
 | Interactions protocol changes | Low | Medium | `Api-Revision` header pins protocol version |
 | Delta computation off-by-one | Medium | High | Extensive unit tests with varying message counts |
 | No anyllm_translate for interactions | High | Medium | Hand-written translation with typed structs; snapshot tests |
+
+---
+
+## Archive Information
+
+**Archived:** 2026-06-20
+**Duration:** 2 days (2026-06-18 → 2026-06-20)
+**Outcome:** Successfully implemented
+
+### Files Modified/Added
+- `src/interactions_handler.rs` — core handler: Anthropic/OpenAI ↔ Interactions translation, streaming, split sending, session delta
+- `src/interactions.rs` — request translation helpers, `split_content_for_limit`, `single_element_too_large`
+- `src/interactions_types.rs` — `include!` of build-time generated serde types
+- `src/session.rs` — `SessionStore` with TOML persistence, TTL eviction, startup recovery
+- `src/control.rs` — in-band control message scanning, stripping, idempotency
+- `src/config.rs` — `endpoint_interactions`, `proxy`, `proxy_limit`, `control_clean_all`, `control_extend_lifetime`, `interactions_session_store`
+- `src/router.rs` — dispatch for interactions, `/interactions/v1/control-constants`, health check GET
+- `src/sse.rs` — SSE utilities reused
+- `src/lib.rs` — `build_app()` wires `InteractionsHandler`
+- `build.rs` — OpenAPI schema → Rust type generation
+- `schemas/interactions.openapi.json` — committed Gemini Interactions API schema
+- `tests/e2e.rs` — 21 E2E tests covering roundtrip, streaming, session persistence, control messages
+- `CLAUDE.md` — strict-types rule, architecture docs
+- Trilingual READMEs — interactions config reference
+
+### Specs Updated
+- `openspec/specs/config.md` — interactions endpoint, proxy, auth, control messages, proxy_limit, session persistence config
+- `openspec/specs/protocol-conversion.md` — Anthropic/OpenAI ↔ Interactions translation, streaming events, codegen types
+- `openspec/specs/routing.md` — interactions dispatch, response translation, session state, persistence, control messages, proxy_limit splitting

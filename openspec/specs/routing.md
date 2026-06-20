@@ -14,6 +14,7 @@ The proxy exposes these routes:
 | `GET` | `/anthropic/v1/models` | Anthropic-format model list |
 | `POST` | `/v1/chat/completions` | OpenAI chat completions ingress |
 | `POST` | `/v1/messages` | Anthropic messages ingress |
+| `GET` | `/interactions/v1/control-constants` | Control message constants for interactions sections |
 
 ### Scenario: Unknown route
 - GIVEN any unrecognized path
@@ -49,7 +50,9 @@ On receiving a POST body, the router:
 
 ## Requirement: Health Check
 
-`GET /health` probes each unique upstream endpoint with a HEAD request:
+`GET /health` probes each unique upstream endpoint:
+- HEAD request for OpenAI/Anthropic endpoints
+- GET request for interactions endpoints (may not support HEAD)
 - 2-second timeout per upstream check
 - 5-second result cache
 - Parallel checks for all endpoints
@@ -182,6 +185,121 @@ When `InteractionsHandler` receives an upstream response, it translates the resp
 - GIVEN section has only `endpoint_interactions`
 - WHEN `POST /v1/chat/completions` arrives with `stream: true`
 - THEN upstream SSE events are converted to OpenAI `ChatCompletionChunk` SSE via `ReverseStreamingTranslator`
+
+## Requirement: Session State Tracking
+
+`InteractionsHandler` uses a `SessionStore` to track session state. The Interactions API maintains conversation state through `previous_interaction_id` chaining.
+
+Session state fields: `interaction_id`, `message_count`, `last_access_utc`, `expires_at_utc`, `pending`.
+
+**Session ID resolution** (priority order):
+1. HTTP header `x-request-id` (primary)
+2. Body field `request_id` (fallback)
+3. Random UUID (last resort)
+
+### Scenario: First request in session
+- GIVEN no prior messages for session
+- WHEN request with 3 messages arrives
+- THEN all 3 messages are translated and sent
+
+### Scenario: Subsequent request — delta
+- GIVEN session has 3 delivered messages
+- WHEN request with 5 messages arrives (same session)
+- THEN only messages [3..5] are sent
+
+### Scenario: Session ID from HTTP header (primary)
+- GIVEN `x-request-id: conv-abc123` header and `request_id: "..."` in body
+- WHEN session is resolved
+- THEN `session_id = "conv-abc123"` (header wins)
+
+## Requirement: Session Persistence
+
+Session state is persisted to a TOML file. Written atomically on every state change, flushed on shutdown/panic. On startup: expired sessions cleaned, pending sessions verified via GET.
+
+### Scenario: Session survives restart
+- GIVEN session with `interaction_id = "abc123"` and `message_count = 5`
+- WHEN proxy restarts
+- THEN session is recovered from TOML with same state
+
+### Scenario: Expired sessions cleaned on startup
+- GIVEN expired session in TOML
+- WHEN proxy starts
+- THEN POST cancel + DELETE sent, session removed
+
+### Scenario: Pending session verified on startup
+- GIVEN session with `pending = true`
+- WHEN proxy starts and `GET /v1beta/interactions/{id}` returns 200
+- THEN `pending` cleared to `false`, session kept
+
+### Scenario: Cleanup errors are tolerated
+- GIVEN eviction triggers DELETE for `interaction_id = "abc123"`
+- WHEN upstream returns 404 "no such interaction"
+- THEN error is logged, session removed from local store
+
+## Requirement: In-Band Control Messages
+
+Clients can manage sessions by embedding special text constants in conversation messages. The proxy detects these before forwarding and handles them locally.
+
+Processing rules:
+1. Control messages stripped from message list before delta computation
+2. `message_count` tracks only non-control messages
+3. Control messages are idempotent via hash tracking
+
+### Scenario: Clean all sessions
+- GIVEN 3 active sessions exist
+- WHEN client sends message containing `control_clean_all`
+- THEN all 3 sessions are cancelled and deleted
+
+### Scenario: Extend session lifetime
+- GIVEN current session expires at `1718570000`
+- WHEN client sends message with `control_extend_lifetime` and timestamp `1719174800`
+- THEN session's `expires_at_utc` updated to `1719174800`
+
+### Scenario: Control message stripped from delta
+- GIVEN 3 delivered messages, new request has 2 text + 1 control message
+- WHEN computing delta
+- THEN control excluded, delta = 2, `message_count` becomes 5
+
+### Scenario: Control message idempotency
+- GIVEN control message `clean_all` was processed
+- WHEN client re-sends the same control message
+- THEN it is ignored (hash matches already-processed set)
+
+## Requirement: Control Constants HTTP Endpoint
+
+```
+GET /interactions/v1/control-constants
+```
+
+Returns JSON keyed by section name. Only sections with `endpoint_interactions` AND at least one control constant are included.
+
+### Scenario: Constants returned
+- GIVEN config has section with `endpoint_interactions`, `control_clean_all`, `control_extend_lifetime`
+- WHEN endpoint is called
+- THEN response maps section name to `{"clean_all": "...", "extend_lifetime": "..."}`
+
+## Requirement: Egress Message Splitting (proxy_limit)
+
+When `proxy_limit` is configured, the serialized `Content[]` is measured. If it exceeds the limit, the array is split into multiple interactions chained via `previous_interaction_id`.
+
+- Sequential greedy packing — order preserved, no reordering
+- First chunk uses session's existing `interaction_id` as `previous_interaction_id`
+- Store the LAST chunk's `interaction.id` in session state
+- `message_count` reflects total across all chunks
+
+### Scenario: Split across multiple interactions
+- GIVEN `proxy_limit = "15k"`, session has `interaction_id = "prior-id"`, 3 messages (6 + 6 + 4 KiB)
+- WHEN request is processed
+- THEN chunk1 (msg1+msg2, 12 KiB, `previous_interaction_id = "prior-id"`) → chunk2 (msg3, chained to chunk1)
+
+### Scenario: Single element exceeds limit
+- GIVEN `proxy_limit = "1k"`, message serializes to 5 KiB
+- WHEN request is processed
+- THEN 415 error returned, no interactions created
+
+### Scenario: Hunks preserve message order (sequential greedy)
+- GIVEN `proxy_limit = "10k"`, 3 messages (6 + 5 + 4 KiB)
+- THEN chunk1 = [msg1] (6 KiB) → chunk2 = [msg2, msg3] (5+4=9 KiB). Order preserved.
 
 ## Requirement: Graceful Shutdown
 

@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g. 0.1.0). Must be valid semver.'
+        description: "Version to release (e.g. 0.1.0). Must be valid semver."
         required: true
         type: string
 
@@ -27,6 +27,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-${{ github.job }}
       - name: cargo fmt
         run: cargo fmt --check
       - name: cargo clippy
@@ -63,6 +65,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-${{ github.job }}
       - name: cargo test
         env:
           RUST_BACKTRACE: 1
@@ -99,6 +103,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-${{ github.job }}
 
       - name: Get package version
         id: pkg_version

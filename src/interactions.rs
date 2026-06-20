@@ -6,15 +6,6 @@
 use crate::config::RouteTarget;
 use crate::interactions_types::{Content, GenerationConfig, Interaction, Step, TextContent};
 
-/// Helper to create a TextContent for outgoing requests.
-fn text_content(text: impl Into<String>) -> Content {
-    Content::TextContent(TextContent {
-        text: text.into(),
-        annotations: None,
-        r#type: serde_json::Value::Null,
-    })
-}
-
 /// Build an interactions request from Anthropic ingress body.
 pub fn build_interactions_request_anthropic(
     body: &serde_json::Value,

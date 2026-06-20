@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use crate::session::{SessionState, SessionStore};
+use crate::session::SessionStore;
 
 /// Result of scanning incoming messages for control commands.
 #[derive(Debug)]
@@ -95,7 +95,7 @@ pub async fn execute_control_action(
             let all = store.remove_all().await?;
             let mut cancelled = 0usize;
             let mut deleted = 0usize;
-            for (sid, state) in &all {
+            for (_sid, state) in &all {
                 if !state.interaction_id.is_empty() {
                     // Silently ignore errors — "already gone" is fine
                     let _ = cancel_fn(&state.interaction_id);

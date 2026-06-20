@@ -3,6 +3,8 @@
 //! Generated at build time from `schemas/interactions.openapi.json`.
 //! The generated code is in `OUT_DIR/interactions_types.rs`.
 
+#![allow(non_camel_case_types)]
+
 // Include the generated types
 include!(concat!(env!("OUT_DIR"), "/interactions_types.rs"));
 

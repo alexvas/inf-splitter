@@ -13,10 +13,9 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
-use crate::auth::forward_request_headers;
 use crate::config::{Config, Protocol, RouteTarget};
 use crate::control::{scan_control_messages, ControlAction};
-use crate::diagnostics::{Diagnostics, DumpBody, StatsEvent};
+use crate::diagnostics::{Diagnostics, StatsEvent};
 use crate::error::AppError;
 use crate::interactions as interactions_lib;
 use crate::interactions_types::{
@@ -669,10 +668,7 @@ impl InteractionsHandler {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("stream error: {e}"),
-                            )))
+                            .send(Err(std::io::Error::other(format!("stream error: {e}"))))
                             .await;
                         return;
                     }
@@ -859,7 +855,7 @@ impl InteractionsHandler {
         _direction: &str,
     ) -> Result<Response, AppError> {
         // Split system_instruction on natural boundaries
-        let sys_parts = split_text_for_limit(sys, limit).map_err(|e| AppError::BadRequest(e))?;
+        let sys_parts = split_text_for_limit(sys, limit).map_err(AppError::BadRequest)?;
         let mut last_id: Option<String> = None;
         let mut current_prev: Option<String> = None;
 
@@ -1073,13 +1069,13 @@ fn uuid_v4() -> String {
 /// Uses hierarchical boundaries: \\n\\n → \\n → . → ! → ? → , → ; → char.
 /// Each chunk is as large as possible while staying under the limit.
 fn split_text_for_limit(text: &str, limit: usize) -> Result<Vec<String>, String> {
-    if text.as_bytes().len() <= limit {
+    if text.len() <= limit {
         return Ok(vec![text.to_string()]);
     }
 
     let delimiters: &[&str] = &["\n\n", "\n", ". ", "! ", "? ", ", ", "; ", " "];
     let chunks = split_by_best_delimiter(text, limit, delimiters);
-    if chunks.is_empty() || (chunks.len() == 1 && chunks[0].as_bytes().len() > limit) {
+    if chunks.is_empty() || (chunks.len() == 1 && chunks[0].len() > limit) {
         Err(format!(
             "Unable to split system instruction under limit {} bytes",
             limit
@@ -1107,12 +1103,12 @@ fn split_by_best_delimiter(text: &str, limit: usize, delimiters: &[&str]) -> Vec
                 format!("{}{}{}", &current, delim, part)
             };
 
-            if candidate.as_bytes().len() <= limit {
+            if candidate.len() <= limit {
                 current = candidate;
             } else {
                 if !current.is_empty() {
                     // Current chunk is full — push it
-                    if current.as_bytes().len() > limit {
+                    if current.len() > limit {
                         // Still too large, try finer delimiter
                         let sub = split_by_best_delimiter(&current, limit, rest);
                         result.extend(sub);
@@ -1123,7 +1119,7 @@ fn split_by_best_delimiter(text: &str, limit: usize, delimiters: &[&str]) -> Vec
                     }
                 }
                 // Start new chunk with this part
-                if part.as_bytes().len() <= limit {
+                if part.len() <= limit {
                     current = part.to_string();
                 } else {
                     // Single part too large, try finer delimiter
@@ -1145,7 +1141,7 @@ fn split_by_best_delimiter(text: &str, limit: usize, delimiters: &[&str]) -> Vec
         }
 
         if !current.is_empty() {
-            if current.as_bytes().len() > limit {
+            if current.len() > limit {
                 let sub = split_by_best_delimiter(&current, limit, rest);
                 result.extend(sub);
             } else {
@@ -1272,7 +1268,7 @@ mod tests {
     #[test]
     fn split_text_exact_limit_single_chunk() {
         let text = "Hello!";
-        let limit = text.as_bytes().len();
+        let limit = text.len();
         let result = split_text_for_limit(text, limit).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], text);
@@ -1340,10 +1336,10 @@ mod tests {
         let result = split_text_for_limit(text, limit).unwrap();
         for chunk in &result {
             assert!(
-                chunk.as_bytes().len() <= limit,
+                chunk.len() <= limit,
                 "chunk '{}' len {} exceeds limit {}",
                 chunk,
-                chunk.as_bytes().len(),
+                chunk.len(),
                 limit
             );
         }
@@ -1427,7 +1423,7 @@ If you don't know the answer, say so honestly.";
         let result = split_text_for_limit(text, limit).unwrap();
         assert_eq!(result.len(), 2);
         for chunk in &result {
-            assert!(chunk.as_bytes().len() <= limit);
+            assert!(chunk.len() <= limit);
         }
     }
 
@@ -1514,7 +1510,7 @@ If you don't know the answer, say so honestly.";
     #[test]
     fn split_text_single_paragraph_fits() {
         let text = "You are a helpful and concise assistant.";
-        let limit = text.as_bytes().len();
+        let limit = text.len();
         let result = split_text_for_limit(text, limit).unwrap();
         assert_eq!(result.len(), 1);
     }
@@ -1536,7 +1532,7 @@ If you don't know the answer, say so honestly.";
         let result = split_text_for_limit(text, limit).unwrap();
         // Each chunk should be ≤ limit
         for chunk in &result {
-            assert!(chunk.as_bytes().len() <= limit);
+            assert!(chunk.len() <= limit);
         }
         // "one two" = 7, "one two three" = 13 > 10 → split
         // "three four" = 11 > 10 → split

@@ -16,6 +16,17 @@ impl Default for InteractionsInput {
     }
 }
 
+/// Typed tool_choice covering the oneOf: simple string or full config.
+/// The generated `GenerationConfig.tool_choice` is `Option<serde_json::Value>`
+/// because the build.rs codegen cannot handle inline oneOf schemas.
+/// This enum bridges that gap with a serde-untagged representation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Simple(String),
+    Config(ToolChoiceConfig),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +122,41 @@ mod tests {
             Some("text"),
             "Content serialization must produce \"type\": \"text\", not null"
         );
+    }
+
+    #[test]
+    fn deserialize_interaction_created_incomplete() {
+        // Gemini API sends interaction.created SSE events where the initial
+        // interaction object is incomplete: only id, status, object, model —
+        // no created/updated/steps. These must deserialize successfully.
+        let json = serde_json::json!({
+            "event_type": "interaction.created",
+            "interaction": {
+                "id": "v1_ChdUdFUzYXQzNktPS2xtdGtQdE92eGtBcxIXVHRVM2F0MzZLT0tsbXRrUHRPdnhrQXM",
+                "status": "in_progress",
+                "object": "interaction",
+                "model": "gemini-3.1-flash-lite"
+            }
+        });
+        let event: InteractionSseEvent = serde_json::from_value(json)
+            .expect("deserialize interaction.created with incomplete interaction");
+        match event {
+            InteractionSseEvent::InteractionCreatedEvent(ev) => {
+                assert_eq!(
+                    ev.interaction.id,
+                    "v1_ChdUdFUzYXQzNktPS2xtdGtQdE92eGtBcxIXVHRVM2F0MzZLT0tsbXRrUHRPdnhrQXM"
+                );
+                assert_eq!(ev.interaction.status, "in_progress");
+                assert_eq!(
+                    ev.interaction.model.as_deref(),
+                    Some("gemini-3.1-flash-lite")
+                );
+            }
+            other => panic!(
+                "expected InteractionCreatedEvent, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
     }
 
     #[test]

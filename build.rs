@@ -19,8 +19,20 @@ fn main() {
     println!("cargo:rerun-if-changed={}", schema_path.display());
 
     let raw = fs::read_to_string(&schema_path).expect("failed to read interactions schema");
-    let spec: serde_json::Value =
+    let mut spec: serde_json::Value =
         serde_json::from_str(&raw).expect("failed to parse interactions schema");
+
+    // Patch Interaction schema: remove created, updated, steps from required.
+    // The Gemini API sends interaction.created SSE events where the initial
+    // interaction object is incomplete (only id, status, object, model).
+    // Making these fields optional matches the actual API behavior.
+    if let Some(required) = spec["components"]["schemas"]["Interaction"]["required"].as_array_mut()
+    {
+        required.retain(|v| {
+            let s = v.as_str().unwrap_or("");
+            s != "created" && s != "updated" && s != "steps"
+        });
+    }
 
     let schemas = &spec["components"]["schemas"];
 
@@ -89,6 +101,7 @@ fn main() {
     // (HarmCategory, ResponseModality, etc.) that don't implement Default.
     for struct_name in [
         "CreateModelInteractionParams",
+        "Function",
         "GenerationConfig",
         "Interaction",
         "TextContent",

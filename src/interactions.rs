@@ -8,7 +8,7 @@
 use crate::config::RouteTarget;
 use crate::interactions_types::{
     Content, CreateModelInteractionParams, GenerationConfig, Interaction, InteractionsInput, Step,
-    TextContent,
+    TextContent, Tool, ToolChoice,
 };
 
 /// Build an interactions request from Anthropic ingress.
@@ -25,6 +25,8 @@ pub fn build_interactions_request_anthropic(
     temperature: Option<f64>,
     ingress_max_tokens: Option<u32>,
     system: Option<String>,
+    tools: Option<Vec<Tool>>,
+    tool_choice: Option<ToolChoice>,
 ) -> CreateModelInteractionParams {
     let contents: Vec<Content> = messages
         .iter()
@@ -41,6 +43,8 @@ pub fn build_interactions_request_anthropic(
         temperature,
         ingress_max_tokens,
         system,
+        tools,
+        tool_choice,
     )
 }
 
@@ -54,6 +58,8 @@ pub fn build_interactions_request_openai(
     stream: bool,
     temperature: Option<f64>,
     ingress_max_tokens: Option<u32>,
+    tools: Option<Vec<Tool>>,
+    tool_choice: Option<ToolChoice>,
 ) -> CreateModelInteractionParams {
     let contents: Vec<Content> = messages
         .iter()
@@ -72,6 +78,8 @@ pub fn build_interactions_request_openai(
         temperature,
         ingress_max_tokens,
         system,
+        tools,
+        tool_choice,
     )
 }
 
@@ -84,21 +92,29 @@ fn build_request_body(
     temperature: Option<f64>,
     ingress_max_tokens: Option<u32>,
     system_instruction: Option<String>,
+    tools: Option<Vec<Tool>>,
+    tool_choice: Option<ToolChoice>,
 ) -> CreateModelInteractionParams {
     let mut params = CreateModelInteractionParams {
         model: model.to_string(),
         input: InteractionsInput::ContentList(contents.to_vec()),
         stream: Some(stream),
+        tools: tools.filter(|t| !t.is_empty()),
         ..Default::default()
     };
 
     let max_tokens = route.max_tokens.or(ingress_max_tokens);
-    if max_tokens.is_some() || temperature.is_some() {
-        params.generation_config = Some(GenerationConfig {
+    let has_tool_choice = tool_choice.is_some();
+    if max_tokens.is_some() || temperature.is_some() || has_tool_choice {
+        let mut gen_config = GenerationConfig {
             temperature,
             max_output_tokens: max_tokens.map(|v| v as i64),
             ..Default::default()
-        });
+        };
+        if has_tool_choice {
+            gen_config.tool_choice = tool_choice.and_then(|tc| serde_json::to_value(tc).ok());
+        }
+        params.generation_config = Some(gen_config);
     }
 
     if let Some(sys) = system_instruction {
@@ -176,6 +192,8 @@ pub fn single_element_too_large(contents: &[Content], limit: usize) -> bool {
 pub fn extract_interaction_text(interaction: &Interaction) -> String {
     interaction
         .steps
+        .as_deref()
+        .unwrap_or_default()
         .iter()
         .filter_map(|step| match step {
             Step::ModelOutputStep(mos) => mos.content.as_ref().map(|content| {
@@ -217,6 +235,83 @@ pub fn extract_anthropic_system(body: &serde_json::Value) -> Option<String> {
 /// Get interaction ID from response.
 pub fn extract_interaction_id(interaction: &Interaction) -> Option<String> {
     Some(interaction.id.clone())
+}
+
+/// Extract tools and tool_choice from an Anthropic ingress body, converting to
+/// Interactions API Tool format.
+///
+/// Anthropic tool: `{"name": "...", "description": "...", "input_schema": {...}}`
+/// → `Tool::Function(Function { name, description, parameters: input_schema, .. })`
+///
+/// Returns `(tools, tool_choice)`.  `tools` is `None` when the ingress has no tools array.
+pub fn extract_anthropic_tools(
+    body: &serde_json::Value,
+) -> (Option<Vec<Tool>>, Option<ToolChoice>) {
+    let tools = body.get("tools").and_then(|arr| arr.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|t| {
+                let mut tool = t.clone();
+                let obj = tool.as_object_mut()?;
+                // Inject type tag if missing
+                if !obj.contains_key("type") {
+                    obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("function".to_string()),
+                    );
+                }
+                // Rename input_schema → parameters
+                if let Some(schema) = obj.remove("input_schema") {
+                    obj.insert("parameters".to_string(), schema);
+                }
+                serde_json::from_value::<Tool>(tool).ok()
+            })
+            .collect()
+    });
+
+    let tool_choice = body.get("tool_choice").and_then(|v| {
+        // Anthropic uses {"type": "auto"} — extract type as a simple string
+        if v.is_object() {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| ToolChoice::Simple(s.to_string()))
+        } else {
+            serde_json::from_value::<ToolChoice>(v.clone()).ok()
+        }
+    });
+
+    (tools, tool_choice)
+}
+
+/// Extract tools and tool_choice from an OpenAI ingress body, converting to
+/// Interactions API Tool format.
+///
+/// OpenAI tool: `{"type": "function", "function": {"name": "...", ...}}`
+/// → `Tool::Function(Function { name, description, parameters, .. })`
+///
+/// Returns `(tools, tool_choice)`.  `tools` is `None` when the ingress has no tools array.
+pub fn extract_openai_tools(body: &serde_json::Value) -> (Option<Vec<Tool>>, Option<ToolChoice>) {
+    let tools = body.get("tools").and_then(|arr| arr.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|t| {
+                let func = t.get("function")?;
+                let mut tool = func.clone();
+                let obj = tool.as_object_mut()?;
+                if !obj.contains_key("type") {
+                    obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("function".to_string()),
+                    );
+                }
+                serde_json::from_value::<Tool>(tool).ok()
+            })
+            .collect()
+    });
+
+    let tool_choice = body
+        .get("tool_choice")
+        .and_then(|v| serde_json::from_value::<ToolChoice>(v.clone()).ok());
+
+    (tools, tool_choice)
 }
 
 // --- Internal helpers ---
@@ -327,6 +422,8 @@ mod tests {
             None,
             Some(100),
             anthropic_system(),
+            None,
+            None,
         );
         match &req.input {
             InteractionsInput::ContentList(list) => assert_eq!(list.len(), 1),
@@ -347,6 +444,8 @@ mod tests {
             None,
             Some(100),
             None,
+            None,
+            None,
         );
         assert_eq!(req.previous_interaction_id.as_deref(), Some("prev-123"));
     }
@@ -361,6 +460,8 @@ mod tests {
             None,
             "gpt-4",
             false,
+            None,
+            None,
             None,
             None,
         );
@@ -385,6 +486,8 @@ mod tests {
             false,
             None,
             None,
+            None,
+            None,
         );
         assert_eq!(req.system_instruction.as_deref(), Some("You are helpful."));
     }
@@ -392,18 +495,19 @@ mod tests {
     #[test]
     fn extract_text_from_interaction() {
         use crate::interactions_types::{Interaction, ModelOutputStep};
+        let step = ModelOutputStep {
+            content: Some(vec![Content::TextContent(TextContent {
+                text: "Hello!".into(),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
         let interaction = Interaction {
             id: "abc".into(),
             status: "completed".into(),
-            created: "2026-01-01T00:00:00Z".into(),
-            updated: "2026-01-01T00:00:00Z".into(),
-            steps: vec![Step::ModelOutputStep(ModelOutputStep {
-                content: Some(vec![Content::TextContent(TextContent {
-                    text: "Hello!".into(),
-                    ..Default::default()
-                })]),
-                ..Default::default()
-            })],
+            created: Some("2026-01-01T00:00:00Z".into()),
+            updated: Some("2026-01-01T00:00:00Z".into()),
+            steps: Some(vec![Step::ModelOutputStep(step)]),
             model: Some("gemini-3.1-flash-lite".into()),
             ..Default::default()
         };
@@ -442,5 +546,155 @@ mod tests {
         ];
         let sys = extract_openai_system(&msgs);
         assert_eq!(sys, Some("You are helpful.".to_string()));
+    }
+
+    // --- Tool extraction tests ---
+
+    #[test]
+    fn extract_anthropic_tools_basic() {
+        let body = serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"name": "get_weather", "description": "Get weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"}
+        });
+        let (tools, tool_choice) = extract_anthropic_tools(&body);
+        let tools = tools.expect("tools should be extracted");
+        assert_eq!(tools.len(), 1);
+        match &tools[0] {
+            Tool::Function(f) => {
+                assert_eq!(f.name.as_deref(), Some("get_weather"));
+                assert_eq!(f.description.as_deref(), Some("Get weather"));
+                assert!(f.parameters.is_some());
+            }
+            _ => panic!("expected Function tool"),
+        }
+        assert!(tool_choice.is_some());
+        match tool_choice.unwrap() {
+            ToolChoice::Simple(s) => assert_eq!(s, "auto"),
+            other => panic!("expected Simple tool_choice, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_anthropic_tools_none_when_no_tools() {
+        let body = serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let (tools, tool_choice) = extract_anthropic_tools(&body);
+        assert!(tools.is_none());
+        assert!(tool_choice.is_none());
+    }
+
+    #[test]
+    fn extract_openai_tools_basic() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object"}}}],
+            "tool_choice": "auto"
+        });
+        let (tools, tool_choice) = extract_openai_tools(&body);
+        let tools = tools.expect("tools should be extracted");
+        assert_eq!(tools.len(), 1);
+        match &tools[0] {
+            Tool::Function(f) => {
+                assert_eq!(f.name.as_deref(), Some("get_weather"));
+                assert_eq!(f.description.as_deref(), Some("Get weather"));
+                assert!(f.parameters.is_some());
+            }
+            _ => panic!("expected Function tool"),
+        }
+        assert!(tool_choice.is_some());
+        match tool_choice.unwrap() {
+            ToolChoice::Simple(s) => assert_eq!(s, "auto"),
+            other => panic!("expected Simple tool_choice, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_openai_tools_none_when_no_tools() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let (tools, tool_choice) = extract_openai_tools(&body);
+        assert!(tools.is_none());
+        assert!(tool_choice.is_none());
+    }
+
+    #[test]
+    fn build_anthropic_request_with_tools() {
+        let tools = vec![Tool::Function(crate::interactions_types::Function {
+            name: Some("get_weather".into()),
+            description: Some("Get weather".into()),
+            parameters: Some(serde_json::json!({"type": "object"})),
+            ..Default::default()
+        })];
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &test_route(),
+            None,
+            "gemini-3.1-flash-lite",
+            false,
+            None,
+            Some(100),
+            None,
+            Some(tools),
+            Some(ToolChoice::Simple("auto".into())),
+        );
+        assert!(req.tools.is_some());
+        assert_eq!(req.tools.unwrap().len(), 1);
+        assert!(req.generation_config.is_some());
+        assert!(req.generation_config.unwrap().tool_choice.is_some());
+    }
+
+    #[test]
+    fn build_openai_request_with_tools() {
+        let tools = vec![Tool::Function(crate::interactions_types::Function {
+            name: Some("get_weather".into()),
+            description: Some("Get weather".into()),
+            parameters: Some(serde_json::json!({"type": "object"})),
+            ..Default::default()
+        })];
+        let req = build_interactions_request_openai(
+            &[serde_json::json!({"role": "user", "content": "Weather?"})],
+            0,
+            &test_route(),
+            None,
+            "gemini-3.1-flash-lite",
+            false,
+            None,
+            None,
+            Some(tools),
+            Some(ToolChoice::Simple("auto".into())),
+        );
+        assert!(req.tools.is_some());
+        assert_eq!(req.tools.unwrap().len(), 1);
+        assert!(req.generation_config.is_some());
+        assert!(req.generation_config.unwrap().tool_choice.is_some());
+    }
+
+    #[test]
+    fn build_request_no_tools_field_when_none() {
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &test_route(),
+            None,
+            "gemini-3.1-flash-lite",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            req.tools.is_none(),
+            "tools should be absent when not provided"
+        );
     }
 }

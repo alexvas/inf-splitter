@@ -192,6 +192,7 @@ impl InteractionsHandler {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
         let system = interactions_lib::extract_anthropic_system(&body_val);
+        let (tools, tool_choice) = interactions_lib::extract_anthropic_tools(&body_val);
 
         let prev_id = if session.interaction_id.is_empty() {
             None
@@ -210,6 +211,8 @@ impl InteractionsHandler {
             temperature,
             ingress_max_tokens,
             system,
+            tools,
+            tool_choice,
         );
 
         // Send to upstream
@@ -387,6 +390,7 @@ impl InteractionsHandler {
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
+        let (tools, tool_choice) = interactions_lib::extract_openai_tools(&body_val);
 
         let prev_id = if session.interaction_id.is_empty() {
             None
@@ -403,6 +407,8 @@ impl InteractionsHandler {
             stream,
             temperature,
             ingress_max_tokens,
+            tools,
+            tool_choice,
         );
 
         let backend_url = endpoint.to_string();
@@ -737,6 +743,17 @@ impl InteractionsHandler {
                                                         sse::format_openai_sse_chunk(&chunk);
                                                     let payload = bytes::Bytes::from(payload);
                                                     if tx.send(Ok(payload)).await.is_err() {
+                                                        let duration_ms =
+                                                            start.elapsed().as_millis() as u64;
+                                                        guard.finish(
+                                                            499,
+                                                            duration_ms,
+                                                            request_size,
+                                                            Some(total_bytes),
+                                                            &label,
+                                                            &dir,
+                                                            true,
+                                                        );
                                                         return;
                                                     }
                                                 }
@@ -744,6 +761,17 @@ impl InteractionsHandler {
                                         } else {
                                             let payload = sse::format_sse_event(event);
                                             if tx.send(Ok(payload)).await.is_err() {
+                                                let duration_ms =
+                                                    start.elapsed().as_millis() as u64;
+                                                guard.finish(
+                                                    499,
+                                                    duration_ms,
+                                                    request_size,
+                                                    Some(total_bytes),
+                                                    &label,
+                                                    &dir,
+                                                    true,
+                                                );
                                                 return;
                                             }
                                         }
@@ -762,6 +790,17 @@ impl InteractionsHandler {
                         let _ = tx
                             .send(Err(std::io::Error::other(format!("stream error: {e}"))))
                             .await;
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        guard.finish_with_error(
+                            502,
+                            duration_ms,
+                            request_size,
+                            Some(total_bytes),
+                            &label,
+                            &dir,
+                            true,
+                            format!("stream error: {e}"),
+                        );
                         return;
                     }
                 }

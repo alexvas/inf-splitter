@@ -297,6 +297,18 @@ pub struct RequestDiagnostics {
 - AND `guard.response_dump_streaming()` + `guard.finish()` are called inside the task
 - AND no raw `diagnostics.record_*` calls remain in the spawned task
 
+### Scenario: Client disconnect during streaming
+- GIVEN an interactions stream is in progress
+- WHEN the client disconnects (causing `tx.send()` to fail)
+- THEN `guard.finish()` is called with status 499 and accumulated stats before `return`
+- AND no `diagnostics guard dropped without finish` error is logged
+
+### Scenario: Stream chunk error
+- GIVEN an interactions stream is in progress
+- WHEN the upstream stream returns an error chunk
+- THEN `guard.finish_with_error()` is called with status 502 before `return`
+- AND no `diagnostics guard dropped without finish` error is logged
+
 ### Scenario: Idempotent finish
 - GIVEN `finish()` was already called
 - WHEN `finish()` or `finish_with_error()` is called again

@@ -132,6 +132,7 @@ All other upstream response headers are filtered out. The OpenAI response relay 
 - `messages[]` → interactions `Content[]` via typed extractors
 - `system` → `system_instruction` (extracted by `extract_anthropic_system`)
 - `max_tokens` → `generation_config.max_output_tokens`
+- `tools` and `tool_choice` extracted from ingress body via `extract_anthropic_tools`, converted to Interactions API format (`Vec<Tool>` and `ToolChoice`), set on `CreateModelInteractionParams.tools` and `generation_config.tool_choice`
 - `previous_interaction_id` set from session state (if exists)
 - All parameters passed as typed scalars to `build_interactions_request_anthropic`, which returns `CreateModelInteractionParams` directly
 - Split-path accesses struct fields (`params.input`, `params.system_instruction`, `params.previous_interaction_id`) — no `.get()` on `serde_json::Value`
@@ -147,6 +148,12 @@ Only messages not yet delivered to the session are included (delta computation).
 - GIVEN session has `{interaction_id: "abc123", delivered_count: 3}`
 - WHEN Anthropic request with 5 messages arrives (same session)
 - THEN only messages [3..5] are sent, `previous_interaction_id: "abc123"` is set
+
+### Scenario: Tools forwarded to interactions API
+- GIVEN Anthropic ingress body with `"tools": [{"name": "get_weather", "input_schema": {...}}]` and `"tool_choice": {"type": "auto"}`
+- WHEN the interactions request is built
+- THEN `CreateModelInteractionParams.tools` contains the tool definitions as `Vec<Tool>`
+- AND `generation_config.tool_choice` reflects the tool choice (as `ToolChoice::Simple("auto")`, serialized to JSON)
 
 ## Requirement: Interactions → Anthropic Translation
 
@@ -168,7 +175,14 @@ OpenAI ingress → `CreateModelInteractionParams`:
 - `messages[]` → interactions `Content[]` via typed extractors
 - System message (role=system) → `system_instruction`
 - `max_tokens` → `generation_config.max_output_tokens`
+- `tools` and `tool_choice` extracted from ingress body via `extract_openai_tools`, converted to Interactions API format (`Vec<Tool>` and `ToolChoice`), set on `CreateModelInteractionParams.tools` and `generation_config.tool_choice`
 - All parameters passed as typed scalars to `build_interactions_request_openai`, which returns `CreateModelInteractionParams` directly
+
+### Scenario: OpenAI tools forwarded to interactions API
+- GIVEN OpenAI ingress body with `"tools": [{"type": "function", "function": {"name": "search"}}]` and `"tool_choice": "auto"`
+- WHEN the interactions request is built
+- THEN `CreateModelInteractionParams.tools` contains the tool definitions
+- AND `generation_config.tool_choice` reflects the tool choice
 
 ## Requirement: Interactions → OpenAI Translation
 
@@ -241,10 +255,24 @@ Streaming from interactions endpoint returns SSE with discriminated event types:
 
 Rust types for the interactions protocol are generated at build time from `schemas/interactions.openapi.json` by `build.rs`. The generated code is included in `src/interactions_types.rs` via `include!`.
 
+The `Interaction` schema's `required` array is patched in `build.rs` to remove `created`, `updated`, and `steps` — the Gemini API does not consistently include these fields in SSE event payloads (specifically in `interaction.created` events where the interaction is still in-progress). Code accessing these fields must handle them as `Option<T>`.
+
 ### Scenario: Schema is committed
 - GIVEN `schemas/interactions.openapi.json` exists in the repo
 - WHEN `cargo build` runs
 - THEN build.rs generates types without network access
+
+### Scenario: Schema patching removes required fields
+- GIVEN `schemas/interactions.openapi.json` has `Interaction.required: ["created", "id", "status", "steps", "updated"]`
+- WHEN `build.rs` runs
+- THEN the in-memory schema is patched so `Interaction.required` is `["id", "status"]`
+- AND the generated `Interaction` struct has `created: Option<String>`, `updated: Option<String>`, `steps: Option<Vec<Step>>`
+
+### Scenario: interaction.created SSE event deserializes
+- GIVEN SSE data `{"event_type":"interaction.created","interaction":{"id":"abc","status":"in_progress","model":"gemini-3.1-flash-lite"}}`
+- WHEN `serde_json::from_str::<InteractionSseEvent>(data)` is called
+- THEN it succeeds as `InteractionSseEvent::InteractionCreatedEvent`
+- AND the inner `Interaction` has `created: None`, `steps: None`, `updated: None`
 
 ## Requirement: build.rs Infers OneOf Discriminator Tags from const
 
@@ -338,6 +366,7 @@ Raw `serde_json::Value` must not thread through functions when typed equivalents
 Selected generated structs derive `Default` for ergonomic construction with `..Default::default()`:
 
 - `CreateModelInteractionParams` — ~20 optional fields default to `None`
+- `Function` — `name`, `description`, `parameters` default to `None`/`Null`
 - `GenerationConfig` — all `Option<T>` fields default to `None`
 - `TextContent` — `annotations` defaults to `None`, `r#type` to `Value::Null` (skipped on serialize)
 - `Interaction`, `InteractionStatusUpdate`, `ModelOutputStep`

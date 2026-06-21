@@ -124,7 +124,7 @@ mod tests {
         let obj = v.as_object().unwrap();
         assert_eq!(
             obj.get("event_type").and_then(|v| v.as_str()),
-            Some("interaction_status_update"),
+            Some("interaction.status_update"),
             "InteractionSseEvent serialization must preserve event_type tag, not null"
         );
     }

@@ -22,8 +22,8 @@ use crate::diagnostics::{Diagnostics, StatsEvent};
 use crate::error::AppError;
 use crate::interactions as interactions_lib;
 use crate::interactions_types::{
-    ContentDelta, ContentDeltaData, CreateModelInteractionParams, Interaction,
-    InteractionCompletedEvent, InteractionCreatedEvent, InteractionsInput,
+    CreateModelInteractionParams, Interaction, InteractionSseEvent, InteractionsInput,
+    StepDeltaData,
 };
 use crate::session::SessionStore;
 use crate::sse;
@@ -814,13 +814,11 @@ impl InteractionsHandler {
                                             }
                                         }
                                     }
-                                    // Track interaction_id from INTERACTION_CREATED events
-                                    if data.contains("INTERACTION_CREATED") {
-                                        if let Ok(ev) =
-                                            serde_json::from_str::<InteractionCreatedEvent>(data)
-                                        {
-                                            interaction_id = ev.interaction.id;
-                                        }
+                                    // Track interaction_id from interaction.created events
+                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
+                                        serde_json::from_str::<InteractionSseEvent>(data)
+                                    {
+                                        interaction_id = ev.interaction.id;
                                     }
                                 }
                             }
@@ -1635,12 +1633,14 @@ fn split_by_best_delimiter(text: &str, limit: usize, delimiters: &[&str]) -> Vec
 /// Translate a single Interactions stream event (JSON data line) into
 /// one or more Anthropic `StreamEvent` objects.
 ///
-/// Uses build-time generated types (`InteractionCreatedEvent`, `ContentDelta`,
-/// `InteractionCompletedEvent`) for type-safe deserialization of incoming
-/// interactions events, and `anyllm_translate::anthropic::StreamEvent` for
-/// type-safe construction of outgoing SSE payloads.
+/// Deserializes into the generated `InteractionSseEvent` enum for type-safe
+/// dispatch.  Construction of `StreamEvent` variants with complex inner types
+/// (MessageStart, ContentBlockStart, ContentBlockDelta, MessageDelta, Error)
+/// uses `serde_json::from_value(serde_json::json!({...}))` because the inner
+/// types are not publicly exported by `anyllm_translate`.
 ///
-/// Returns `None` for unrecognised or malformed events (they are silently skipped).
+/// Returns `None` for events that are intentionally skipped (status updates)
+/// or malformed (logged via `tracing::info!`).
 fn translate_stream_event(
     data: &str,
     _message_id: &str,
@@ -1648,14 +1648,17 @@ fn translate_stream_event(
 ) -> Option<Vec<anyllm_translate::anthropic::StreamEvent>> {
     use anyllm_translate::anthropic::StreamEvent;
 
-    let peek: serde_json::Value = serde_json::from_str(data).ok()?;
-    let event_type = peek.get("event_type")?.as_str()?;
+    let event: InteractionSseEvent = match serde_json::from_str(data) {
+        Ok(ev) => ev,
+        Err(e) => {
+            let preview: String = data.chars().take(200).collect();
+            tracing::info!(%e, data_preview = %preview, "unrecognized interactions SSE event, dropping");
+            return None;
+        }
+    };
 
-    match event_type {
-        "INTERACTION_CREATED" => {
-            let ev: InteractionCreatedEvent = serde_json::from_str(data).ok()?;
-            // MessageStartData and DeltaUsage are not public in anyllm_translate;
-            // construction via serde is the intended API for complex variants.
+    match event {
+        InteractionSseEvent::InteractionCreatedEvent(ev) => {
             let msg_start: StreamEvent = serde_json::from_value(serde_json::json!({
                 "type": "message_start",
                 "message": {
@@ -1678,29 +1681,52 @@ fn translate_stream_event(
             .ok()?;
             Some(vec![msg_start, block_start])
         }
-        "CONTENT_DELTA" => {
-            let ev: ContentDelta = serde_json::from_str(data).ok()?;
-            match ev.delta {
-                ContentDeltaData::TextDelta(td) => {
-                    let delta: StreamEvent = serde_json::from_value(serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": ev.index,
-                        "delta": {"type": "text_delta", "text": td.text}
-                    }))
-                    .ok()?;
-                    Some(vec![delta])
-                }
-                other => {
-                    tracing::warn!(
-                        delta = ?serde_json::to_string(&other).unwrap_or_default(),
-                        "unhandled non-text CONTENT_DELTA dropped"
-                    );
-                    None
-                }
-            }
+        InteractionSseEvent::StepStart(ev) => {
+            // Map all step types to a text content block — clients handle
+            // thinking vs text distinction via the delta type (signature_delta
+            // vs text_delta) rather than the block type.
+            let block_start: StreamEvent = serde_json::from_value(serde_json::json!({
+                "type": "content_block_start",
+                "index": ev.index,
+                "content_block": {"type": "text", "text": ""}
+            }))
+            .ok()?;
+            Some(vec![block_start])
         }
-        "INTERACTION_COMPLETED" => {
-            let ev: InteractionCompletedEvent = serde_json::from_str(data).ok()?;
+        InteractionSseEvent::StepDelta(ev) => match ev.delta {
+            StepDeltaData::TextDelta(td) => {
+                let delta: StreamEvent = serde_json::from_value(serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": ev.index,
+                    "delta": {"type": "text_delta", "text": td.text}
+                }))
+                .ok()?;
+                Some(vec![delta])
+            }
+            StepDeltaData::ThoughtSignatureDelta(tsd) => {
+                let signature = tsd.signature.unwrap_or_default();
+                let delta: StreamEvent = serde_json::from_value(serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": ev.index,
+                    "delta": {"type": "signature_delta", "signature": signature}
+                }))
+                .ok()?;
+                Some(vec![delta])
+            }
+            other => {
+                tracing::warn!(
+                    delta_type = ?serde_json::to_string(&other).unwrap_or_default(),
+                    "unhandled step.delta type, dropping"
+                );
+                None
+            }
+        },
+        InteractionSseEvent::StepStop(ev) => Some(vec![StreamEvent::ContentBlockStop {
+            index: ev.index as u32,
+        }]),
+        // Status updates have no client-visible effect; safe to skip silently.
+        InteractionSseEvent::InteractionStatusUpdate(_) => None,
+        InteractionSseEvent::InteractionCompletedEvent(ev) => {
             let input_tokens = ev
                 .interaction
                 .usage
@@ -1725,7 +1751,24 @@ fn translate_stream_event(
                 StreamEvent::MessageStop {},
             ])
         }
-        _ => None,
+        InteractionSseEvent::ErrorEvent(ev) => {
+            let msg = ev
+                .error
+                .as_ref()
+                .and_then(|e| e.message.as_deref())
+                .unwrap_or("unknown error");
+            let code = ev
+                .error
+                .as_ref()
+                .and_then(|e| e.code.as_deref())
+                .unwrap_or("api_error");
+            let err: StreamEvent = serde_json::from_value(serde_json::json!({
+                "type": "error",
+                "error": {"type": code, "message": msg}
+            }))
+            .ok()?;
+            Some(vec![err])
+        }
     }
 }
 
@@ -2015,23 +2058,46 @@ If you don't know the answer, say so honestly.";
         assert!(result.len() >= 3);
     }
 
-    // --- Streaming SSE event translation tests (RED) ---
+    // --- Streaming SSE event translation tests ---
 
-    /// Helper to extract the data portion from an SSE event's Debug representation.
+    /// A step.delta event with text content.
+    const STREAM_STEP_DELTA_TEXT: &str =
+        r#"{"event_type":"step.delta","delta":{"type":"text","text":"Hello"},"index":1}"#;
 
-    /// An interactions CONTENT_DELTA event with text content.
-    const STREAM_CONTENT_DELTA: &str =
-        r#"{"event_type":"CONTENT_DELTA","delta":{"type":"text_delta","text":"Hello"},"index":0}"#;
+    /// A step.delta event with thought_signature content.
+    const STREAM_STEP_DELTA_SIGNATURE: &str = r#"{"event_type":"step.delta","delta":{"type":"thought_signature","signature":"EjQKMgEMOdbHDmR4/UnibJL5"},"index":0}"#;
 
-    /// An interactions INTERACTION_CREATED event.
-    const STREAM_INTERACTION_CREATED: &str = r#"{"event_type":"INTERACTION_CREATED","interaction":{"id":"int-stream-1","status":"started","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z","steps":[]}}"#;
+    /// An interaction.created event.
+    const STREAM_INTERACTION_CREATED: &str = r#"{"event_type":"interaction.created","interaction":{"id":"int-stream-1","status":"in_progress","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:00Z","steps":[]}}"#;
 
-    /// An interactions INTERACTION_COMPLETED event with usage.
-    const STREAM_INTERACTION_COMPLETED: &str = r#"{"event_type":"INTERACTION_COMPLETED","interaction":{"id":"int-stream-1","status":"completed","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:01Z","steps":[],"usage":{"total_input_tokens":10,"total_output_tokens":20}}}"#;
+    /// An interaction.completed event with usage.
+    const STREAM_INTERACTION_COMPLETED: &str = r#"{"event_type":"interaction.completed","interaction":{"id":"int-stream-1","status":"completed","created":"2026-01-01T00:00:00Z","updated":"2026-01-01T00:00:01Z","steps":[],"usage":{"total_input_tokens":10,"total_output_tokens":20}}}"#;
+
+    /// A step.start event for a model_output step.
+    const STREAM_STEP_START_MODEL_OUTPUT: &str =
+        r#"{"event_type":"step.start","index":1,"step":{"type":"model_output"}}"#;
+
+    /// A step.start event for a thought step.
+    const STREAM_STEP_START_THOUGHT: &str =
+        r#"{"event_type":"step.start","index":0,"step":{"type":"thought"}}"#;
+
+    /// A step.stop event.
+    const STREAM_STEP_STOP: &str = r#"{"event_type":"step.stop","index":1}"#;
+
+    /// An error_event.
+    const STREAM_ERROR: &str =
+        r#"{"event_type":"error","error":{"code":"not_found","message":"Result not found."}}"#;
 
     #[test]
-    fn translate_content_delta_produces_block_delta() {
-        let events = translate_stream_event(STREAM_CONTENT_DELTA, "msg-1", "test-model").unwrap();
+    fn translate_step_delta_text_produces_block_delta() {
+        let events = translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "test-model").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn translate_step_delta_signature_produces_block_delta() {
+        let events =
+            translate_stream_event(STREAM_STEP_DELTA_SIGNATURE, "msg-1", "test-model").unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -2050,9 +2116,34 @@ If you don't know the answer, say so honestly.";
     }
 
     #[test]
+    fn translate_step_start_model_output_produces_text_block() {
+        let events = translate_stream_event(STREAM_STEP_START_MODEL_OUTPUT, "msg-1", "m").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn translate_step_start_thought_produces_text_block() {
+        let events = translate_stream_event(STREAM_STEP_START_THOUGHT, "msg-1", "m").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn translate_step_stop_produces_block_stop() {
+        let events = translate_stream_event(STREAM_STEP_STOP, "msg-1", "m").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn translate_error_event_produces_error() {
+        let events = translate_stream_event(STREAM_ERROR, "msg-1", "m").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
     fn translate_returns_none_for_unknown_event_type() {
-        let unknown = r#"{"event_type":"RANDOM_EVENT","data":"ignore"}"#;
-        let events = translate_stream_event(unknown, "msg-1", "test-model");
+        // "interaction.status_update" is a real event type but we skip it
+        let status_update = r#"{"event_type":"interaction.status_update","interaction_id":"abc","status":"in_progress"}"#;
+        let events = translate_stream_event(status_update, "msg-1", "test-model");
         assert!(events.is_none());
     }
 
@@ -2066,13 +2157,58 @@ If you don't know the answer, say so honestly.";
     fn translate_multiple_deltas_accumulate() {
         let events1 = translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "m").unwrap();
         assert!(!events1.is_empty());
-        let events2 = translate_stream_event(STREAM_CONTENT_DELTA, "msg-1", "m").unwrap();
+        let events2 = translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "m").unwrap();
         assert!(!events2.is_empty());
-        let delta2 = r#"{"event_type":"CONTENT_DELTA","delta":{"type":"text_delta","text":" World"},"index":0}"#;
+        let delta2 =
+            r#"{"event_type":"step.delta","delta":{"type":"text","text":" World"},"index":1}"#;
         let events3 = translate_stream_event(delta2, "msg-1", "m").unwrap();
         assert!(!events3.is_empty());
         let events4 = translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "m").unwrap();
         assert_eq!(events4.len(), 3);
+    }
+
+    #[test]
+    fn translate_full_dump_sequence() {
+        // Simulate the full event sequence from the dump
+        let created =
+            translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "gemini").unwrap();
+        assert_eq!(created.len(), 2); // message_start + content_block_start
+
+        let thought_start =
+            translate_stream_event(STREAM_STEP_START_THOUGHT, "msg-1", "gemini").unwrap();
+        assert_eq!(thought_start.len(), 1); // content_block_start (thinking)
+
+        let sig_delta =
+            translate_stream_event(STREAM_STEP_DELTA_SIGNATURE, "msg-1", "gemini").unwrap();
+        assert_eq!(sig_delta.len(), 1); // content_block_delta (signature)
+
+        let thought_stop = translate_stream_event(STREAM_STEP_STOP, "msg-1", "gemini").unwrap();
+        assert_eq!(thought_stop.len(), 1); // content_block_stop
+
+        let text_start =
+            translate_stream_event(STREAM_STEP_START_MODEL_OUTPUT, "msg-1", "gemini").unwrap();
+        assert_eq!(text_start.len(), 1); // content_block_start (text)
+
+        let text_delta = translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "gemini").unwrap();
+        assert_eq!(text_delta.len(), 1); // content_block_delta (text)
+
+        let text_stop = translate_stream_event(STREAM_STEP_STOP, "msg-1", "gemini").unwrap();
+        assert_eq!(text_stop.len(), 1); // content_block_stop
+
+        let completed =
+            translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "gemini").unwrap();
+        assert_eq!(completed.len(), 3); // content_block_stop + message_delta + message_stop
+
+        // Total events: 2 + 1 + 1 + 1 + 1 + 1 + 1 + 3 = 11
+        let total = created.len()
+            + thought_start.len()
+            + sig_delta.len()
+            + thought_stop.len()
+            + text_start.len()
+            + text_delta.len()
+            + text_stop.len()
+            + completed.len();
+        assert_eq!(total, 11);
     }
 
     #[test]

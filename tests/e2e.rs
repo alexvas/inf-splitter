@@ -1024,39 +1024,48 @@ control_extend_lifetime = "{CTRL_EXTEND}"
 #[tokio::test]
 async fn interactions_streaming_anthropic_sse_roundtrip() {
     let sse_body = format!(
-        "data: {created}\n\ndata: {delta1}\n\ndata: {delta2}\n\ndata: {completed}\n\n",
-        created = serde_json::json!({
-            "event_type": "INTERACTION_CREATED",
-            "interaction": {
-                "id": "int-stream-e2e-1",
-                "status": "started",
-                "created": "2026-01-01T00:00:00Z",
-                "updated": "2026-01-01T00:00:00Z",
-                "steps": []
-            }
-        }),
-        delta1 = serde_json::json!({
-            "event_type": "CONTENT_DELTA",
-            "delta": {"type": "text_delta", "text": "Hello"},
-            "index": 0
-        }),
-        delta2 = serde_json::json!({
-            "event_type": "CONTENT_DELTA",
-            "delta": {"type": "text_delta", "text": " from stream!"},
-            "index": 0
-        }),
-        completed = serde_json::json!({
-            "event_type": "INTERACTION_COMPLETED",
-            "interaction": {
-                "id": "int-stream-e2e-1",
-                "status": "completed",
-                "created": "2026-01-01T00:00:00Z",
-                "updated": "2026-01-01T00:00:01Z",
-                "steps": [],
-                "usage": {"total_input_tokens": 5, "total_output_tokens": 15}
-            }
-        }),
-    );
+"data: {created}\n\ndata: {step_start}\n\ndata: {delta1}\n\ndata: {delta2}\n\ndata: {step_stop}\n\ndata: {completed}\n\n",
+created = serde_json::json!({
+"event_type": "interaction.created",
+"interaction": {
+"id": "int-stream-e2e-1",
+"status": "in_progress",
+"created": "2026-01-01T00:00:00Z",
+"updated": "2026-01-01T00:00:00Z",
+"steps": []
+}
+}),
+step_start = serde_json::json!({
+"event_type": "step.start",
+"index": 0,
+"step": {"type": "model_output"}
+}),
+delta1 = serde_json::json!({
+"event_type": "step.delta",
+"delta": {"type": "text", "text": "Hello"},
+"index": 0
+}),
+delta2 = serde_json::json!({
+"event_type": "step.delta",
+"delta": {"type": "text", "text": " from stream!"},
+"index": 0
+}),
+step_stop = serde_json::json!({
+"event_type": "step.stop",
+"index": 0
+}),
+completed = serde_json::json!({
+    "event_type": "interaction.completed",
+        "interaction": {
+	                "id": "int-stream-e2e-1",
+	                "status": "completed",
+	                "created": "2026-01-01T00:00:00Z",
+	                "updated": "2026-01-01T00:00:01Z",
+	                "steps": [],
+	                "usage": {"total_input_tokens": 5, "total_output_tokens": 15}
+	            }
+	        }),
+	    );
 
     let session_store_path =
         std::env::temp_dir().join(format!("inf-splitter-stream-{}.toml", std::process::id()));
@@ -1185,24 +1194,33 @@ models = "gemini-3.1-flash-lite"
 #[tokio::test]
 async fn interactions_openai_streaming_returns_openai_sse() {
     let sse_body = format!(
-        "data: {created}\n\ndata: {delta}\n\ndata: {completed}\n\n",
+        "data: {created}\n\ndata: {step_start}\n\ndata: {delta}\n\ndata: {step_stop}\n\ndata: {completed}\n\n",
         created = serde_json::json!({
-            "event_type": "INTERACTION_CREATED",
+            "event_type": "interaction.created",
             "interaction": {
                 "id": "int-oa-stream-1",
-                "status": "started",
+                "status": "in_progress",
                 "created": "2026-01-01T00:00:00Z",
                 "updated": "2026-01-01T00:00:00Z",
                 "steps": []
             }
         }),
+        step_start = serde_json::json!({
+            "event_type": "step.start",
+            "index": 0,
+            "step": {"type": "model_output"}
+        }),
         delta = serde_json::json!({
-            "event_type": "CONTENT_DELTA",
-            "delta": {"type": "text_delta", "text": "OpenAI stream reply"},
+            "event_type": "step.delta",
+            "delta": {"type": "text", "text": "OpenAI stream reply"},
+            "index": 0
+        }),
+        step_stop = serde_json::json!({
+            "event_type": "step.stop",
             "index": 0
         }),
         completed = serde_json::json!({
-            "event_type": "INTERACTION_COMPLETED",
+            "event_type": "interaction.completed",
             "interaction": {
                 "id": "int-oa-stream-1",
                 "status": "completed",

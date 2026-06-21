@@ -256,9 +256,11 @@ fn resolve_schema(
             if let Some(ref_path) = variant.get("$ref").and_then(|v| v.as_str()) {
                 let ref_name = ref_path.split('/').next_back().unwrap();
                 let vname = variant_name.unwrap_or_else(|| ref_name.to_string());
-                // Use explicit mapping if available, otherwise derive from variant name
+                // Use explicit mapping if available, then try const tag,
+                // then derive from variant name as last resort.
                 let tag = if mapping.is_empty() {
-                    Some(derive_tag_from_variant(ref_name, name))
+                    try_const_tag(ref_name, discriminator.as_deref(), all_schemas)
+                        .or_else(|| Some(derive_tag_from_variant(ref_name, name)))
                 } else {
                     mapping
                         .iter()
@@ -709,4 +711,27 @@ fn derive_tag_from_variant(variant_name: &str, parent_enum_name: &str) -> String
         .strip_suffix(parent_enum_name)
         .unwrap_or(variant_name);
     to_snake_case(stripped)
+}
+
+/// Try to extract a serde tag value from a variant schema's `const` field on the
+/// discriminator property.  When a oneOf discriminator has no explicit `mapping`,
+/// the tag values are often encoded as `const` constraints on the discriminator
+/// property inside each variant's schema.
+///
+/// Example: schema `InteractionStatusUpdate` has
+///   `properties.event_type.const = "interaction.status_update"`
+/// → returns `Some("interaction.status_update")`.
+fn try_const_tag(
+    ref_name: &str,
+    discriminator: Option<&str>,
+    all_schemas: &serde_json::Value,
+) -> Option<String> {
+    let prop = discriminator?;
+    let schema = all_schemas.get(ref_name)?;
+    schema
+        .get("properties")?
+        .get(prop)?
+        .get("const")?
+        .as_str()
+        .map(String::from)
 }

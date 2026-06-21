@@ -182,20 +182,60 @@ Streaming from interactions endpoint returns SSE with discriminated event types:
 
 | Event type | Meaning |
 |-----------|---------|
-| `InteractionCreatedEvent` | Interaction created, contains full initial state |
-| `ContentDelta` | Incremental text/image/audio output |
-| `InteractionCompletedEvent` | Final interaction with usage |
-| `ErrorEvent` | Stream-level error |
+| `interaction.created` | Interaction created, contains full initial state |
+| `interaction.status_update` | Status change (skipped in translation) |
+| `step.start` | A new step begins (thought, model_output, tool_call, etc.) |
+| `step.delta` | Incremental output for the current step (text, thought_signature, etc.) |
+| `step.stop` | Current step completes, includes per-step usage |
+| `error` | Stream-level error |
+| `interaction.completed` | Final interaction with total usage |
+
+> **Note:** The old `content.delta` / `ContentDelta` events are no longer emitted by the current Gemini Interactions API. The protocol now uses `step.*` events.
 
 ### Scenario: Streaming Anthropic ingress → Interactions upstream
 - GIVEN `POST /v1/messages` with `"stream": true`
 - WHEN routing to interactions endpoint with `stream: true`
-- THEN `ContentDelta` events translated to Anthropic SSE format
+- THEN SSE events translated to Anthropic SSE format:
+  - `interaction.created` → `message_start` + `content_block_start` (initial text block)
+  - `step.start` → `content_block_start`
+  - `step.delta` (text) → `content_block_delta { type: "text_delta" }`
+  - `step.delta` (thought_signature) → `content_block_delta { type: "signature_delta" }`
+  - `step.stop` → `content_block_stop`
+  - `error` → `event: error` with `{"type": "error", "error": {"type": "<code>", "message": "<message>"}}`
+  - `interaction.completed` → `message_delta { stop_reason }` + `message_stop`
 
 ### Scenario: Streaming OpenAI ingress → Interactions upstream
 - GIVEN `POST /v1/chat/completions` with `"stream": true`
 - WHEN routing to interactions endpoint with `stream: true`
-- THEN `ContentDelta` events translated to OpenAI SSE chunks, `[DONE]` on completion
+- THEN step.* events translated to OpenAI SSE chunks, `[DONE]` on completion (via `ReverseStreamingTranslator`)
+
+### Scenario: Full stream lifecycle with thinking
+- GIVEN an interactions response with:
+  - `interaction.created`
+  - `step.start { type: "thought" }`
+  - `step.delta { delta: { type: "thought_signature", signature: "..." } }`
+  - `step.stop`
+  - `step.start { type: "model_output" }`
+  - `step.delta { delta: { type: "text", text: "Hello" } }`
+  - `step.stop`
+  - `interaction.completed`
+- WHEN the proxy translates the stream to Anthropic format
+- THEN the client receives:
+  - `message_start`
+  - `content_block_start` (text type, from interaction.created)
+  - `content_block_start` (text type, from step.start thought)
+  - `content_block_delta { type: "signature_delta", signature: "..." }`
+  - `content_block_stop`
+  - `content_block_start` (text type, from step.start model_output)
+  - `content_block_delta { type: "text_delta", text: "Hello" }`
+  - `content_block_stop`
+  - `message_delta { stop_reason: "end_turn" }`
+  - `message_stop`
+
+### Scenario: Error event translation
+- GIVEN an interactions SSE event `{"event_type": "error", "error": {"code": "not_found", "message": "Result not found."}}`
+- WHEN the proxy translates it to Anthropic streaming format
+- THEN the client receives `event: error` with `{"type": "error", "error": {"type": "not_found", "message": "Result not found."}}`
 
 ## Requirement: Interactions Request/Response Types
 
@@ -205,6 +245,68 @@ Rust types for the interactions protocol are generated at build time from `schem
 - GIVEN `schemas/interactions.openapi.json` exists in the repo
 - WHEN `cargo build` runs
 - THEN build.rs generates types without network access
+
+## Requirement: build.rs Infers OneOf Discriminator Tags from const
+
+When a oneOf discriminator schema has no explicit `mapping`, `build.rs` must inspect each variant's target schema for a `const` value on the discriminator property. If found, this value becomes the `#[serde(rename)]` tag for the enum variant.
+
+### Scenario: Tag inferred from const on event_type property
+- GIVEN schema `InteractionSseEvent` has discriminator `propertyName: "event_type"` with no `mapping`
+- AND variant `InteractionStatusUpdate` has `properties.event_type.const = "interaction.status_update"`
+- WHEN `build.rs` generates the `InteractionSseEvent` enum
+- THEN the variant is annotated `#[serde(rename = "interaction.status_update")]`
+
+### Scenario: Fallback to derive_tag_from_variant when no const
+- GIVEN a variant whose target schema has no `const` on the discriminator property
+- WHEN `build.rs` resolves the tag
+- THEN it falls back to `derive_tag_from_variant()` (existing behavior)
+
+## Requirement: translate_stream_event Uses Typed InteractionSseEvent
+
+`translate_stream_event` deserializes each SSE data line into `InteractionSseEvent` using serde's tag dispatch. Manual `event_type` string matching is removed.
+
+### Scenario: Typed event dispatch
+- GIVEN an SSE data line with `"event_type": "step.delta"`
+- WHEN `serde_json::from_str::<InteractionSseEvent>(data)` is called
+- THEN it deserializes as `InteractionSseEvent::StepDelta(StepDelta { ... })`
+- AND the match arm receives typed data without manual string comparison
+
+## Requirement: Document JSON Roundtrip Usage
+
+When `StreamEvent` variants are constructed via `serde_json::from_value(serde_json::json!({...}))` because their inner types are not publicly exported by `anyllm_translate`, the code must include a comment on the same line block explaining **why** a direct constructor cannot be used.
+
+### Scenario: All JSON roundtrip sites are annotated
+- GIVEN any `serde_json::from_value(serde_json::json!({...}))` call that constructs a `StreamEvent`
+- WHEN reading the code
+- THEN a nearby comment explains that the inner type is not public in `anyllm_translate`
+
+## Requirement: Handling Policy for Unsupported-but-Valid Events
+
+Events that are valid (correctly deserialized) but not fully supported fall into three categories with distinct behavior:
+
+| Category | Example | Behavior | Rationale |
+|----------|---------|----------|-----------|
+| **Malformed data** | Invalid JSON, unknown `event_type` | `tracing::info!` with raw data prefix (first 200 chars), then drop | `info!` (not `warn!`) because protocol evolution may introduce new event types that are safe to ignore |
+| **No client impact** | `interaction.status_update` | Skip silently; code comment explains why | `tracing::warn!` would produce noise for an expected, harmless event |
+| **Not yet implemented** | Unhandled delta types (`image_delta`, `audio_delta`, etc.) | `tracing::warn!` with event type; stream continues | Makes the gap visible to operators; serves as a signal to prioritize implementation |
+
+### Scenario: Malformed event logged then dropped
+- GIVEN an SSE data line `{"event_type": "future.unknown_event", "payload": ...}`
+- WHEN `serde_json::from_str::<InteractionSseEvent>` returns `Err`
+- THEN `tracing::info!` is emitted with the first 200 chars of the raw data
+- AND `None` is returned (event dropped, stream continues)
+
+### Scenario: interaction.status_update skipped silently
+- GIVEN an SSE event `{"event_type": "interaction.status_update", "status": "in_progress"}`
+- WHEN `translate_stream_event` processes it
+- THEN it returns `None` (event skipped)
+- AND a code comment above the `InteractionStatusUpdate` match arm states "status updates have no client-visible effect; safe to skip"
+
+### Scenario: Unhandled delta type logged
+- GIVEN an SSE event `{"event_type": "step.delta", "delta": {"type": "image_delta", "image": "..."}}`
+- WHEN `translate_stream_event` processes it and encounters an unhandled delta variant
+- THEN `tracing::warn!(delta_type = "image_delta", "unhandled step.delta type, dropping")` is emitted
+- AND `None` is returned (event dropped, stream continues)
 
 ## Requirement: Typed Construction Pipeline
 

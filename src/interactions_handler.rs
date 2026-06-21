@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
-use crate::auth::forward_request_headers;
+use crate::auth::{is_auth_header, should_forward_request_header};
 use crate::config::{Config, Protocol, RouteTarget};
 use crate::control::{scan_control_messages, ControlAction};
 use crate::diagnostics::{Diagnostics, StatsEvent};
@@ -1262,10 +1262,24 @@ fn build_interactions_headers(
     api_key: Option<&str>,
     request_headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
-    let b = builder.header("Content-Type", "application/json");
-    let b = b.header("Api-Revision", API_REVISION);
-    // Forward client tracing/observability headers (non-hop-by-hop)
-    let b = forward_request_headers(b, request_headers, None);
+    let mut b = builder.header("Content-Type", "application/json");
+    b = b.header("Api-Revision", API_REVISION);
+    // Forward non-hop-by-hop headers, but strip incoming auth headers
+    // when we have a configured API key.  Using forward_request_headers
+    // with Some(key) would add Authorization + x-api-key, which conflicts
+    // with x-goog-api-key (Gemini returns OVERLOADED_CREDENTIALS).
+    for (name, value) in request_headers.iter() {
+        let name_str = name.as_str();
+        if !should_forward_request_header(name_str) {
+            continue;
+        }
+        if api_key.is_some() && is_auth_header(name_str) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            b = b.header(name_str, v);
+        }
+    }
     if let Some(key) = api_key {
         b.header("x-goog-api-key", key)
     } else {
@@ -1910,6 +1924,111 @@ If you don't know the answer, say so honestly.";
         assert!(
             result.is_err(),
             "unsplittable contiguous segment must cause an error"
+        );
+    }
+
+    // --- build_interactions_headers tests ---
+
+    use axum::http::{HeaderMap, HeaderValue};
+    use reqwest::Client;
+
+    fn request_headers_with_auth() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer client-sk-ant-key"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("client-api-key"));
+        headers.insert("x-request-id", HeaderValue::from_static("trace-12345"));
+        headers.insert("x-custom-trace", HeaderValue::from_static("custom-value"));
+        headers
+    }
+
+    #[test]
+    fn build_interactions_headers_sets_x_goog_api_key() {
+        let client = Client::new();
+        let builder = client.get("http://example.com");
+        let result = build_interactions_headers(builder, Some("gemini-key-123"), &HeaderMap::new());
+        let req = result.build().expect("build request");
+        assert_eq!(
+            req.headers().get("x-goog-api-key").unwrap(),
+            "gemini-key-123"
+        );
+    }
+
+    #[test]
+    fn build_interactions_headers_strips_client_auth_when_key_set() {
+        let client = Client::new();
+        let builder = client.get("http://example.com");
+        let result = build_interactions_headers(
+            builder,
+            Some("gemini-key-123"),
+            &request_headers_with_auth(),
+        );
+        let req = result.build().expect("build request");
+        assert!(
+            req.headers().get("Authorization").is_none(),
+            "client Authorization must be stripped when api_key is set"
+        );
+        assert!(
+            req.headers().get("x-api-key").is_none(),
+            "client x-api-key must be stripped when api_key is set"
+        );
+        assert_eq!(
+            req.headers().get("x-goog-api-key").unwrap(),
+            "gemini-key-123",
+            "x-goog-api-key must be set from api_key"
+        );
+    }
+
+    #[test]
+    fn build_interactions_headers_forwards_client_auth_when_no_key() {
+        let client = Client::new();
+        let builder = client.get("http://example.com");
+        let result = build_interactions_headers(builder, None, &request_headers_with_auth());
+        let req = result.build().expect("build request");
+        assert_eq!(
+            req.headers().get("Authorization").unwrap(),
+            "Bearer client-sk-ant-key",
+            "client Authorization must be forwarded when api_key is None"
+        );
+        assert!(
+            req.headers().get("x-goog-api-key").is_none(),
+            "x-goog-api-key must NOT be set when api_key is None"
+        );
+    }
+
+    #[test]
+    fn build_interactions_headers_forwards_non_auth_headers() {
+        let client = Client::new();
+        let builder = client.get("http://example.com");
+
+        // With api_key
+        let result = build_interactions_headers(
+            builder,
+            Some("gemini-key-123"),
+            &request_headers_with_auth(),
+        );
+        let req = result.build().expect("build request");
+        assert_eq!(
+            req.headers().get("x-request-id").unwrap(),
+            "trace-12345",
+            "non-auth headers must be forwarded when api_key is set"
+        );
+        assert_eq!(
+            req.headers().get("x-custom-trace").unwrap(),
+            "custom-value",
+            "custom headers must be forwarded when api_key is set"
+        );
+
+        // Without api_key
+        let builder2 = client.get("http://example.com");
+        let result2 = build_interactions_headers(builder2, None, &request_headers_with_auth());
+        let req2 = result2.build().expect("build request");
+        assert_eq!(
+            req2.headers().get("x-request-id").unwrap(),
+            "trace-12345",
+            "non-auth headers must be forwarded when api_key is None"
         );
     }
 }

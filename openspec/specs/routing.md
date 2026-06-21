@@ -157,6 +157,26 @@ When both `endpoint_interactions` and another endpoint are set, the ingress prot
 - WHEN `POST /v1/chat/completions` arrives
 - THEN the request is translated OpenAI→Interactions and sent upstream
 
+### Scenario: Client auth headers suppressed for interactions
+- GIVEN section has `api_key` set and client sends `Authorization: Bearer sk-ant-...`
+- WHEN the request is forwarded to the interactions upstream
+- THEN client auth headers (`Authorization`, `x-api-key`) are stripped, only `x-goog-api-key` is sent
+
+### Scenario: No API key — client auth passthrough
+- GIVEN section has no `api_key` configured
+- WHEN the request is forwarded to the interactions upstream
+- THEN client auth headers (if any) pass through unchanged
+
+### Scenario: Non-auth headers always forwarded
+- GIVEN `api_key` is set and client sends `x-request-id: trace-123`
+- WHEN the request is forwarded to the interactions upstream
+- THEN `x-request-id` is present regardless of `api_key`
+
+### Scenario: x-goog-api-key matches configured api_key
+- GIVEN section has `api_key = "my-gemini-key"`
+- WHEN `POST /v1/messages` is dispatched to interactions upstream
+- THEN upstream receives `x-goog-api-key: my-gemini-key`
+
 ## Requirement: Response Translation to Client Protocol
 
 When `InteractionsHandler` receives an upstream response, it translates the response back to the client's ingress protocol:

@@ -1520,3 +1520,152 @@ control_clean_all = "{CTRL_CLEAN_ALL}"
 
     let _ = std::fs::remove_file(&session_path);
 }
+
+// ── Interactions auth header tests ──
+
+#[tokio::test]
+async fn interactions_strips_client_auth_headers_when_api_key_set() {
+    use std::sync::Mutex as StdMutex;
+    let captured_headers: Arc<StdMutex<Option<axum::http::HeaderMap>>> =
+        Arc::new(StdMutex::new(None));
+    let captured_headers_clone = captured_headers.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/interactions",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap,
+                  axum::Json(_body): axum::Json<serde_json::Value>| async move {
+                *captured_headers_clone.lock().unwrap() = Some(headers);
+                axum::Json(interactions_upstream_response(
+                    "int-auth-1",
+                    "Reply with api_key",
+                ))
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+api_key = "my-gemini-secret-key"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = make_anthropic_request("gemini-3.1-flash-lite");
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("Authorization", "Bearer client-sk-ant-key")
+        .header("x-api-key", "client-api-key")
+        .header("x-custom-trace", "trace-12345")
+        .json(&serde_json::to_value(&request).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let headers = captured_headers
+        .lock()
+        .unwrap()
+        .take()
+        .expect("captured headers");
+
+    // Client auth headers must be stripped
+    assert!(
+        headers.get("Authorization").is_none(),
+        "client Authorization must be stripped when api_key is set"
+    );
+    assert!(
+        headers.get("x-api-key").is_none(),
+        "client x-api-key must be stripped when api_key is set"
+    );
+
+    // x-goog-api-key must be set from config api_key
+    assert_eq!(
+        headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()),
+        Some("my-gemini-secret-key"),
+        "x-goog-api-key must be set from config api_key"
+    );
+
+    // Non-auth client headers must still be forwarded
+    assert_eq!(
+        headers.get("x-custom-trace").and_then(|v| v.to_str().ok()),
+        Some("trace-12345"),
+        "non-auth client headers must still be forwarded"
+    );
+}
+
+#[tokio::test]
+async fn interactions_sets_x_goog_api_key_from_config() {
+    use std::sync::Mutex as StdMutex;
+    let captured_headers: Arc<StdMutex<Option<axum::http::HeaderMap>>> =
+        Arc::new(StdMutex::new(None));
+    let captured_headers_clone = captured_headers.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/interactions",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap,
+                  axum::Json(_body): axum::Json<serde_json::Value>| async move {
+                *captured_headers_clone.lock().unwrap() = Some(headers);
+                axum::Json(interactions_upstream_response(
+                    "int-auth-2",
+                    "Reply with x-goog-api-key",
+                ))
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+api_key = "another-secret-key"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = make_anthropic_request("gemini-3.1-flash-lite");
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::to_value(&request).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let headers = captured_headers
+        .lock()
+        .unwrap()
+        .take()
+        .expect("captured headers");
+
+    assert_eq!(
+        headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()),
+        Some("another-secret-key"),
+        "x-goog-api-key must match config api_key"
+    );
+    assert_eq!(
+        headers.get("Api-Revision").and_then(|v| v.to_str().ok()),
+        Some("2026-05-20"),
+        "Api-Revision must always be sent"
+    );
+    assert_eq!(
+        headers.get("Content-Type").and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "Content-Type must always be application/json"
+    );
+}

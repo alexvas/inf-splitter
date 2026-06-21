@@ -6,7 +6,7 @@ HTTP proxy that routes LLM inference requests to OpenAI- and Anthropic-compatibl
 
 - **Language:** Rust (edition 2021)
 - **Web framework:** Axum 0.8 + Tokio
-- **HTTP client:** reqwest 0.12 (rustls-tls-native-roots, SOCKS proxy support)
+- **HTTP client:** reqwest 0.12 (rustls-tls-native-roots, gzip, SOCKS proxy support)
 - **Protocol translation:** anyllm_translate 0.9
 - **Config format:** TOML
 - **Serialization:** serde + serde_json
@@ -41,7 +41,7 @@ All three checks (`fmt`, `clippy`, `test`) must pass before merging. CI runs the
 |-------|---------|
 | anyllm_translate | OpenAI↔Anthropic protocol conversion |
 | axum | HTTP server framework |
-| reqwest | HTTP client (rustls, SOCKS) |
+| reqwest | HTTP client (rustls, gzip, SOCKS) |
 | tower-http | Body limiting, tracing middleware |
 | base64 | Non-UTF8 body encoding in dumps |
 | flate2, zip | Diagnostic file compression |

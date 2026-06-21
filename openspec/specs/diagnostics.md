@@ -63,6 +63,11 @@ Each stats line is an NDJSON `StatsEvent` with fields:
 - WHEN the event is serialized
 - THEN the field is omitted from JSON output
 
+### Scenario: Error field contains decoded text
+- GIVEN upstream returns a gzip-compressed error response (e.g. Gemini API)
+- WHEN the stats event is recorded
+- THEN `error` contains the decompressed JSON text (reqwest with `gzip` feature auto-decompresses)
+
 ## Requirement: Dump Event Format
 
 Each dump line is an NDJSON `DumpEvent` with fields:

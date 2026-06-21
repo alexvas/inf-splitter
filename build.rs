@@ -592,7 +592,6 @@ fn generate_string_enum(name: &str, description: &Option<String>, values: &[Stri
     }
 
     code.push_str("#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n");
-    code.push_str("#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]\n");
     code.push_str(&format!("pub enum {} {{\n", to_pascal_case(name)));
 
     for value in values {

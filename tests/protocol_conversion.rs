@@ -2161,6 +2161,200 @@ max_file_size = "1k"
     let _ = fs::remove_file(&tmp);
 }
 
+/// When `compression = "7z"` is set, rotated files must be compressed to `.ndjson.7z`
+/// and the original uncompressed file must be removed.
+#[tokio::test]
+async fn diagnostics_rotation_compresses_with_7z() {
+    use common::wait_for_file;
+    use std::fs;
+
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("rot7z-model", "response-text"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-7z-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "rot7z-model"
+
+[diagnostics]
+dump_mode = "all"
+dump_output = "{dump_path}"
+max_file_size = "1k"
+compression = "7z"
+"#,
+        dump_path = tmp.display()
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        max_file_size: Some(1024),
+        compression: Some(inf_splitter::diagnostics::Compression::SevenZ),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+
+    // Send multiple requests to fill the file past 1KB and trigger rotation
+    for i in 0..5 {
+        let response = post_anthropic(
+            &proxy_addr,
+            serde_json::json!({
+                "model": "rot7z-model",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": format!("msg-{}", i)}]
+            }),
+        )
+        .await;
+        let _ = response.text().await;
+    }
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(!lines.is_empty(), "current file should have content");
+
+    // Wait a bit for background compression to finish
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify a compressed .ndjson.7z file exists
+    let dir = tmp.parent().unwrap();
+    let compressed: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("inf-splitter-7z-")
+                && e.file_name().to_string_lossy().ends_with(".ndjson.7z")
+        })
+        .collect();
+
+    assert!(
+        !compressed.is_empty(),
+        "must have at least one compressed .7z file in {:?}",
+        dir
+    );
+
+    // The compressed file should be smaller than the original would be
+    // (50M uncompressed → 7z should be much smaller)
+    for entry in &compressed {
+        let size = entry.metadata().unwrap().len();
+        assert!(
+            size > 0,
+            "compressed file {} must be non-empty",
+            entry.file_name().to_string_lossy()
+        );
+    }
+
+    // Clean up
+    for entry in compressed {
+        let _ = fs::remove_file(entry.path());
+    }
+    let _ = fs::remove_file(&tmp);
+}
+
+/// When `compression = "bz2"` is set, rotated files must be compressed to `.ndjson.bz2`
+/// and the original uncompressed file must be removed.
+#[tokio::test]
+async fn diagnostics_rotation_compresses_with_bz2() {
+    use common::wait_for_file;
+    use std::fs;
+
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("rotbz2-model", "response-text"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-bz2-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "rotbz2-model"
+
+[diagnostics]
+dump_mode = "all"
+dump_output = "{dump_path}"
+max_file_size = "1k"
+compression = "bz2"
+"#,
+        dump_path = tmp.display()
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        max_file_size: Some(1024),
+        compression: Some(inf_splitter::diagnostics::Compression::Bz2),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+
+    for i in 0..5 {
+        let response = post_anthropic(
+            &proxy_addr,
+            serde_json::json!({
+                "model": "rotbz2-model",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": format!("msg-{}", i)}]
+            }),
+        )
+        .await;
+        let _ = response.text().await;
+    }
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(!lines.is_empty(), "current file should have content");
+
+    // Wait for background compression
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let dir = tmp.parent().unwrap();
+    let compressed: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("inf-splitter-bz2-")
+                && e.file_name().to_string_lossy().ends_with(".ndjson.bz2")
+        })
+        .collect();
+
+    assert!(
+        !compressed.is_empty(),
+        "must have at least one compressed .bz2 file in {:?}",
+        dir
+    );
+
+    for entry in &compressed {
+        let size = entry.metadata().unwrap().len();
+        assert!(
+            size > 0,
+            "compressed file {} must be non-empty",
+            entry.file_name().to_string_lossy()
+        );
+    }
+
+    // Clean up
+    for entry in compressed {
+        let _ = fs::remove_file(entry.path());
+    }
+    let _ = fs::remove_file(&tmp);
+}
+
 fn uuid_suffix() -> String {
     use std::time::SystemTime;
     let ts = SystemTime::now()
@@ -2613,7 +2807,9 @@ models = "gemini-3.1-flash-lite"
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let _body = response.text().await.expect("response body");
 
-    let lines = wait_for_file(&tmp).await;
+    // Wait for the egress response dump — by then ingress and egress
+    // request dumps are also flushed.
+    let lines = wait_for_egress_response_dump(&tmp).await;
     assert!(
         lines.len() >= 3,
         "expected at least 3 dump lines (ingress, egress request, egress response), got {}",

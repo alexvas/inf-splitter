@@ -621,7 +621,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Compress a file in a background thread. Returns the compressed path on success.
+/// Compress a file in a background thread.
 fn compress_file(src: PathBuf, compression: &Compression) -> tokio::task::JoinHandle<()> {
     let comp = compression.clone();
     tokio::task::spawn_blocking(move || {
@@ -635,7 +635,6 @@ fn compress_file(src: PathBuf, compression: &Compression) -> tokio::task::JoinHa
             src.extension().unwrap_or_default().to_string_lossy(),
             ext
         ));
-
         match &comp {
             Compression::Zip => {
                 let input = match std::fs::File::open(&src) {
@@ -645,45 +644,73 @@ fn compress_file(src: PathBuf, compression: &Compression) -> tokio::task::JoinHa
                         return;
                     }
                 };
-                let output = match std::fs::File::create(&dst) {
+                let entry = src.file_name().unwrap_or_default().to_string_lossy();
+                compress_with_output(&src, &dst, "zip", |output| {
+                    let mut w = zip::ZipWriter::new(output);
+                    let opts = zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated);
+                    w.start_file(entry, opts)?;
+                    std::io::copy(&mut std::io::BufReader::new(input), &mut w)?;
+                    w.finish()?;
+                    Ok(())
+                });
+            }
+            Compression::Bz2 => {
+                let input = match std::fs::File::open(&src) {
                     Ok(f) => f,
                     Err(e) => {
-                        tracing::error!(dst = %dst.display(), error = %e, "compress: create failed");
+                        tracing::error!(src = %src.display(), error = %e, "compress: open failed");
                         return;
                     }
                 };
-                let mut zipw = zip::ZipWriter::new(output);
-                let options = zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated);
-                let entry_name = src.file_name().unwrap_or_default().to_string_lossy();
-                if let Err(e) = zipw.start_file(entry_name.as_ref(), options) {
-                    tracing::error!(dst = %dst.display(), error = %e, "compress: zip start failed");
-                    let _ = std::fs::remove_file(&dst);
-                    return;
-                }
-                if let Err(e) = std::io::copy(&mut std::io::BufReader::new(input), &mut zipw) {
-                    tracing::error!(src = %src.display(), error = %e, "compress: zip write failed");
-                    let _ = std::fs::remove_file(&dst);
-                    return;
-                }
-                if let Err(e) = zipw.finish() {
-                    tracing::error!(dst = %dst.display(), error = %e, "compress: zip finish failed");
-                    let _ = std::fs::remove_file(&dst);
-                    return;
-                }
-                if let Err(e) = std::fs::remove_file(&src) {
-                    tracing::error!(src = %src.display(), error = %e, "compress: remove original failed");
-                }
-                tracing::debug!(src = %src.display(), dst = %dst.display(), "rotated file compressed");
+                compress_with_output(&src, &dst, "bz2", |output| {
+                    let mut enc = bzip2::write::BzEncoder::new(output, bzip2::Compression::best());
+                    std::io::copy(&mut std::io::BufReader::new(input), &mut enc)?;
+                    enc.finish()?;
+                    Ok(())
+                });
             }
-            Compression::Bz2 | Compression::SevenZ => {
-                tracing::warn!(
-                    compression = ?comp,
-                    "compression not yet implemented, leaving uncompressed"
-                );
+            Compression::SevenZ => {
+                compress_with_output(&src, &dst, "7z", |output| {
+                    let mut sz = sevenz_rust::SevenZWriter::new(output)
+                        .map_err(Box::<dyn std::error::Error>::from)?;
+                    sz.push_source_path(&src, |_| true)
+                        .map_err(Box::<dyn std::error::Error>::from)?;
+                    sz.finish().map_err(Box::<dyn std::error::Error>::from)?;
+                    Ok(())
+                });
             }
         }
     })
+}
+
+/// Create output file, run compression closure, then on success remove source.
+/// On failure, remove the output and log.
+fn compress_with_output(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    label: &str,
+    f: impl FnOnce(std::fs::File) -> Result<(), Box<dyn std::error::Error>>,
+) {
+    let output = match std::fs::File::create(dst) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(dst = %dst.display(), error = %e, "compress: create output failed");
+            return;
+        }
+    };
+    match f(output) {
+        Ok(()) => {
+            if let Err(e) = std::fs::remove_file(src) {
+                tracing::error!(src = %src.display(), error = %e, "compress: remove original failed");
+            }
+            tracing::debug!(src = %src.display(), dst = %dst.display(), "rotated file compressed");
+        }
+        Err(e) => {
+            tracing::error!(src = %src.display(), dst = %dst.display(), error = %e, "compress: {} failed", label);
+            let _ = std::fs::remove_file(dst);
+        }
+    }
 }
 
 /// Delete oldest rotated files until total size ≤ `max_size`.

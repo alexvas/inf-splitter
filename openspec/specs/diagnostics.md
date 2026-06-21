@@ -184,6 +184,25 @@ When `max_file_size` is set, the current output file is rotated when it exceeds 
 - WHEN rotation completes
 - THEN the rotated file is compressed to `.ndjson.zip` in a background thread
 
+### Scenario: 7z compression after rotation
+- GIVEN `compression = "7z"` and `max_file_size` is set
+- WHEN a dump file is rotated
+- THEN the rotated file is compressed to `.ndjson.7z`
+- AND the original `.ndjson` file is removed
+
+### Scenario: Bz2 compression after rotation
+- GIVEN `compression = "bz2"` and `max_file_size` is set
+- WHEN a dump file is rotated
+- THEN the rotated file is compressed to `.ndjson.bz2`
+- AND the original `.ndjson` file is removed
+
+### Scenario: Compression failure preserves original
+- GIVEN any compression is configured
+- AND the compression fails (e.g., disk full)
+- WHEN compression is attempted
+- THEN the original `.ndjson` file is preserved
+- AND an error is logged
+
 ### Scenario: Old file cleanup
 - GIVEN `max_rotated_size = "1g"` and rotated files total 1.2 GiB
 - WHEN rotation occurs

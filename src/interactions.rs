@@ -5,10 +5,15 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::config::RouteTarget;
+use crate::config::{Protocol, RouteTarget};
 use crate::interactions_types::{
     Content, CreateModelInteractionParams, GenerationConfig, Interaction, InteractionsInput, Step,
     TextContent, Tool, ToolChoice,
+};
+use anyllm_translate::anthropic::{ContentBlock, MessageResponse, Role, StopReason, Usage};
+use anyllm_translate::openai::{
+    ChatCompletionResponse, ChatContent, ChatMessage, ChatRole, ChatUsage, Choice, FinishReason,
+    FunctionCall, ToolCall,
 };
 
 /// Build an interactions request from Anthropic ingress.
@@ -186,6 +191,151 @@ pub fn single_element_too_large(contents: &[Content], limit: usize) -> bool {
     contents
         .iter()
         .any(|c| serde_json::to_vec(c).map(|v| v.len()).unwrap_or(0) > limit)
+}
+
+/// Extract function tool calls from an Interaction response.
+///
+/// Returns `None` when the interaction has no function_call steps (i.e., the
+/// model did not request any tool invocation) or the status is not
+/// `"requires_action"`. Returns `Some(Vec<(id, name, arguments)>)` for each
+/// `FunctionCallStep` found.
+pub fn extract_interaction_tool_calls(
+    interaction: &Interaction,
+) -> Option<Vec<(String, String, serde_json::Value)>> {
+    if interaction.status != "requires_action" {
+        return None;
+    }
+    let calls: Vec<_> = interaction
+        .steps
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|step| match step {
+            Step::FunctionCallStep(fcs) => Some((
+                fcs.id.clone(),
+                fcs.name.clone(),
+                fcs.arguments.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        })
+        .collect();
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+/// Build a typed protocol response from an Interaction.
+///
+/// Extracts text and tool calls from the interaction and constructs the
+/// appropriate response type (Anthropic `MessageResponse` or OpenAI
+/// `ChatCompletionResponse`).  Uses `stop_reason: "tool_use"` /
+/// `finish_reason: "tool_calls"` when the status is `"requires_action"`,
+/// `"end_turn"` / `"stop"` otherwise.
+pub fn build_response_from_interaction(
+    interaction: &Interaction,
+    model: &str,
+    ingress: Protocol,
+) -> Result<serde_json::Value, String> {
+    let text = extract_interaction_text(interaction);
+    let tool_calls = extract_interaction_tool_calls(interaction);
+    let input_tokens = interaction
+        .usage
+        .as_ref()
+        .and_then(|u| u.total_input_tokens)
+        .unwrap_or(0);
+    let output_tokens = interaction
+        .usage
+        .as_ref()
+        .and_then(|u| u.total_output_tokens)
+        .unwrap_or(0);
+
+    match ingress {
+        Protocol::OpenAi => {
+            let (content, tool_calls_field, finish_reason) = if let Some(ref calls) = tool_calls {
+                let tc: Vec<ToolCall> = calls
+                    .iter()
+                    .map(|(id, name, args)| ToolCall {
+                        id: id.clone(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: name.clone(),
+                            arguments: serde_json::to_string(args).unwrap_or_default(),
+                        },
+                    })
+                    .collect();
+                (None, Some(tc), FinishReason::ToolCalls)
+            } else {
+                (Some(ChatContent::Text(text)), None, FinishReason::Stop)
+            };
+            let typed = ChatCompletionResponse {
+                id: interaction.id.clone(),
+                object: "chat.completion".to_string(),
+                model: model.to_string(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage {
+                        role: ChatRole::Assistant,
+                        content,
+                        name: None,
+                        tool_calls: tool_calls_field,
+                        tool_call_id: None,
+                        refusal: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: Some(finish_reason),
+                    logprobs: None,
+                }],
+                usage: Some(ChatUsage {
+                    prompt_tokens: input_tokens as u32,
+                    completion_tokens: output_tokens as u32,
+                    total_tokens: (input_tokens + output_tokens) as u32,
+                    completion_tokens_details: None,
+                    prompt_tokens_details: None,
+                }),
+                created: None,
+                system_fingerprint: None,
+                service_tier: None,
+            };
+            serde_json::to_value(typed).map_err(|e| e.to_string())
+        }
+        Protocol::Anthropic => {
+            let content: Vec<ContentBlock> = if let Some(ref calls) = tool_calls {
+                calls
+                    .iter()
+                    .map(|(id, name, args)| ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: args.clone(),
+                    })
+                    .collect()
+            } else {
+                vec![ContentBlock::Text { text: text.clone() }]
+            };
+            let stop_reason = if tool_calls.is_some() {
+                Some(StopReason::ToolUse)
+            } else {
+                Some(StopReason::EndTurn)
+            };
+            let typed = MessageResponse {
+                id: interaction.id.clone(),
+                response_type: "message".to_string(),
+                role: Role::Assistant,
+                model: model.to_string(),
+                content,
+                stop_reason,
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: input_tokens as u32,
+                    output_tokens: output_tokens as u32,
+                    ..Default::default()
+                },
+                created: None,
+            };
+            serde_json::to_value(typed).map_err(|e| e.to_string())
+        }
+    }
 }
 
 /// Extract response text from Interaction using generated types.
@@ -394,6 +544,7 @@ fn extract_openai_system(messages: &[serde_json::Value]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interactions_types::FunctionCallStep;
 
     fn test_route() -> RouteTarget {
         RouteTarget {
@@ -696,5 +847,154 @@ mod tests {
             req.tools.is_none(),
             "tools should be absent when not provided"
         );
+    }
+
+    // --- Tool call extraction tests (RED — not yet implemented) ---
+
+    #[test]
+    fn extract_tool_calls_from_interaction() {
+        let interaction = Interaction {
+            id: "abc".into(),
+            status: "requires_action".into(),
+            created: Some("2026-01-01T00:00:00Z".into()),
+            updated: Some("2026-01-01T00:00:00Z".into()),
+            steps: Some(vec![Step::FunctionCallStep(FunctionCallStep {
+                id: "call-1".into(),
+                name: "get_weather".into(),
+                arguments: Some(serde_json::json!({"location": "Boston"})),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+        let result = extract_interaction_tool_calls(&interaction);
+        assert!(
+            result.is_some(),
+            "should extract tool calls from requires_action interaction"
+        );
+        let tool_calls = result.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].0, "call-1"); // (id, name, arguments)
+        assert_eq!(tool_calls[0].1, "get_weather");
+        assert_eq!(tool_calls[0].2, serde_json::json!({"location": "Boston"}));
+    }
+
+    #[test]
+    fn extract_tool_calls_empty_for_completed() {
+        let interaction = Interaction {
+            id: "abc".into(),
+            status: "completed".into(),
+            created: Some("2026-01-01T00:00:00Z".into()),
+            updated: Some("2026-01-01T00:00:00Z".into()),
+            steps: Some(vec![]),
+            ..Default::default()
+        };
+        let result = extract_interaction_tool_calls(&interaction);
+        assert!(
+            result.is_none(),
+            "should return None for completed interaction"
+        );
+    }
+
+    #[test]
+    fn build_response_with_function_call_anthropic() {
+        let interaction = Interaction {
+            id: "abc".into(),
+            status: "requires_action".into(),
+            created: Some("2026-01-01T00:00:00Z".into()),
+            updated: Some("2026-01-01T00:00:00Z".into()),
+            steps: Some(vec![Step::FunctionCallStep(FunctionCallStep {
+                id: "call-1".into(),
+                name: "get_weather".into(),
+                arguments: Some(serde_json::json!({"location": "Boston"})),
+                ..Default::default()
+            })]),
+            model: Some("gemini".into()),
+            ..Default::default()
+        };
+        let resp = build_response_from_interaction(&interaction, "gemini", Protocol::Anthropic)
+            .expect("should build response");
+        let msg: MessageResponse =
+            serde_json::from_value(resp).expect("should deserialize as MessageResponse");
+        assert_eq!(msg.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(msg.content.len(), 1);
+        match &msg.content[0] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input, &serde_json::json!({"location": "Boston"}));
+            }
+            other => panic!("expected ToolUse, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_without_tool_calls_is_end_turn() {
+        let interaction = Interaction {
+            id: "abc".into(),
+            status: "completed".into(),
+            created: Some("2026-01-01T00:00:00Z".into()),
+            updated: Some("2026-01-01T00:00:00Z".into()),
+            steps: Some(vec![]),
+            ..Default::default()
+        };
+        let resp =
+            build_response_from_interaction(&interaction, "gemini", Protocol::Anthropic).unwrap();
+        let msg: MessageResponse =
+            serde_json::from_value(resp).expect("should deserialize as MessageResponse");
+        assert_eq!(msg.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn build_response_function_call_openai() {
+        let interaction = Interaction {
+            id: "abc".into(),
+            status: "requires_action".into(),
+            created: Some("2026-01-01T00:00:00Z".into()),
+            updated: Some("2026-01-01T00:00:00Z".into()),
+            steps: Some(vec![Step::FunctionCallStep(FunctionCallStep {
+                id: "call-1".into(),
+                name: "get_weather".into(),
+                arguments: Some(serde_json::json!({"location": "Boston"})),
+                ..Default::default()
+            })]),
+            model: Some("gemini".into()),
+            ..Default::default()
+        };
+        let resp = build_response_from_interaction(&interaction, "gemini", Protocol::OpenAi)
+            .expect("should build response");
+        let msg: ChatCompletionResponse =
+            serde_json::from_value(resp).expect("should deserialize as ChatCompletionResponse");
+        assert_eq!(msg.choices[0].finish_reason, Some(FinishReason::ToolCalls));
+        let tool_calls = msg.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("should have tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"location":"Boston"}"#);
+    }
+
+    /// Compile-time check: verify all required tool-use types exist.
+    #[test]
+    fn check_tool_variants_exist() {
+        // Anthropic
+        let _ = anyllm_translate::anthropic::StopReason::ToolUse;
+        let _ = anyllm_translate::anthropic::ContentBlock::ToolUse {
+            id: String::new(),
+            name: String::new(),
+            input: serde_json::Value::Null,
+        };
+        // OpenAI
+        let _ = anyllm_translate::openai::FinishReason::ToolCalls;
+        let tc = anyllm_translate::openai::ToolCall {
+            call_type: "function".into(),
+            id: String::new(),
+            function: anyllm_translate::openai::FunctionCall {
+                name: String::new(),
+                arguments: String::new(),
+            },
+        };
+        let _ = tc;
     }
 }

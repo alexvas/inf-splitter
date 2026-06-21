@@ -34,6 +34,15 @@ fn main() {
         });
     }
 
+    // Patch FunctionCallStep schema: remove arguments from required.
+    // The Gemini API sends step.start SSE events with function_call steps
+    // where arguments may be empty/incomplete initially.
+    if let Some(required) =
+        spec["components"]["schemas"]["FunctionCallStep"]["required"].as_array_mut()
+    {
+        required.retain(|v| v.as_str().unwrap_or("") != "arguments");
+    }
+
     let schemas = &spec["components"]["schemas"];
 
     // --- Phase 1: Resolve all $ref references into flat definitions ---

@@ -22,7 +22,7 @@ use crate::diagnostics::Diagnostics;
 use crate::error::AppError;
 use crate::interactions as interactions_lib;
 use crate::interactions_types::{
-    CreateModelInteractionParams, Interaction, InteractionSseEvent, InteractionsInput,
+    CreateModelInteractionParams, Interaction, InteractionSseEvent, InteractionsInput, Step,
     StepDeltaData,
 };
 use crate::session::SessionStore;
@@ -562,6 +562,11 @@ impl InteractionsHandler {
             false,
             vec![],
         );
+
+        // Translate response back to ingress protocol
+        let resp = interactions_lib::build_response_from_interaction(&interaction, model, ingress)
+            .map_err(AppError::Internal)?;
+
         guard.finish(
             200,
             duration_ms,
@@ -571,72 +576,6 @@ impl InteractionsHandler {
             direction,
             stream,
         );
-
-        // Translate response back to ingress protocol
-        let text = interactions_lib::extract_interaction_text(&interaction);
-        let input_tokens = interaction
-            .usage
-            .as_ref()
-            .and_then(|u| u.total_input_tokens)
-            .unwrap_or(0);
-        let output_tokens = interaction
-            .usage
-            .as_ref()
-            .and_then(|u| u.total_output_tokens)
-            .unwrap_or(0);
-
-        let resp = match ingress {
-            Protocol::OpenAi => {
-                let typed = ChatCompletionResponse {
-                    id: interaction.id.clone(),
-                    object: "chat.completion".to_string(),
-                    model: model.to_string(),
-                    choices: vec![Choice {
-                        index: 0,
-                        message: ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: Some(ChatContent::Text(text.clone())),
-                            name: None,
-                            tool_calls: None,
-                            tool_call_id: None,
-                            refusal: None,
-                            reasoning_content: None,
-                        },
-                        finish_reason: Some(FinishReason::Stop),
-                        logprobs: None,
-                    }],
-                    usage: Some(ChatUsage {
-                        prompt_tokens: input_tokens as u32,
-                        completion_tokens: output_tokens as u32,
-                        total_tokens: (input_tokens + output_tokens) as u32,
-                        completion_tokens_details: None,
-                        prompt_tokens_details: None,
-                    }),
-                    created: None,
-                    system_fingerprint: None,
-                    service_tier: None,
-                };
-                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-            }
-            Protocol::Anthropic => {
-                let typed = MessageResponse {
-                    id: interaction.id.clone(),
-                    response_type: "message".to_string(),
-                    role: Role::Assistant,
-                    model: model.to_string(),
-                    content: vec![ContentBlock::Text { text: text.clone() }],
-                    stop_reason: Some(StopReason::EndTurn),
-                    stop_sequence: None,
-                    usage: Usage {
-                        input_tokens: input_tokens as u32,
-                        output_tokens: output_tokens as u32,
-                        ..Default::default()
-                    },
-                    created: None,
-                };
-                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-            }
-        };
 
         Ok((StatusCode::OK, axum::Json(resp)).into_response())
     }
@@ -985,6 +924,77 @@ impl InteractionsHandler {
                 .await;
         }
 
+        let resp = if let Some(ref inter) = last_interaction {
+            interactions_lib::build_response_from_interaction(inter, model, ingress)
+                .map_err(AppError::Internal)?
+        } else {
+            let text = last_interaction
+                .as_ref()
+                .map(interactions_lib::extract_interaction_text)
+                .unwrap_or_default();
+            let input_tokens = last_interaction
+                .as_ref()
+                .and_then(|i| i.usage.as_ref())
+                .and_then(|u| u.total_input_tokens)
+                .unwrap_or(0);
+            let output_tokens = last_interaction
+                .as_ref()
+                .and_then(|i| i.usage.as_ref())
+                .and_then(|u| u.total_output_tokens)
+                .unwrap_or(0);
+            match ingress {
+                Protocol::OpenAi => {
+                    let typed = ChatCompletionResponse {
+                        id: last_id.unwrap_or_default(),
+                        object: "chat.completion".to_string(),
+                        model: model.to_string(),
+                        choices: vec![Choice {
+                            index: 0,
+                            message: ChatMessage {
+                                role: ChatRole::Assistant,
+                                content: Some(ChatContent::Text(text)),
+                                name: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                refusal: None,
+                                reasoning_content: None,
+                            },
+                            finish_reason: Some(FinishReason::Stop),
+                            logprobs: None,
+                        }],
+                        usage: Some(ChatUsage {
+                            prompt_tokens: input_tokens as u32,
+                            completion_tokens: output_tokens as u32,
+                            total_tokens: (input_tokens + output_tokens) as u32,
+                            completion_tokens_details: None,
+                            prompt_tokens_details: None,
+                        }),
+                        created: None,
+                        system_fingerprint: None,
+                        service_tier: None,
+                    };
+                    serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+                }
+                Protocol::Anthropic => {
+                    let typed = MessageResponse {
+                        id: last_id.unwrap_or_default(),
+                        response_type: "message".to_string(),
+                        role: Role::Assistant,
+                        model: model.to_string(),
+                        content: vec![ContentBlock::Text { text: text.clone() }],
+                        stop_reason: Some(StopReason::EndTurn),
+                        stop_sequence: None,
+                        usage: Usage {
+                            input_tokens: input_tokens as u32,
+                            output_tokens: output_tokens as u32,
+                            ..Default::default()
+                        },
+                        created: None,
+                    };
+                    serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+                }
+            }
+        };
         guard.finish(
             200,
             start.elapsed().as_millis() as u64,
@@ -994,74 +1004,6 @@ impl InteractionsHandler {
             direction,
             false,
         );
-
-        let text = last_interaction
-            .as_ref()
-            .map(interactions_lib::extract_interaction_text)
-            .unwrap_or_default();
-        let input_tokens = last_interaction
-            .as_ref()
-            .and_then(|i| i.usage.as_ref())
-            .and_then(|u| u.total_input_tokens)
-            .unwrap_or(0);
-        let output_tokens = last_interaction
-            .as_ref()
-            .and_then(|i| i.usage.as_ref())
-            .and_then(|u| u.total_output_tokens)
-            .unwrap_or(0);
-
-        let resp = match ingress {
-            Protocol::OpenAi => {
-                let typed = ChatCompletionResponse {
-                    id: last_id.unwrap_or_default(),
-                    object: "chat.completion".to_string(),
-                    model: model.to_string(),
-                    choices: vec![Choice {
-                        index: 0,
-                        message: ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: Some(ChatContent::Text(text)),
-                            name: None,
-                            tool_calls: None,
-                            tool_call_id: None,
-                            refusal: None,
-                            reasoning_content: None,
-                        },
-                        finish_reason: Some(FinishReason::Stop),
-                        logprobs: None,
-                    }],
-                    usage: Some(ChatUsage {
-                        prompt_tokens: input_tokens as u32,
-                        completion_tokens: output_tokens as u32,
-                        total_tokens: (input_tokens + output_tokens) as u32,
-                        completion_tokens_details: None,
-                        prompt_tokens_details: None,
-                    }),
-                    created: None,
-                    system_fingerprint: None,
-                    service_tier: None,
-                };
-                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-            }
-            Protocol::Anthropic => {
-                let typed = MessageResponse {
-                    id: last_id.unwrap_or_default(),
-                    response_type: "message".to_string(),
-                    role: Role::Assistant,
-                    model: model.to_string(),
-                    content: vec![ContentBlock::Text { text: text.clone() }],
-                    stop_reason: Some(StopReason::EndTurn),
-                    stop_sequence: None,
-                    usage: Usage {
-                        input_tokens: input_tokens as u32,
-                        output_tokens: output_tokens as u32,
-                        ..Default::default()
-                    },
-                    created: None,
-                };
-                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-            }
-        };
         Ok((StatusCode::OK, axum::Json(resp)).into_response())
     }
 
@@ -1234,6 +1176,78 @@ impl InteractionsHandler {
                 .await;
         }
 
+        // Translate last response to ingress protocol
+        let resp = if let Some(ref inter) = last_interaction {
+            interactions_lib::build_response_from_interaction(inter, model, ingress)
+                .map_err(AppError::Internal)?
+        } else {
+            let text = last_interaction
+                .as_ref()
+                .map(interactions_lib::extract_interaction_text)
+                .unwrap_or_default();
+            let input_tokens = last_interaction
+                .as_ref()
+                .and_then(|i| i.usage.as_ref())
+                .and_then(|u| u.total_input_tokens)
+                .unwrap_or(0);
+            let output_tokens = last_interaction
+                .as_ref()
+                .and_then(|i| i.usage.as_ref())
+                .and_then(|u| u.total_output_tokens)
+                .unwrap_or(0);
+            match ingress {
+                Protocol::OpenAi => {
+                    let typed = ChatCompletionResponse {
+                        id: last_id.unwrap_or_default(),
+                        object: "chat.completion".to_string(),
+                        model: model.to_string(),
+                        choices: vec![Choice {
+                            index: 0,
+                            message: ChatMessage {
+                                role: ChatRole::Assistant,
+                                content: Some(ChatContent::Text(text)),
+                                name: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                refusal: None,
+                                reasoning_content: None,
+                            },
+                            finish_reason: Some(FinishReason::Stop),
+                            logprobs: None,
+                        }],
+                        usage: Some(ChatUsage {
+                            prompt_tokens: input_tokens as u32,
+                            completion_tokens: output_tokens as u32,
+                            total_tokens: (input_tokens + output_tokens) as u32,
+                            completion_tokens_details: None,
+                            prompt_tokens_details: None,
+                        }),
+                        created: None,
+                        system_fingerprint: None,
+                        service_tier: None,
+                    };
+                    serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+                }
+                Protocol::Anthropic => {
+                    let typed = MessageResponse {
+                        id: last_id.unwrap_or_default(),
+                        response_type: "message".to_string(),
+                        role: Role::Assistant,
+                        model: model.to_string(),
+                        content: vec![ContentBlock::Text { text: text.clone() }],
+                        stop_reason: Some(StopReason::EndTurn),
+                        stop_sequence: None,
+                        usage: Usage {
+                            input_tokens: input_tokens as u32,
+                            output_tokens: output_tokens as u32,
+                            ..Default::default()
+                        },
+                        created: None,
+                    };
+                    serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
+                }
+            }
+        };
         guard.finish(
             200,
             start.elapsed().as_millis() as u64,
@@ -1243,75 +1257,6 @@ impl InteractionsHandler {
             direction,
             false,
         );
-
-        // Translate last response to ingress protocol
-        let text = last_interaction
-            .as_ref()
-            .map(interactions_lib::extract_interaction_text)
-            .unwrap_or_default();
-        let input_tokens = last_interaction
-            .as_ref()
-            .and_then(|i| i.usage.as_ref())
-            .and_then(|u| u.total_input_tokens)
-            .unwrap_or(0);
-        let output_tokens = last_interaction
-            .as_ref()
-            .and_then(|i| i.usage.as_ref())
-            .and_then(|u| u.total_output_tokens)
-            .unwrap_or(0);
-
-        let resp = match ingress {
-            Protocol::OpenAi => {
-                let typed = ChatCompletionResponse {
-                    id: last_id.unwrap_or_default(),
-                    object: "chat.completion".to_string(),
-                    model: model.to_string(),
-                    choices: vec![Choice {
-                        index: 0,
-                        message: ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: Some(ChatContent::Text(text)),
-                            name: None,
-                            tool_calls: None,
-                            tool_call_id: None,
-                            refusal: None,
-                            reasoning_content: None,
-                        },
-                        finish_reason: Some(FinishReason::Stop),
-                        logprobs: None,
-                    }],
-                    usage: Some(ChatUsage {
-                        prompt_tokens: input_tokens as u32,
-                        completion_tokens: output_tokens as u32,
-                        total_tokens: (input_tokens + output_tokens) as u32,
-                        completion_tokens_details: None,
-                        prompt_tokens_details: None,
-                    }),
-                    created: None,
-                    system_fingerprint: None,
-                    service_tier: None,
-                };
-                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-            }
-            Protocol::Anthropic => {
-                let typed = MessageResponse {
-                    id: last_id.unwrap_or_default(),
-                    response_type: "message".to_string(),
-                    role: Role::Assistant,
-                    model: model.to_string(),
-                    content: vec![ContentBlock::Text { text: text.clone() }],
-                    stop_reason: Some(StopReason::EndTurn),
-                    stop_sequence: None,
-                    usage: Usage {
-                        input_tokens: input_tokens as u32,
-                        output_tokens: output_tokens as u32,
-                        ..Default::default()
-                    },
-                    created: None,
-                };
-                serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-            }
-        };
         Ok((StatusCode::OK, axum::Json(resp)).into_response())
     }
 
@@ -1594,18 +1539,31 @@ fn translate_stream_event(
             .ok()?;
             Some(vec![msg_start, block_start])
         }
-        InteractionSseEvent::StepStart(ev) => {
-            // Map all step types to a text content block — clients handle
-            // thinking vs text distinction via the delta type (signature_delta
-            // vs text_delta) rather than the block type.
-            let block_start: StreamEvent = serde_json::from_value(serde_json::json!({
-                "type": "content_block_start",
-                "index": ev.index,
-                "content_block": {"type": "text", "text": ""}
-            }))
-            .ok()?;
-            Some(vec![block_start])
-        }
+        InteractionSseEvent::StepStart(ev) => match &ev.step {
+            Step::FunctionCallStep(fcs) => {
+                let block_start: StreamEvent = serde_json::from_value(serde_json::json!({
+                    "type": "content_block_start",
+                    "index": ev.index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": fcs.id,
+                        "name": fcs.name,
+                        "input": {}
+                    }
+                }))
+                .ok()?;
+                Some(vec![block_start])
+            }
+            _ => {
+                let block_start: StreamEvent = serde_json::from_value(serde_json::json!({
+                    "type": "content_block_start",
+                    "index": ev.index,
+                    "content_block": {"type": "text", "text": ""}
+                }))
+                .ok()?;
+                Some(vec![block_start])
+            }
+        },
         InteractionSseEvent::StepDelta(ev) => match ev.delta {
             StepDeltaData::TextDelta(td) => {
                 let delta: StreamEvent = serde_json::from_value(serde_json::json!({
@@ -1622,6 +1580,19 @@ fn translate_stream_event(
                     "type": "content_block_delta",
                     "index": ev.index,
                     "delta": {"type": "signature_delta", "signature": signature}
+                }))
+                .ok()?;
+                Some(vec![delta])
+            }
+            StepDeltaData::ArgumentsDelta(ad) => {
+                let partial_json = ad.arguments.unwrap_or_default();
+                let delta: StreamEvent = serde_json::from_value(serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": ev.index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": partial_json
+                    }
                 }))
                 .ok()?;
                 Some(vec![delta])
@@ -2274,5 +2245,49 @@ If you don't know the answer, say so honestly.";
             "trace-12345",
             "non-auth headers must be forwarded when api_key is None"
         );
+    }
+
+    // --- Streaming function_call event tests (RED — not yet implemented) ---
+
+    /// A step.start event with a function_call step (no arguments — schema patched optional).
+    const STREAM_STEP_START_FUNCTION_CALL: &str = r#"{"event_type":"step.start","index":2,"step":{"type":"function_call","id":"call-1","name":"get_weather"}}"#;
+
+    /// A step.delta event with an arguments_delta (function_call arguments).
+    const STREAM_STEP_DELTA_ARGUMENTS: &str = r#"{"event_type":"step.delta","index":2,"delta":{"type":"arguments_delta","arguments":"{\"location\":\"Boston\"}"}}"#;
+
+    #[test]
+    fn translate_step_start_function_call_produces_tool_use_block() {
+        let events = translate_stream_event(STREAM_STEP_START_FUNCTION_CALL, "msg-1", "m").unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            anyllm_translate::anthropic::StreamEvent::ContentBlockStart {
+                content_block, ..
+            } => match content_block {
+                anyllm_translate::anthropic::ContentBlock::ToolUse { id, name, input } => {
+                    assert_eq!(id, "call-1");
+                    assert_eq!(name, "get_weather");
+                    assert_eq!(input, &serde_json::json!({}));
+                }
+                other => panic!("expected ToolUse block, got {:?}", other),
+            },
+            other => panic!("expected ContentBlockStart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_arguments_delta_produces_input_json_delta() {
+        let events = translate_stream_event(STREAM_STEP_DELTA_ARGUMENTS, "msg-1", "m").unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            anyllm_translate::anthropic::StreamEvent::ContentBlockDelta { delta, .. } => {
+                match delta {
+                    anyllm_translate::anthropic::Delta::InputJsonDelta { partial_json } => {
+                        assert_eq!(partial_json, r#"{"location":"Boston"}"#);
+                    }
+                    other => panic!("expected InputJsonDelta, got {:?}", other),
+                }
+            }
+            other => panic!("expected ContentBlockDelta, got {:?}", other),
+        }
     }
 }

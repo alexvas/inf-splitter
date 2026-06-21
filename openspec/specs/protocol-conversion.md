@@ -158,15 +158,23 @@ Only messages not yet delivered to the session are included (delta computation).
 ## Requirement: Interactions → Anthropic Translation
 
 `Interaction` response translates to Anthropic `MessageResponse`:
-- `Interaction.steps[]` → Anthropic `content[]` text blocks
+- `Interaction.steps[]` → Anthropic `content[]` blocks: text from `ModelOutputStep`, tool_use from `FunctionCallStep`
+- `Interaction.status` → `stop_reason`: `"end_turn"` for `"completed"`, `"tool_use"` for `"requires_action"`
 - `Interaction.usage` → response usage metadata
-- Stream: `ContentDelta` events → Anthropic `StreamEvent` SSE
-- Stream: `InteractionCompletedEvent` → final events with `stop_reason: "end_turn"`
+- Non-streaming response construction uses shared `build_response_from_interaction()` across all three paths (`send_and_translate`, `handle_split_send`, `send_split_system_instruction`)
+- Stream: `step.*` events → Anthropic `StreamEvent` SSE, including function_call → tool_use blocks
+- Stream: `InteractionCompletedEvent` → final events with appropriate stop_reason
 
 ### Scenario: Text response from interactions
 - GIVEN `Interaction` with `ModelOutputStep` containing text
 - WHEN translated to Anthropic format
-- THEN response has `{"type": "message", "role": "assistant", "content": [{"type": "text", "text": "..."}], ...}`
+- THEN response has `{"type": "message", "role": "assistant", "content": [{"type": "text", "text": "..."}], "stop_reason": "end_turn"}`
+
+### Scenario: Function call response from interactions (non-streaming)
+- GIVEN `Interaction` with `status: "requires_action"` and `FunctionCallStep { id: "call-1", name: "get_weather", arguments: {"location": "Boston"} }`
+- WHEN translated to Anthropic format
+- THEN `content` contains `ContentBlock::ToolUse { id: "call-1", name: "get_weather", input: {"location": "Boston"} }`
+- AND `stop_reason` is `"tool_use"`
 
 ## Requirement: OpenAI → Interactions Translation
 
@@ -187,8 +195,11 @@ OpenAI ingress → `CreateModelInteractionParams`:
 ## Requirement: Interactions → OpenAI Translation
 
 `Interaction` → OpenAI `ChatCompletionResponse`:
-- `Interaction.steps[]` → `choices[].message.content`
-- Stream: `ContentDelta` → OpenAI streaming chunks via `ReverseStreamingTranslator`, `InteractionCompletedEvent` → `[DONE]`
+- `Interaction.steps[]` → `choices[].message`: text from `ModelOutputStep` → `content`, `FunctionCallStep` → `tool_calls`
+- `Interaction.status` → `finish_reason`: `"stop"` for `"completed"`, `"tool_calls"` for `"requires_action"`
+- Non-streaming response construction uses shared `build_response_from_interaction()`
+- Stream: `step.*` events → OpenAI streaming chunks via `ReverseStreamingTranslator`, `[DONE]` on completion
+- Stream: function_call `step.start`/`step.delta` events flow through `ReverseStreamingTranslator` to produce OpenAI-format `tool_calls` chunks
 
 ## Requirement: Interactions Streaming Events
 
@@ -199,7 +210,7 @@ Streaming from interactions endpoint returns SSE with discriminated event types:
 | `interaction.created` | Interaction created, contains full initial state |
 | `interaction.status_update` | Status change (skipped in translation) |
 | `step.start` | A new step begins (thought, model_output, tool_call, etc.) |
-| `step.delta` | Incremental output for the current step (text, thought_signature, etc.) |
+| `step.delta` | Incremental output for the current step (text, thought_signature, arguments_delta for function_call, etc.) |
 | `step.stop` | Current step completes, includes per-step usage |
 | `error` | Stream-level error |
 | `interaction.completed` | Final interaction with total usage |
@@ -251,7 +262,52 @@ Streaming from interactions endpoint returns SSE with discriminated event types:
 - WHEN the proxy translates it to Anthropic streaming format
 - THEN the client receives `event: error` with `{"type": "error", "error": {"type": "not_found", "message": "Result not found."}}`
 
-## Requirement: Interactions Request/Response Types
+### Scenario: Streaming function_call step.start
+- GIVEN SSE event `{"event_type":"step.start","index":2,"step":{"type":"function_call","id":"call-1","name":"get_weather"}}`
+- WHEN translated
+- THEN emits `content_block_start` with `index: 2`, `content_block: {type: "tool_use", id: "call-1", name: "get_weather", input: {}}`
+
+### Scenario: Streaming function_call step.delta (arguments_delta)
+- GIVEN SSE event `{"event_type":"step.delta","index":2,"delta":{"type":"arguments_delta","arguments":"{\"location\":\"Boston\"}"}}`
+- WHEN translated
+- THEN emits `content_block_delta` with `index: 2`, `delta: {type: "input_json_delta", partial_json: "{\"location\":\"Boston\"}"}`
+
+### Scenario: Full stream lifecycle with function_call
+- GIVEN an interactions response with:
+  - `interaction.created`
+  - `step.start { type: "thought" }` → thought_signature deltas → `step.stop`
+  - `step.start { type: "function_call", id: "call-1", name: "get_weather" }`
+  - `step.delta { delta: { type: "arguments_delta", arguments: "{\"location\":\"Boston\"}" } }`
+  - `step.stop`
+  - `interaction.completed`
+- WHEN the proxy translates the stream to Anthropic format
+- THEN the client receives:
+  - `message_start`
+  - `content_block_start` (text type, from interaction.created)
+  - `content_block_start` (text type, from step.start thought)
+  - `content_block_delta { type: "signature_delta" }`
+  - `content_block_stop`
+  - `content_block_start { content_block: { type: "tool_use", id: "call-1", name: "get_weather", input: {} } }`
+  - `content_block_delta { delta: { type: "input_json_delta", partial_json: "{\"location\":\"Boston\"}" } }`
+  - `content_block_stop`
+  - `message_delta` + `message_stop`
+
+## Requirement: Interactions Schema Patching
+
+`build.rs` patches the OpenAPI schema before code generation to match actual Gemini API behavior:
+
+| Schema | Field | Patch | Reason |
+|--------|-------|-------|--------|
+| `Interaction` | `created` | Removed from required | SSE `interaction.created` events have incomplete initial state |
+| `Interaction` | `updated` | Removed from required | Same as above |
+| `Interaction` | `steps` | Removed from required | Same as above |
+| `FunctionCallStep` | `arguments` | Removed from required | SSE `step.start` events may not include arguments initially |
+
+### Scenario: FunctionCallStep deserializes without arguments
+- GIVEN a `step.start` SSE event with `{"type":"function_call","id":"call-1","name":"get_weather"}` (no `arguments`)
+- WHEN deserialized as `Step::FunctionCallStep`
+- THEN `arguments` is `serde_json::Value::Null` (via `#[serde(default)]`)
+- AND the step.start event translates to a `tool_use` `content_block_start` with empty `input: {}`
 
 Rust types for the interactions protocol are generated at build time from `schemas/interactions.openapi.json` by `build.rs`. The generated code is included in `src/interactions_types.rs` via `include!`.
 

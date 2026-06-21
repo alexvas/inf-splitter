@@ -240,11 +240,23 @@ async fn dispatch_messages(
         AppError::BadRequest("non-utf8".into())
     })?;
     let peek: MessagePeek = serde_json::from_str(body_str).map_err(|err| {
+        let request_id = state.diagnostics.new_request_id();
+        let dump_body = crate::diagnostics::dump_body_from_bytes(&body);
+        state.diagnostics.record_request_dump(
+            &request_id,
+            "?",
+            "ingress",
+            "?",
+            &headers,
+            dump_body,
+            None,
+            true,
+        );
         state
             .diagnostics
             .record_stats(&crate::diagnostics::StatsEvent {
                 section: "?".into(),
-                request_id: state.diagnostics.new_request_id(),
+                request_id,
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
                 model: "?".into(),
@@ -257,11 +269,23 @@ async fn dispatch_messages(
     })?;
 
     if peek.model.trim().is_empty() {
+        let request_id = state.diagnostics.new_request_id();
+        let dump_body = crate::diagnostics::dump_body_from_bytes(&body);
+        state.diagnostics.record_request_dump(
+            &request_id,
+            "?",
+            "ingress",
+            "?",
+            &headers,
+            dump_body,
+            None,
+            true,
+        );
         state
             .diagnostics
             .record_stats(&crate::diagnostics::StatsEvent {
                 section: "?".into(),
-                request_id: state.diagnostics.new_request_id(),
+                request_id,
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
                 model: "?".into(),
@@ -274,11 +298,23 @@ async fn dispatch_messages(
     }
 
     let route = state.config.resolve_route(&peek.model).map_err(|err| {
+        let request_id = state.diagnostics.new_request_id();
+        let dump_body = crate::diagnostics::dump_body_from_bytes(&body);
+        state.diagnostics.record_request_dump(
+            &request_id,
+            "?",
+            "ingress",
+            &peek.model,
+            &headers,
+            dump_body,
+            None,
+            true,
+        );
         state
             .diagnostics
             .record_stats(&crate::diagnostics::StatsEvent {
                 section: "?".into(),
-                request_id: state.diagnostics.new_request_id(),
+                request_id,
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
                 model: peek.model.clone(),

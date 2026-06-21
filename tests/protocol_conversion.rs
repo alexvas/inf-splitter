@@ -3502,3 +3502,120 @@ models = "test-model"
         "openai passthrough streaming must record streaming=true in stats"
     );
 }
+
+// ── Phase 4: client error visibility tests ───────────────────────────
+
+#[tokio::test]
+async fn invalid_json_body_produces_ingress_dump() {
+    let upstream_addr = spawn_upstream(
+        "/v1/chat/completions",
+        Arc::new(Mutex::new(None)),
+        openai_upstream_response("ignored-id", "ignored"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "inf-splitter-bad-json-dump-{}.ndjson",
+        uuid_suffix()
+    ));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream_addr}"
+models = "bad-json-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::Error,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+
+    // Send a truncated JSON body
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model": "bad-json-model", "messages":"#.to_string())
+        .send()
+        .await
+        .expect("proxy request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let _body = response.text().await.expect("response body");
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(
+        !lines.is_empty(),
+        "invalid JSON body must produce dump line"
+    );
+    let has_ingress = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+        v["stage"].as_str() == Some("ingress") && v["direction"].as_str() == Some("request")
+    });
+    assert!(
+        has_ingress,
+        "invalid JSON body must have ingress dump with the malformed body"
+    );
+}
+
+#[tokio::test]
+async fn empty_model_produces_ingress_dump() {
+    let upstream_addr = spawn_upstream(
+        "/v1/chat/completions",
+        Arc::new(Mutex::new(None)),
+        openai_upstream_response("ignored-id", "ignored"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "inf-splitter-empty-model-dump-{}.ndjson",
+        uuid_suffix()
+    ));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream_addr}"
+models = "empty-model-test"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::Error,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let _body = response.text().await.expect("response body");
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(
+        !lines.is_empty(),
+        "empty model error must produce dump line"
+    );
+    let has_ingress = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+        v["stage"].as_str() == Some("ingress") && v["direction"].as_str() == Some("request")
+    });
+    assert!(
+        has_ingress,
+        "empty model error must have ingress dump with the request body"
+    );
+}

@@ -182,6 +182,82 @@ This includes all code paths:
 - AND `status` matches the upstream status code
 - AND the dump lines and stats line share the same `request_id`
 
+## Requirement: StatsEvent, DumpEvent, and RouteTarget have Default
+
+- `StatsEvent` derives `Default`. All fields default to zero/empty/None.
+- `DumpBody` implements `Default` returning `Utf8(String::new())`.
+- `DumpEvent` derives `Default`. All fields default to zero/empty/None/`DumpBody::default()`.
+- `RouteTarget` derives `Default`. All `Option` fields default to `None`, `model_names` to empty `HashSet`, `drop_fields` to `DropFields::default()`.
+
+### Scenario: StatsEvent construction with defaults
+- GIVEN a StatsEvent needs construction with mostly-default values
+- WHEN the struct is constructed
+- THEN `StatsEvent { field1, field2, ..Default::default() }` is used
+- AND only non-default fields are listed explicitly
+
+### Scenario: RouteTarget construction in tests
+- GIVEN a test needs a RouteTarget with mostly-default fields
+- WHEN constructing the route
+- THEN `RouteTarget { section: "test".into(), ..Default::default() }` sets only the needed fields
+
+## Requirement: RequestDiagnostics Session Guard
+
+A `RequestDiagnostics` session object binds stats and dump recording into a single guard, enforcing the stats-dump parity invariant structurally. Created at request start with `RequestDiagnostics::new(diagnostics, section, model)`.
+
+**Methods:**
+- `ingress_dump(body, headers)` — records ingress request dump, tracks `ingress_size`
+- `egress_dump(body, headers)` — records egress request dump
+- `response_dump(body, status, is_error)` — records non-streaming response dump
+- `response_dump_streaming(body, status)` — records streaming response dump
+- `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, consumes guard
+- `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, error)` — records error stats, consumes guard
+- `disarm()` — marks guard finished without recording stats (for streaming paths), returns `request_id`
+
+**Drop safety net:** If dropped without `finish()`/`finish_with_error()`/`disarm()`, logs `tracing::error!` and records a stats event with `error: "diagnostics guard dropped without finish"`.
+
+### Scenario: Normal completion
+- GIVEN a `RequestDiagnostics` guard created for a request
+- AND ingress/egress dumps recorded via guard methods
+- WHEN `guard.finish(200, ...)` is called
+- THEN a success stats event is recorded
+- AND the guard does not log on drop
+
+### Scenario: Guard dropped without finish
+- GIVEN a `RequestDiagnostics` guard
+- AND `finish()` was NOT called
+- WHEN the guard is dropped
+- THEN `tracing::error!` is emitted
+- AND a stats event is recorded with `error: "diagnostics guard dropped without finish"` and `status: 0`
+
+### Scenario: Pilot migration in send_and_translate
+- GIVEN `send_and_translate` uses `RequestDiagnostics`
+- WHEN a request completes (success or error, streaming or non-streaming)
+- THEN the same stats and dump events are recorded as before migration
+- AND the `request_id` is shared across all events
+
+## Requirement: Router-Level Client Error Visibility
+
+Pre-routing error checks in `dispatch_messages()` must record a dump of the offending request body so operators can debug malformed client requests. All four error paths now record an ingress dump:
+
+| Error | Trigger | Status |
+|-------|---------|--------|
+| Non-UTF8 body | `from_utf8(&body)` fails | Dump implemented |
+| Invalid JSON | `from_str::<MessagePeek>(body_str)` fails | Dump implemented |
+| Empty model | `peek.model.trim().is_empty()` | Dump implemented |
+| Route resolution failure | `resolve_route(&peek.model)` returns `Err` | Dump implemented |
+
+### Scenario: Invalid JSON body is dumped
+- GIVEN `dump_mode = "all"` (or `"error"`)
+- AND a client sends a request body that is valid UTF-8 but not valid JSON
+- WHEN the router rejects the request with 400
+- THEN a dump line is written with `stage: "ingress"` containing the raw body
+- AND a stats line is written with the same `request_id`
+
+### Scenario: Empty model is dumped
+- GIVEN a client sends `{"model": ""}`
+- WHEN the router rejects the request with 400
+- THEN a dump line is written with the raw body
+
 ## Requirement: Timestamp Format
 
 All diagnostic timestamps use ISO 8601 UTC format: `YYYY-MM-DDTHH:MM:SSZ`. This applies to both `StatsEvent.ts` and `DumpEvent.ts`.

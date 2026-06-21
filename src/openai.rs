@@ -414,6 +414,8 @@ impl OpenAiHandler {
             },
         );
 
+        let resp = sse::sse_response(request_headers, sse_stream)?;
+
         guard.finish(
             200,
             duration_ms,
@@ -424,7 +426,7 @@ impl OpenAiHandler {
             true,
         );
 
-        sse::sse_response(request_headers, sse_stream)
+        Ok(resp)
     }
 }
 

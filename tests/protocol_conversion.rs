@@ -2811,9 +2811,26 @@ models = "gemini-3.1-flash-lite"
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let _body = response.text().await.expect("response body");
 
-    // Wait for the egress response dump — by then ingress and egress
-    // request dumps are also flushed.
-    let lines = wait_for_egress_response_dump(&tmp).await;
+    // Response dumps are recorded immediately, but ingress/egress request
+    // dumps are deferred to finish(). Poll after the response dump appears
+    // until all three stages land.
+    let dump_path: std::path::PathBuf = tmp.clone();
+    let lines = {
+        let mut lines = wait_for_egress_response_dump(&tmp).await;
+        for _ in 0..20 {
+            if lines.iter().any(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+                v["stage"].as_str() == Some("ingress")
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(content) = std::fs::read_to_string(&dump_path) {
+                lines = content.lines().map(|s| s.to_string()).collect();
+            }
+        }
+        lines
+    };
     assert!(
         lines.len() >= 3,
         "expected at least 3 dump lines (ingress, egress request, egress response), got {}",

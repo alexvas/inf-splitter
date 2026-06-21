@@ -95,8 +95,11 @@ fn main() {
         "InteractionStatusUpdate",
         "ModelOutputStep",
     ] {
-        let from = format!("#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct {struct_name}");
-        let to = format!("#[derive(Debug, Clone, Default, Serialize, Deserialize)]\npub struct {struct_name}");
+        let from =
+            format!("#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct {struct_name}");
+        let to = format!(
+            "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\npub struct {struct_name}"
+        );
         code = code.replace(&from, &to);
     }
 

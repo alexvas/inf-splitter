@@ -211,9 +211,7 @@ A `RequestDiagnostics` session object binds stats and dump recording into a sing
 - `response_dump_streaming(body, status)` — records streaming response dump
 - `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, consumes guard
 - `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, error)` — records error stats, consumes guard
-- `disarm()` — marks guard finished without recording stats (for streaming paths), returns `request_id`
-
-**Drop safety net:** If dropped without `finish()`/`finish_with_error()`/`disarm()`, logs `tracing::error!` and records a stats event with `error: "diagnostics guard dropped without finish"`.
+**Drop safety net:** If dropped without `finish()`/`finish_with_error()`, logs `tracing::error!` and records a stats event with `error: "diagnostics guard dropped without finish"`.
 
 ### Scenario: Normal completion
 - GIVEN a `RequestDiagnostics` guard created for a request
@@ -234,6 +232,13 @@ A `RequestDiagnostics` session object binds stats and dump recording into a sing
 - WHEN a request completes (success or error, streaming or non-streaming)
 - THEN the same stats and dump events are recorded as before migration
 - AND the `request_id` is shared across all events
+
+### Scenario: Streaming task moves guard by value
+- GIVEN a streaming handler that spawns a `tokio::spawn` task
+- WHEN the guard is `Send` (uses `Mutex` not `RefCell`)
+- THEN the guard is moved into the spawned task by value
+- AND `guard.response_dump_streaming()` + `guard.finish()` are called inside the task
+- AND no raw `diagnostics.record_*` calls remain in the spawned task
 
 ## Requirement: Router-Level Client Error Visibility
 

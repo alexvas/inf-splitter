@@ -477,7 +477,7 @@ impl InteractionsHandler {
         ingress: Protocol,
         request_headers: &HeaderMap,
     ) -> Result<Response, AppError> {
-        let mut guard =
+        let guard =
             crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, model);
 
         guard.ingress_dump(ingress_body, request_headers);

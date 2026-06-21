@@ -544,14 +544,21 @@ impl Diagnostics {
 /// Created at request start.  On drop, if `finish()` or `finish_with_error()`
 /// was never called, a best-effort stats event is recorded with
 /// `error: "diagnostics guard dropped without finish"`.
+///
+/// Uses `Cell`/`Mutex` for interior mutability so all methods take `&self`
+/// and the guard is `Send` (can cross `tokio::spawn` boundaries).
 pub struct RequestDiagnostics {
     diagnostics: Diagnostics,
     request_id: String,
     section: String,
     model: String,
     start: std::time::Instant,
-    finished: bool,
-    ingress_size: usize,
+    finished: std::cell::Cell<bool>,
+    ingress_size: std::cell::Cell<usize>,
+    input_messages: std::cell::Cell<Option<usize>>,
+    max_tokens: std::cell::Cell<Option<u32>>,
+    messages_detail_ingress: std::sync::Mutex<Option<serde_json::Value>>,
+    messages_detail_egress: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 impl RequestDiagnostics {
@@ -562,8 +569,12 @@ impl RequestDiagnostics {
             section: section.to_string(),
             model: model.to_string(),
             start: std::time::Instant::now(),
-            finished: false,
-            ingress_size: 0,
+            finished: std::cell::Cell::new(false),
+            ingress_size: std::cell::Cell::new(0),
+            input_messages: std::cell::Cell::new(None),
+            max_tokens: std::cell::Cell::new(None),
+            messages_detail_ingress: std::sync::Mutex::new(None),
+            messages_detail_egress: std::sync::Mutex::new(None),
         }
     }
 
@@ -572,23 +583,34 @@ impl RequestDiagnostics {
         &self.request_id
     }
 
-    /// Mark the guard as finished without recording stats.
-    /// Use when the completion is handled elsewhere (e.g., streaming tasks).
-    pub fn disarm(mut self) -> String {
-        self.finished = true;
+    /// Set optional stats detail fields (only recorded when `stats_enabled()`).
+    pub fn set_input_messages(&self, n: usize) {
+        self.input_messages.set(Some(n));
+    }
+    pub fn set_max_tokens(&self, n: u32) {
+        self.max_tokens.set(Some(n));
+    }
+    pub fn set_messages_detail_ingress(&self, v: serde_json::Value) {
+        *self.messages_detail_ingress.lock().unwrap() = Some(v);
+    }
+    pub fn set_messages_detail_egress(&self, v: serde_json::Value) {
+        *self.messages_detail_egress.lock().unwrap() = Some(v);
+    }
+
+    /// Deprecated: prefer moving the `Send` guard into the streaming task directly.
+    pub fn disarm(self) -> String {
+        self.finished.set(true);
         self.request_id.clone()
     }
 
     /// Record an ingress request dump and track request size.
-    pub fn ingress_dump(&mut self, body: &[u8], headers: &axum::http::HeaderMap) {
-        self.ingress_size = body.len();
+    pub fn ingress_dump(&self, body: &[u8], headers: &axum::http::HeaderMap) {
+        self.ingress_size.set(body.len());
         let dump_body = dump_body_from_bytes(body);
         if dump_body.is_base64() {
             tracing::warn!(
-                request_id = %self.request_id,
-                direction = "request",
-                body_len = body.len(),
-                "non-utf8 in ingress request body"
+                request_id = %self.request_id, direction = "request",
+                body_len = body.len(), "non-utf8 in ingress request body"
             );
         }
         self.diagnostics.record_request_dump(
@@ -608,10 +630,8 @@ impl RequestDiagnostics {
         let dump_body = dump_body_from_bytes(body);
         if dump_body.is_base64() {
             tracing::warn!(
-                request_id = %self.request_id,
-                direction = "request",
-                body_len = body.len(),
-                "non-utf8 in egress request body"
+                request_id = %self.request_id, direction = "request",
+                body_len = body.len(), "non-utf8 in egress request body"
             );
         }
         self.diagnostics.record_request_dump(
@@ -652,10 +672,10 @@ impl RequestDiagnostics {
         );
     }
 
-    /// Record success stats and mark the guard as finished.
+    /// Record success stats and mark the guard as finished. Idempotent.
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
-        mut self,
+        &self,
         status: u16,
         duration_ms: u64,
         request_size: usize,
@@ -664,7 +684,9 @@ impl RequestDiagnostics {
         direction: &str,
         streaming: bool,
     ) {
-        self.finished = true;
+        if self.finished.replace(true) {
+            return;
+        }
         self.diagnostics.record_stats(&StatsEvent {
             section: self.section.clone(),
             request_id: self.request_id.clone(),
@@ -678,14 +700,17 @@ impl RequestDiagnostics {
             response_size_bytes: response_size,
             streaming,
             error: None,
-            ..Default::default()
+            input_messages: self.input_messages.get(),
+            max_tokens: self.max_tokens.get(),
+            messages_detail_ingress: self.messages_detail_ingress.lock().unwrap().clone(),
+            messages_detail_egress: self.messages_detail_egress.lock().unwrap().clone(),
         });
     }
 
-    /// Record error stats and mark the guard as finished.
+    /// Record error stats and mark the guard as finished. Idempotent.
     #[allow(clippy::too_many_arguments)]
     pub fn finish_with_error(
-        mut self,
+        &self,
         status: u16,
         duration_ms: u64,
         request_size: usize,
@@ -695,7 +720,9 @@ impl RequestDiagnostics {
         streaming: bool,
         error: String,
     ) {
-        self.finished = true;
+        if self.finished.replace(true) {
+            return;
+        }
         self.diagnostics.record_stats(&StatsEvent {
             section: self.section.clone(),
             request_id: self.request_id.clone(),
@@ -709,20 +736,21 @@ impl RequestDiagnostics {
             response_size_bytes: response_size,
             streaming,
             error: Some(error),
-            ..Default::default()
+            input_messages: self.input_messages.get(),
+            max_tokens: self.max_tokens.get(),
+            messages_detail_ingress: self.messages_detail_ingress.lock().unwrap().clone(),
+            messages_detail_egress: self.messages_detail_egress.lock().unwrap().clone(),
         });
     }
 }
 
 impl Drop for RequestDiagnostics {
     fn drop(&mut self) {
-        if !self.finished {
+        if !self.finished.get() {
             let duration_ms = self.start.elapsed().as_millis() as u64;
             tracing::error!(
-                request_id = %self.request_id,
-                section = %self.section,
-                model = %self.model,
-                "diagnostics guard dropped without finish"
+                request_id = %self.request_id, section = %self.section,
+                model = %self.model, "diagnostics guard dropped without finish"
             );
             self.diagnostics.record_stats(&StatsEvent {
                 section: self.section.clone(),
@@ -733,7 +761,7 @@ impl Drop for RequestDiagnostics {
                 upstream: String::new(),
                 status: 0,
                 duration_ms,
-                request_size_bytes: self.ingress_size,
+                request_size_bytes: self.ingress_size.get(),
                 response_size_bytes: None,
                 streaming: false,
                 error: Some("diagnostics guard dropped without finish".into()),
@@ -1710,11 +1738,33 @@ mod tests {
     #[test]
     fn request_diagnostics_drop_records_safety_net_stats() {
         let diag = Diagnostics::new_noop();
-        // Create a guard, do nothing, drop it — should not panic.
         let guard = super::RequestDiagnostics::new(&diag, "test-section", "test-model");
         let request_id = guard.request_id().to_string();
         drop(guard);
         assert!(!request_id.is_empty());
         assert!(request_id.contains('-'));
+    }
+
+    #[test]
+    fn request_diagnostics_finish_is_idempotent() {
+        let diag = Diagnostics::new_noop();
+        let guard = super::RequestDiagnostics::new(&diag, "test-section", "test-model");
+        guard.finish(200, 42, 100, Some(50), "up", "dir", false);
+        guard.finish(500, 99, 200, Some(100), "other", "x", true); // no-op
+        drop(guard);
+    }
+
+    #[test]
+    fn request_diagnostics_detail_setters_populate_fields() {
+        let diag = Diagnostics::new_noop();
+        let guard = super::RequestDiagnostics::new(&diag, "test-section", "test-model");
+        guard.set_input_messages(3);
+        guard.set_max_tokens(4096);
+        guard.set_messages_detail_ingress(serde_json::json!([{"role": "user"}]));
+        guard.set_messages_detail_egress(serde_json::json!([{"role": "assistant"}]));
+        assert_eq!(guard.input_messages.get(), Some(3));
+        assert_eq!(guard.max_tokens.get(), Some(4096));
+        assert!(guard.messages_detail_ingress.lock().unwrap().is_some());
+        assert!(guard.messages_detail_egress.lock().unwrap().is_some());
     }
 }

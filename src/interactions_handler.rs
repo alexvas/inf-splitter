@@ -546,8 +546,7 @@ impl InteractionsHandler {
         }
 
         let response_body_bytes = upstream.bytes().await?;
-        let validated =
-            crate::validate_upstream_body(response_body_bytes, guard.request_id())?;
+        let validated = crate::validate_upstream_body(response_body_bytes, guard.request_id())?;
         guard.response_dump(validated.dump, 200, false, vec![]);
         let response_body = validated.text;
         let interaction: Interaction = serde_json::from_str(&response_body).map_err(|e| {
@@ -926,8 +925,7 @@ impl InteractionsHandler {
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
             let response_bytes = upstream.bytes().await?;
-            let validated =
-                crate::validate_upstream_body(response_bytes, guard.request_id())?;
+            let validated = crate::validate_upstream_body(response_bytes, guard.request_id())?;
             guard.response_dump(validated.dump, 200, false, vec![]);
             let response_text = validated.text;
             let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
@@ -1113,8 +1111,7 @@ impl InteractionsHandler {
             }
             let response_bytes = upstream.bytes().await?;
             total_response_bytes += response_bytes.len();
-            let validated =
-                crate::validate_upstream_body(response_bytes, guard.request_id())?;
+            let validated = crate::validate_upstream_body(response_bytes, guard.request_id())?;
             guard.response_dump(validated.dump, 200, false, vec![]);
             let response_text = validated.text;
             if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
@@ -1177,8 +1174,7 @@ impl InteractionsHandler {
                 }
                 let response_bytes = upstream.bytes().await?;
                 total_response_bytes += response_bytes.len();
-                let validated =
-                    crate::validate_upstream_body(response_bytes, guard.request_id())?;
+                let validated = crate::validate_upstream_body(response_bytes, guard.request_id())?;
                 guard.response_dump(validated.dump, 200, false, vec![]);
                 let response_text = validated.text;
                 if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {

@@ -86,12 +86,10 @@ impl AnthropicHandler {
                 duration_ms,
                 request_size_bytes: request_size,
                 response_size_bytes: Some(error_body.len()),
-                streaming: false,
-                input_messages: None,
-                max_tokens: None,
                 messages_detail_ingress: messages_detail_ingress.clone(),
                 messages_detail_egress: messages_detail_egress.clone(),
                 error: Some(error_body.clone()),
+                ..Default::default()
             });
             // Egress dump: body sent upstream after token caps.
             let body = crate::diagnostics::dump_body_from_bytes(&egress_body);
@@ -160,13 +158,10 @@ impl AnthropicHandler {
             status: relayed.status().as_u16(),
             duration_ms,
             request_size_bytes: request_size,
-            response_size_bytes: None,
             streaming: is_streaming,
-            input_messages: None,
-            max_tokens: None,
             messages_detail_ingress,
             messages_detail_egress,
-            error: None,
+            ..Default::default()
         });
         // Ingress dump: original client body before token caps.
         let status = relayed.status().as_u16();
@@ -215,13 +210,8 @@ impl AnthropicHandler {
                     status: 400,
                     duration_ms: 0,
                     request_size_bytes: body.len(),
-                    response_size_bytes: None,
-                    streaming: false,
-                    input_messages: None,
-                    max_tokens: None,
-                    messages_detail_ingress: None,
-                    messages_detail_egress: None,
                     error: Some(format!("invalid OpenAI body: {err}")),
+                    ..Default::default()
                 });
                 AppError::BadRequest(err.to_string())
             })?;
@@ -290,12 +280,12 @@ impl AnthropicHandler {
                 duration_ms,
                 request_size_bytes: request_size,
                 response_size_bytes: Some(error_body.len()),
-                streaming: false,
                 input_messages: Some(openai_req.messages.len()),
                 max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
                 messages_detail_ingress: messages_detail_ingress.clone(),
                 messages_detail_egress: messages_detail_egress.clone(),
                 error: Some(error_body.clone()),
+                ..Default::default()
             });
             if let Some(ref s) = ingress_str {
                 self.diagnostics.record_dump(
@@ -355,13 +345,11 @@ impl AnthropicHandler {
             status: 200,
             duration_ms,
             request_size_bytes: request_size,
-            response_size_bytes: None,
-            streaming: false,
             input_messages: Some(openai_req.messages.len()),
             max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
             messages_detail_ingress,
             messages_detail_egress,
-            error: None,
+            ..Default::default()
         });
         if let Some(ingress_str) = ingress_str {
             self.diagnostics.record_dump(
@@ -615,13 +603,12 @@ impl AnthropicHandler {
             status: 200,
             duration_ms,
             request_size_bytes: request_size,
-            response_size_bytes: None,
             streaming: true,
             input_messages: Some(openai_req.messages.len()),
             max_tokens: openai_req.max_tokens.or(openai_req.max_completion_tokens),
             messages_detail_ingress,
             messages_detail_egress,
-            error: None,
+            ..Default::default()
         });
         if let Some(ingress_str) = ingress_str {
             self.diagnostics.record_dump(

@@ -547,11 +547,8 @@ impl InteractionsHandler {
                 request_size_bytes: ingress_body.len(),
                 response_size_bytes: Some(error_body.len()),
                 streaming: stream,
-                input_messages: None,
-                max_tokens: None,
-                messages_detail_ingress: None,
-                messages_detail_egress: None,
                 error: Some(error_body.clone()),
+                ..Default::default()
             });
             // Response dump for error path
             self.diagnostics.record_response_dump(
@@ -614,11 +611,7 @@ impl InteractionsHandler {
             request_size_bytes: ingress_body.len(),
             response_size_bytes: Some(response_body.len()),
             streaming: stream,
-            input_messages: None,
-            max_tokens: None,
-            messages_detail_ingress: None,
-            messages_detail_egress: None,
-            error: None,
+            ..Default::default()
         });
         // Response dump for non-streaming success
         self.diagnostics.record_response_dump(
@@ -878,11 +871,7 @@ impl InteractionsHandler {
                 request_size_bytes: request_size,
                 response_size_bytes: Some(total_bytes),
                 streaming: true,
-                input_messages: None,
-                max_tokens: None,
-                messages_detail_ingress: None,
-                messages_detail_egress: None,
-                error: None,
+                ..Default::default()
             });
         });
 
@@ -909,6 +898,8 @@ impl InteractionsHandler {
         ingress: Protocol,
     ) -> Result<Response, AppError> {
         let request_id = self.diagnostics.new_request_id();
+        let start = std::time::Instant::now();
+        let mut total_response_bytes: usize = 0;
 
         // Ingress dump: original client body
         let ingress_dump_body = crate::diagnostics::dump_body_from_bytes(ingress_body);
@@ -1028,6 +1019,20 @@ impl InteractionsHandler {
                     status.as_u16(),
                     true,
                 );
+                self.diagnostics.record_stats(&StatsEvent {
+                    section: route.section.clone(),
+                    request_id: request_id.clone(),
+                    ts: crate::diagnostics::ts_string(),
+                    direction: direction.into(),
+                    model: model.into(),
+                    upstream: upstream_label.into(),
+                    status: status.as_u16(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    request_size_bytes: ingress_body.len(),
+                    response_size_bytes: Some(error_body.len()),
+                    error: Some(error_body.clone()),
+                    ..Default::default()
+                });
                 let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
                 return Response::builder()
@@ -1050,6 +1055,7 @@ impl InteractionsHandler {
             let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
                 AppError::Upstream(format!("failed to parse split interaction: {e}"))
             })?;
+            total_response_bytes += response_text.len();
             current_prev = Some(interaction.id.clone());
             last_id = Some(interaction.id.clone());
             last_interaction = Some(interaction);
@@ -1078,6 +1084,20 @@ impl InteractionsHandler {
             .and_then(|i| i.usage.as_ref())
             .and_then(|u| u.total_output_tokens)
             .unwrap_or(0);
+
+        self.diagnostics.record_stats(&StatsEvent {
+            section: route.section.clone(),
+            request_id: request_id.clone(),
+            ts: crate::diagnostics::ts_string(),
+            direction: direction.into(),
+            model: model.into(),
+            upstream: upstream_label.into(),
+            status: 200,
+            duration_ms: start.elapsed().as_millis() as u64,
+            request_size_bytes: ingress_body.len(),
+            response_size_bytes: Some(total_response_bytes),
+            ..Default::default()
+        });
 
         let resp = match ingress {
             Protocol::OpenAi => {
@@ -1145,13 +1165,15 @@ impl InteractionsHandler {
         total_message_count: usize,
         limit: usize,
         model: &str,
-        _upstream_label: &str,
-        _ingress_body: &[u8],
-        _direction: &str,
+        upstream_label: &str,
+        ingress_body: &[u8],
+        direction: &str,
         request_headers: &HeaderMap,
         ingress: Protocol,
         request_id: String,
     ) -> Result<Response, AppError> {
+        let start = std::time::Instant::now();
+        let mut total_response_bytes: usize = 0;
         // Split system_instruction on natural boundaries
         let sys_parts = split_text_for_limit(sys, limit).map_err(AppError::BadRequest)?;
         let mut last_id: Option<String> = None;
@@ -1216,6 +1238,20 @@ impl InteractionsHandler {
                     upstream_status.as_u16(),
                     true,
                 );
+                self.diagnostics.record_stats(&StatsEvent {
+                    section: route.section.clone(),
+                    request_id: request_id.clone(),
+                    ts: crate::diagnostics::ts_string(),
+                    direction: direction.into(),
+                    model: model.into(),
+                    upstream: upstream_label.into(),
+                    status: upstream_status.as_u16(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    request_size_bytes: ingress_body.len(),
+                    response_size_bytes: Some(error_body.len()),
+                    error: Some(error_body.clone()),
+                    ..Default::default()
+                });
                 let sc = StatusCode::from_u16(upstream_status.as_u16())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
                 let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
@@ -1226,6 +1262,7 @@ impl InteractionsHandler {
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
             let response_text = upstream.text().await?;
+            total_response_bytes += response_text.len();
             // Response dump per system-instruction chunk
             self.diagnostics.record_response_dump(
                 &request_id,
@@ -1295,6 +1332,20 @@ impl InteractionsHandler {
                         upstream_status.as_u16(),
                         true,
                     );
+                    self.diagnostics.record_stats(&StatsEvent {
+                        section: route.section.clone(),
+                        request_id: request_id.clone(),
+                        ts: crate::diagnostics::ts_string(),
+                        direction: direction.into(),
+                        model: model.into(),
+                        upstream: upstream_label.into(),
+                        status: upstream_status.as_u16(),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        request_size_bytes: ingress_body.len(),
+                        response_size_bytes: Some(error_body.len()),
+                        error: Some(error_body.clone()),
+                        ..Default::default()
+                    });
                     let sc = StatusCode::from_u16(upstream_status.as_u16())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     let body =
@@ -1306,6 +1357,7 @@ impl InteractionsHandler {
                         .map_err(|err| AppError::Internal(err.to_string()));
                 }
                 let response_text = upstream.text().await?;
+                total_response_bytes += response_text.len();
                 // Response dump per content chunk
                 self.diagnostics.record_response_dump(
                     &request_id,
@@ -1346,6 +1398,20 @@ impl InteractionsHandler {
             .and_then(|i| i.usage.as_ref())
             .and_then(|u| u.total_output_tokens)
             .unwrap_or(0);
+
+        self.diagnostics.record_stats(&StatsEvent {
+            section: route.section.clone(),
+            request_id: request_id.clone(),
+            ts: crate::diagnostics::ts_string(),
+            direction: direction.into(),
+            model: model.into(),
+            upstream: upstream_label.into(),
+            status: 200,
+            duration_ms: start.elapsed().as_millis() as u64,
+            request_size_bytes: ingress_body.len(),
+            response_size_bytes: Some(total_response_bytes),
+            ..Default::default()
+        });
 
         let resp = match ingress {
             Protocol::OpenAi => {
@@ -2215,21 +2281,10 @@ If you don't know the answer, say so honestly.";
     fn build_interaction_url_strips_query_params() {
         let route = crate::config::RouteTarget {
             section: "test".into(),
-            endpoint_openai: None,
-            endpoint_anthropic: None,
             endpoint_interactions: Some(
                 "https://host/v1beta/interactions?model=gemini-2.0-flash&alt=sse".into(),
             ),
-            api_key: None,
-            max_tokens: None,
-            max_output_tokens: None,
-            max_completion_tokens: None,
-            model_names: std::collections::HashSet::new(),
-            drop_fields: crate::config::DropFields::default(),
-            proxy_limit: None,
-            proxy: None,
-            control_clean_all: None,
-            control_extend_lifetime: None,
+            ..Default::default()
         };
         let result = build_interaction_url(&route, "/cancel");
         assert_eq!(result, "https://host/v1beta/interactions/cancel");
@@ -2239,19 +2294,8 @@ If you don't know the answer, say so honestly.";
     fn build_interaction_url_strips_trailing_slash() {
         let route = crate::config::RouteTarget {
             section: "test".into(),
-            endpoint_openai: None,
-            endpoint_anthropic: None,
             endpoint_interactions: Some("https://host/v1beta/interactions/".into()),
-            api_key: None,
-            max_tokens: None,
-            max_output_tokens: None,
-            max_completion_tokens: None,
-            model_names: std::collections::HashSet::new(),
-            drop_fields: crate::config::DropFields::default(),
-            proxy_limit: None,
-            proxy: None,
-            control_clean_all: None,
-            control_extend_lifetime: None,
+            ..Default::default()
         };
         let result = build_interaction_url(&route, "/cancel");
         assert_eq!(result, "https://host/v1beta/interactions/cancel");
@@ -2261,19 +2305,8 @@ If you don't know the answer, say so honestly.";
     fn build_interaction_url_strips_bare_qmark() {
         let route = crate::config::RouteTarget {
             section: "test".into(),
-            endpoint_openai: None,
-            endpoint_anthropic: None,
             endpoint_interactions: Some("https://host/v1beta/interactions?model".into()),
-            api_key: None,
-            max_tokens: None,
-            max_output_tokens: None,
-            max_completion_tokens: None,
-            model_names: std::collections::HashSet::new(),
-            drop_fields: crate::config::DropFields::default(),
-            proxy_limit: None,
-            proxy: None,
-            control_clean_all: None,
-            control_extend_lifetime: None,
+            ..Default::default()
         };
         let result = build_interaction_url(&route, "/cancel");
         assert_eq!(result, "https://host/v1beta/interactions/cancel");

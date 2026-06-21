@@ -104,7 +104,7 @@ impl<'de> Deserialize<'de> for DropFields {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RouteTarget {
     pub section: String,
     pub endpoint_openai: Option<String>,

@@ -220,17 +220,10 @@ async fn dispatch_messages(
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
                 model: "?".into(),
-                upstream: String::new(),
                 status: 400,
-                duration_ms: 0,
                 request_size_bytes: body.len(),
-                response_size_bytes: None,
-                streaming: false,
-                input_messages: None,
-                max_tokens: None,
-                messages_detail_ingress: None,
-                messages_detail_egress: None,
                 error: Some("non-utf8".into()),
+                ..Default::default()
             });
         // Record a dump of the non-UTF8 body
         let body = crate::diagnostics::dump_body_from_bytes(&body);
@@ -255,17 +248,10 @@ async fn dispatch_messages(
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
                 model: "?".into(),
-                upstream: String::new(),
                 status: 400,
-                duration_ms: 0,
                 request_size_bytes: body.len(),
-                response_size_bytes: None,
-                streaming: false,
-                input_messages: None,
-                max_tokens: None,
-                messages_detail_ingress: None,
-                messages_detail_egress: None,
                 error: Some(format!("invalid JSON body: {err}")),
+                ..Default::default()
             });
         AppError::BadRequest(format!("invalid JSON body: {err}"))
     })?;
@@ -279,17 +265,10 @@ async fn dispatch_messages(
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
                 model: "?".into(),
-                upstream: String::new(),
                 status: 400,
-                duration_ms: 0,
                 request_size_bytes: body.len(),
-                response_size_bytes: None,
-                streaming: false,
-                input_messages: None,
-                max_tokens: None,
-                messages_detail_ingress: None,
-                messages_detail_egress: None,
                 error: Some("model must not be empty".into()),
+                ..Default::default()
             });
         return Err(AppError::BadRequest("model must not be empty".to_string()));
     }
@@ -303,17 +282,10 @@ async fn dispatch_messages(
                 ts: crate::diagnostics::ts_string(),
                 direction: ingress.to_string(),
                 model: peek.model.clone(),
-                upstream: String::new(),
                 status: 400,
-                duration_ms: 0,
                 request_size_bytes: body.len(),
-                response_size_bytes: None,
-                streaming: false,
-                input_messages: None,
-                max_tokens: None,
-                messages_detail_ingress: None,
-                messages_detail_egress: None,
                 error: Some(err.to_string()),
+                ..Default::default()
             });
         AppError::from(err)
     })?;

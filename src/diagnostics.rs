@@ -101,7 +101,7 @@ struct SectionWriters {
 }
 
 /// Per-request statistics (model, duration, token counts, message breakdown).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct StatsEvent {
     pub section: String,
     pub request_id: String,
@@ -128,7 +128,7 @@ pub struct StatsEvent {
 }
 
 /// Raw request or response body dump.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DumpEvent {
     pub section: String,
     pub request_id: String,
@@ -180,6 +180,12 @@ pub enum DumpBody {
 impl DumpBody {
     pub(crate) fn is_base64(&self) -> bool {
         matches!(self, Self::Base64(_))
+    }
+}
+
+impl Default for DumpBody {
+    fn default() -> Self {
+        DumpBody::Utf8(String::new())
     }
 }
 

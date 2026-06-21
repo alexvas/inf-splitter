@@ -143,24 +143,11 @@ pub(crate) fn cap_openai_max_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn empty_route() -> crate::config::RouteTarget {
         crate::config::RouteTarget {
             section: "test".into(),
-            endpoint_openai: None,
-            endpoint_anthropic: None,
-            endpoint_interactions: None,
-            api_key: None,
-            max_tokens: None,
-            max_output_tokens: None,
-            max_completion_tokens: None,
-            model_names: HashSet::new(),
-            drop_fields: crate::config::DropFields::default(),
-            proxy: None,
-            proxy_limit: None,
-            control_clean_all: None,
-            control_extend_lifetime: None,
+            ..Default::default()
         }
     }
 

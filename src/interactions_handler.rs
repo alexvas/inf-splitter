@@ -521,7 +521,8 @@ impl InteractionsHandler {
                 error_body.clone(),
             );
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
+            let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
+            let body = crate::apply_error_translation(sc, body, &self.error_translation);
             return Response::builder()
                 .status(sc)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -894,7 +895,8 @@ impl InteractionsHandler {
                     error_body.clone(),
                 );
                 let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
+                let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
+                let body = crate::apply_error_translation(sc, body, &self.error_translation);
                 return Response::builder()
                     .status(sc)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -1081,7 +1083,8 @@ impl InteractionsHandler {
                 );
                 let sc = StatusCode::from_u16(upstream_status.as_u16())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
-                let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
+                let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
+                let body = crate::apply_error_translation(sc, body, &self.error_translation);
                 return Response::builder()
                     .status(sc)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -1146,7 +1149,8 @@ impl InteractionsHandler {
                     let sc = StatusCode::from_u16(upstream_status.as_u16())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     let body =
-                        crate::apply_error_translation(sc, error_body, &self.error_translation);
+                        crate::translate_interactions_error_to_protocol(&error_body, ingress);
+                    let body = crate::apply_error_translation(sc, body, &self.error_translation);
                     return Response::builder()
                         .status(sc)
                         .header(header::CONTENT_TYPE, "application/json")

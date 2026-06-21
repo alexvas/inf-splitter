@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::anthropic::AnthropicHandler;
-use crate::config::{cap_numeric_field, Config, ErrorTranslationRule, RouteTarget};
+use crate::config::{cap_numeric_field, Config, ErrorTranslationRule, Protocol, RouteTarget};
 use crate::diagnostics::Diagnostics;
 use crate::error::AppError;
 use crate::interactions_handler::InteractionsHandler;
@@ -57,6 +57,58 @@ pub(crate) fn apply_error_translation(
         }
     }
     body
+}
+
+/// Detect a Gemini/Interactions API error body and translate it to the
+/// ingress protocol format (Anthropic or OpenAI).
+///
+/// Gemini error shape: `{"error":{"message":"...","code":"..."}}`
+///
+/// Returns the original body unchanged when it is not a recognizable
+/// Gemini error (not valid JSON, missing `error.message`, etc.).
+pub(crate) fn translate_interactions_error_to_protocol(body: &str, ingress: Protocol) -> String {
+    let mut value: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return body.to_string(),
+    };
+
+    let error_obj = match value.get_mut("error").and_then(|e| e.as_object_mut()) {
+        Some(obj) => obj,
+        None => return body.to_string(),
+    };
+
+    // Require `message` as a string — the one field every Gemini error carries.
+    let message = match error_obj.get("message").and_then(|m| m.as_str()) {
+        Some(m) => m,
+        None => return body.to_string(),
+    };
+
+    let code = error_obj
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("api_error");
+
+    let error_type = code;
+    let error_message = message;
+
+    match ingress {
+        Protocol::Anthropic => serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": error_message
+            }
+        })
+        .to_string(),
+        Protocol::OpenAi => serde_json::json!({
+            "error": {
+                "message": error_message,
+                "type": error_type,
+                "code": error_type
+            }
+        })
+        .to_string(),
+    }
 }
 
 /// Apply token limits from the route config to a raw JSON body (passthrough path).
@@ -447,5 +499,61 @@ mod tests {
         let result =
             apply_error_translation(StatusCode::PAYLOAD_TOO_LARGE, "any error".into(), &rules);
         assert_eq!(result, "translated");
+    }
+
+    // --- translate_interactions_error_to_protocol ---
+
+    use crate::config::Protocol;
+
+    #[test]
+    fn translate_gemini_error_to_anthropic() {
+        let body = r#"{"error":{"message":"Quota exceeded","code":"too_many_requests"}}"#;
+        let result = translate_interactions_error_to_protocol(body, Protocol::Anthropic);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "too_many_requests");
+        assert_eq!(v["error"]["message"], "Quota exceeded");
+    }
+
+    #[test]
+    fn translate_gemini_error_to_openai() {
+        let body = r#"{"error":{"message":"Quota exceeded","code":"too_many_requests"}}"#;
+        let result = translate_interactions_error_to_protocol(body, Protocol::OpenAi);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["error"]["message"], "Quota exceeded");
+        assert_eq!(v["error"]["type"], "too_many_requests");
+        assert_eq!(v["error"]["code"], "too_many_requests");
+    }
+
+    #[test]
+    fn translate_gemini_error_missing_code_defaults() {
+        let body = r#"{"error":{"message":"Quota exceeded"}}"#;
+        let result = translate_interactions_error_to_protocol(body, Protocol::Anthropic);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["error"]["type"], "api_error");
+        assert_eq!(v["error"]["message"], "Quota exceeded");
+    }
+
+    #[test]
+    fn translate_non_json_body_passes_through() {
+        let result =
+            translate_interactions_error_to_protocol("plain text error", Protocol::Anthropic);
+        assert_eq!(result, "plain text error");
+    }
+
+    #[test]
+    fn translate_non_gemini_json_passes_through() {
+        let body = r#"{"error":{"type":"server_error"}}"#;
+        let result = translate_interactions_error_to_protocol(body, Protocol::Anthropic);
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn translate_gemini_error_preserves_upstream_code() {
+        let body = r#"{"error":{"message":"Result not found.","code":"not_found"}}"#;
+        let result = translate_interactions_error_to_protocol(body, Protocol::Anthropic);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["error"]["type"], "not_found");
+        assert_eq!(v["error"]["message"], "Result not found.");
     }
 }

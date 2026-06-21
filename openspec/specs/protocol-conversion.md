@@ -433,3 +433,37 @@ Selected generated structs derive `Default` for ergonomic construction with `..D
 - GIVEN `TextContent { text: "hello".into(), ..Default::default() }`
 - WHEN serialized as part of `Content::TextContent`
 - THEN output has `{"text":"hello","type":"text"}` — no `null` fields
+
+## Requirement: Gemini Error Body Translation (Non-Streaming)
+
+When the Interactions API returns a non-2xx status with a Gemini-shaped error body `{"error":{"message":"...","code":"..."}}`, the proxy translates it to the ingress protocol format before applying user-configured `error_translation` rules. The function `translate_interactions_error_to_protocol(body: &str, ingress: Protocol)` in `src/lib.rs` handles this.
+
+All 4 non-streaming error paths in `InteractionsHandler` call it before `apply_error_translation`:
+- `send_and_translate`
+- `handle_split_send`
+- `send_split_system_instruction` (both error sites)
+
+### Scenario: Gemini error → Anthropic format
+- GIVEN interactions upstream returns body `{"error":{"message":"Quota exceeded","code":"too_many_requests"}}`
+- WHEN `translate_interactions_error_to_protocol` is called with `Protocol::Anthropic`
+- THEN the body is translated to `{"type":"error","error":{"type":"too_many_requests","message":"Quota exceeded"}}`
+
+### Scenario: Gemini error → OpenAI format
+- GIVEN interactions upstream returns body `{"error":{"message":"Quota exceeded","code":"too_many_requests"}}`
+- WHEN `translate_interactions_error_to_protocol` is called with `Protocol::OpenAi`
+- THEN the body is translated to `{"error":{"message":"Quota exceeded","type":"too_many_requests","code":"too_many_requests"}}`
+
+### Scenario: Missing code defaults to api_error
+- GIVEN interactions upstream returns body `{"error":{"message":"Internal error"}}` without `code` field
+- WHEN `translate_interactions_error_to_protocol` is called
+- THEN `error.type` defaults to `"api_error"`
+
+### Scenario: Non-Gemini body passes through
+- GIVEN interactions upstream returns a body that is not valid JSON or lacks `error.message`
+- WHEN `translate_interactions_error_to_protocol` is called
+- THEN the body is returned unchanged
+
+### Scenario: User rule overrides translated body
+- GIVEN `translate_interactions_error_to_protocol` translates a Gemini error to Anthropic format
+- AND a user-configured `[[error_translation]]` rule matches (e.g., `status = 429`)
+- THEN `apply_error_translation` replaces the body with the rule's `egress`

@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 use anyllm_translate::anthropic::{Content, MessageCreateRequest};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
 use common::{
-    anthropic_upstream_response, openai_upstream_response, post_anthropic, post_openai,
-    spawn_delayed_upstream, spawn_error_upstream, spawn_router, spawn_router_with_diagnostics,
-    spawn_router_with_dump, spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream,
-    wait_for_egress_dump, wait_for_egress_response_dump, wait_for_file, wait_for_ingress_dump,
+    anthropic_upstream_response, interactions_upstream_response, openai_upstream_response,
+    post_anthropic, post_openai, spawn_delayed_upstream, spawn_error_upstream, spawn_router,
+    spawn_router_with_diagnostics, spawn_router_with_dump, spawn_sse_upstream_with_headers,
+    spawn_stream_upstream, spawn_upstream, wait_for_egress_dump, wait_for_egress_response_dump,
+    wait_for_file, wait_for_ingress_dump,
 };
 use inf_splitter::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
@@ -2566,4 +2567,376 @@ drop_fields = ["nonexistent"]
     // Just checking the proxy doesn't error on nonexistent field
     let body = captured.lock().unwrap().take().expect("upstream body");
     assert!(body.get("messages").is_some(), "messages should remain");
+}
+
+// ── Interactions dump tests ─────────────────────────────────────────
+
+/// Non-streaming Anthropic→Interactions must produce ingress, egress request,
+/// and egress response dump lines.
+#[tokio::test]
+async fn interactions_non_streaming_produces_dumps() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-dump-001", "Hello from interactions dump test!"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-int-dump-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _body = response.text().await.expect("response body");
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(
+        lines.len() >= 3,
+        "expected at least 3 dump lines (ingress, egress request, egress response), got {}",
+        lines.len()
+    );
+
+    // Verify ingress request dump
+    let has_ingress = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("ingress") && v["direction"].as_str() == Some("request")
+    });
+    assert!(has_ingress, "must have ingress request dump");
+
+    // Verify egress request dump
+    let has_egress_req = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("egress") && v["direction"].as_str() == Some("request")
+    });
+    assert!(has_egress_req, "must have egress request dump");
+
+    // Verify egress response dump
+    let has_egress_resp = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("egress") && v["direction"].as_str() == Some("response")
+    });
+    assert!(has_egress_resp, "must have egress response dump");
+
+    // All lines must share the same request_id
+    assert_unique_requests(&lines);
+
+    // Verify body contains expected text
+    let response_line = lines
+        .iter()
+        .find(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["stage"].as_str() == Some("egress") && v["direction"].as_str() == Some("response")
+        })
+        .expect("must have response dump");
+    let response_val: serde_json::Value = serde_json::from_str(response_line).expect("valid JSON");
+    let body = response_val["body"].as_str().expect("body must be string");
+    assert!(
+        body.contains("Hello from interactions dump test!"),
+        "response dump body must contain expected text, got: {body}"
+    );
+}
+
+/// Streaming Anthropic→Interactions must produce dump lines.
+#[tokio::test]
+async fn interactions_streaming_produces_dumps() {
+    let sse_body = format!(
+        "data: {created}\n\ndata: {delta}\n\ndata: {completed}\n\n",
+        created = serde_json::json!({
+            "event_type": "INTERACTION_CREATED",
+            "interaction": {
+                "id": "int-stream-dump-1",
+                "status": "started",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:00:00Z",
+                "steps": []
+            }
+        }),
+        delta = serde_json::json!({
+            "event_type": "CONTENT_DELTA",
+            "delta": {"type": "text_delta", "text": "Stream dump body!"},
+            "index": 0
+        }),
+        completed = serde_json::json!({
+            "event_type": "INTERACTION_COMPLETED",
+            "interaction": {
+                "id": "int-stream-dump-1",
+                "status": "completed",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:00:01Z",
+                "steps": [],
+                "usage": {"total_input_tokens": 5, "total_output_tokens": 15}
+            }
+        }),
+    );
+
+    let session_store_path = std::env::temp_dir().join(format!(
+        "inf-splitter-int-stream-dump-{}.toml",
+        uuid_suffix()
+    ));
+    let _ = std::fs::remove_file(&session_store_path);
+
+    let upstream_addr = common::spawn_stream_upstream("/v1beta/interactions", sse_body).await;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "inf-splitter-int-stream-dump-{}.ndjson",
+        uuid_suffix()
+    ));
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#,
+        store_path = session_store_path.display(),
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _body = response.text().await.expect("response body");
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(
+        !lines.is_empty(),
+        "streaming interactions must produce dump lines"
+    );
+
+    let has_egress_resp = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("egress") && v["direction"].as_str() == Some("response")
+    });
+    assert!(
+        has_egress_resp,
+        "streaming interactions must produce egress response dump"
+    );
+}
+
+/// Interactions error path must produce dump lines (including response dump with error body).
+#[tokio::test]
+async fn interactions_error_produces_dumps() {
+    let upstream_addr = spawn_error_upstream(
+        "/v1beta/interactions",
+        axum::http::StatusCode::BAD_GATEWAY,
+        serde_json::json!({"error": {"message": "upstream exploded"}}),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "inf-splitter-int-err-dump-{}.ndjson",
+        uuid_suffix()
+    ));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::Error,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(
+        !lines.is_empty(),
+        "interactions error must produce dump lines"
+    );
+
+    // Must have response dump with error flag
+    let has_error_resp = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"].as_str() == Some("egress")
+            && v["direction"].as_str() == Some("response")
+            && v["status"] == 502
+    });
+    assert!(
+        has_error_resp,
+        "interactions error must produce egress response dump with status 502"
+    );
+}
+
+/// When dump_mode is "off", no dump file should be created for interactions.
+#[tokio::test]
+async fn interactions_no_dump_when_off() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-no-dump-1", "should not be dumped"),
+    )
+    .await;
+
+    let tmp =
+        std::env::temp_dir().join(format!("inf-splitter-int-nodump-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::Off,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // The file might be created (empty) but should have no content
+    // Wait a bit then check
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    match std::fs::read_to_string(&tmp) {
+        Ok(content) => assert!(
+            content.trim().is_empty(),
+            "dump file must be empty when dump_mode is off, got: {content}"
+        ),
+        Err(_) => {
+            // File not existing at all is also fine
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// Verify that dump and stats events share the same request_id for interactions.
+#[tokio::test]
+async fn interactions_dump_and_stats_share_request_id() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-shared-1", "Shared request ID test"),
+    )
+    .await;
+
+    let tmp =
+        std::env::temp_dir().join(format!("inf-splitter-int-shared-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _body = response.text().await.expect("response body");
+
+    // Stats
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_lines = wait_for_file(&stats_path).await;
+    assert!(!stats_lines.is_empty(), "must have stats line");
+    let stats: serde_json::Value = serde_json::from_str(&stats_lines[0]).expect("valid NDJSON");
+    let stats_request_id = stats["request_id"]
+        .as_str()
+        .expect("stats must have request_id");
+
+    // Dump
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_lines = wait_for_file(&dump_path).await;
+    assert!(!dump_lines.is_empty(), "must have dump lines");
+
+    // All dump lines must share the same request_id as the stats line
+    for line in &dump_lines {
+        let dump: serde_json::Value = serde_json::from_str(line).expect("valid NDJSON");
+        let dump_request_id = dump["request_id"]
+            .as_str()
+            .expect("dump must have request_id");
+        assert_eq!(
+            dump_request_id, stats_request_id,
+            "dump request_id {dump_request_id} must match stats request_id {stats_request_id}"
+        );
+    }
 }

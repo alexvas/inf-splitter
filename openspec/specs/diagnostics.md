@@ -101,6 +101,48 @@ Each dump line is an NDJSON `DumpEvent` with fields:
 - WHEN a dump event is recorded
 - THEN the body is truncated to 65536 bytes before base64 encoding
 
+## Requirement: Every Protocol Handler Records Dump Events
+
+Every protocol handler (OpenAI passthrough, Anthropic passthrough, protocol conversion, interactions) must record the same categories of dump events for every request:
+
+- **ingress request** — the original client body as received by the proxy
+- **egress request** — the body actually sent upstream (after token caps, protocol translation, control message stripping, etc.)
+- **egress response** — the raw upstream response body (up to 1 MiB for streaming)
+
+All dump events for a single request share the same `request_id` as the corresponding stats event.
+
+### Scenario: Non-streaming request produces dump
+- GIVEN `dump_mode = "all"` and `dump_output` is set to a file path
+- AND a non-streaming request arrives at any handler
+- WHEN the request completes with status 200
+- THEN three dump lines are written: ingress request, egress request, egress response
+- AND all three lines share the same `request_id`
+
+### Scenario: Streaming request produces dump
+- GIVEN `dump_mode = "all"` and `dump_output` is set to a file path
+- AND a streaming request arrives at any handler
+- WHEN the stream completes with status 200
+- THEN ingress and egress request dump lines are written
+- AND a response dump line is written with the raw body (up to 1 MiB)
+
+### Scenario: Error response produces dump
+- GIVEN `dump_mode = "all"` (or `"error"`) and `dump_output` is set to a file path
+- AND the upstream returns a non-2xx status
+- WHEN the error is handled
+- THEN ingress and egress request dump lines are written
+- AND a response dump line is written containing the error body
+
+### Scenario: No dump when dump_mode is off
+- GIVEN `dump_mode = "off"`
+- WHEN a request completes (any handler)
+- THEN no dump lines are written for that request
+
+### Scenario: Shared request_id between dump and stats
+- GIVEN `dump_mode = "all"` and `stats_mode = "all"`
+- AND a request completes via any handler
+- WHEN both dump and stats events are recorded
+- THEN all dump lines and the stats line for that request share the same `request_id`
+
 ## Requirement: Timestamp Format
 
 All diagnostic timestamps use ISO 8601 UTC format: `YYYY-MM-DDTHH:MM:SSZ`. This applies to both `StatsEvent.ts` and `DumpEvent.ts`.

@@ -467,3 +467,28 @@ All 4 non-streaming error paths in `InteractionsHandler` call it before `apply_e
 - GIVEN `translate_interactions_error_to_protocol` translates a Gemini error to Anthropic format
 - AND a user-configured `[[error_translation]]` rule matches (e.g., `status = 429`)
 - THEN `apply_error_translation` replaces the body with the rule's `egress`
+
+## Requirement: Shared Non-UTF-8 Upstream Body Validation
+
+`validate_upstream_body(body: Bytes, request_id: &str) -> Result<ValidatedBody, AppError>` in `src/lib.rs` detects non-UTF-8 upstream response bodies. On success it returns `ValidatedBody { text, dump }` with the decoded string and a `DumpBody` ready for `response_dump`. On failure it logs `tracing::warn!("non-utf8 upstream response body")` and returns `AppError::Internal("non-utf8 response from upstream")`.
+
+Used by all three handlers (`openai.rs`, `anthropic.rs`, `interactions_handler.rs`) for non-streaming responses.
+
+The interactions streaming path (`handle_stream_response`) also detects non-UTF-8 chunks — replacing the previous `String::from_utf8_lossy` (which silently produced garbage). On a binary chunk it sends an SSE `error` event with `{"type":"error","error":{"type":"upstream_error","message":"non-utf8 response from upstream"}}` and aborts the stream.
+
+### Scenario: Binary upstream response detected (non-streaming)
+- GIVEN upstream returns bytes `0xFF 0xFE 0x00` with `content-type: application/json`
+- WHEN `validate_upstream_body` is called
+- THEN `tracing::warn!` is emitted
+- AND `AppError::Internal("non-utf8 response from upstream")` is returned
+
+### Scenario: Valid UTF-8 passes through
+- GIVEN upstream returns valid UTF-8 JSON bytes
+- WHEN `validate_upstream_body` is called
+- THEN `Ok(ValidatedBody { text, dump })` is returned
+
+### Scenario: Binary chunk in interactions stream
+- GIVEN an interactions SSE stream with a non-UTF-8 chunk
+- WHEN the chunk is received by `handle_stream_response`
+- THEN an SSE `error` event is sent to the client
+- AND the stream is aborted with `finish_with_error(502, ...)`

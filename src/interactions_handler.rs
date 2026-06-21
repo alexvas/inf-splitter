@@ -545,7 +545,11 @@ impl InteractionsHandler {
                 .await;
         }
 
-        let response_body = upstream.text().await?;
+        let response_body_bytes = upstream.bytes().await?;
+        let validated =
+            crate::validate_upstream_body(response_body_bytes, guard.request_id())?;
+        guard.response_dump(validated.dump, 200, false, vec![]);
+        let response_body = validated.text;
         let interaction: Interaction = serde_json::from_str(&response_body).map_err(|e| {
             AppError::Upstream(format!("failed to parse interaction response: {e}"))
         })?;
@@ -556,13 +560,6 @@ impl InteractionsHandler {
             .session_store
             .update(session_id, interaction_id, new_count, false)
             .await;
-
-        guard.response_dump(
-            crate::diagnostics::dump_body_from_bytes(response_body.as_bytes()),
-            200,
-            false,
-            vec![],
-        );
 
         // Translate response back to ingress protocol
         let resp = interactions_lib::build_response_from_interaction(&interaction, model, ingress)
@@ -636,7 +633,32 @@ impl InteractionsHandler {
                             let to_take = std::cmp::min(chunk.len(), remaining);
                             dump_buffer.extend_from_slice(&chunk[..to_take]);
                         }
-                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        // Reject non-UTF-8 chunks — from_utf8_lossy would silently
+                        // produce garbage that confuses the downstream agent.
+                        if std::str::from_utf8(&chunk).is_err() {
+                            let err_payload = bytes::Bytes::from(sse::format_sse_event_str(
+                                &anyllm_translate::anthropic::StreamEvent::Error {
+                                    error: anyllm_translate::anthropic::streaming::StreamError {
+                                        error_type: "upstream_error".into(),
+                                        message: "non-utf8 response from upstream".into(),
+                                    },
+                                },
+                            ));
+                            let _ = tx.send(Ok(err_payload)).await;
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            guard.finish_with_error(
+                                502,
+                                duration_ms,
+                                request_size,
+                                Some(total_bytes),
+                                &label,
+                                &dir,
+                                true,
+                                "non-utf8 streaming response from upstream".into(),
+                            );
+                            return;
+                        }
+                        buffer.push_str(std::str::from_utf8(&chunk).unwrap());
 
                         // Parse complete SSE events separated by \n\n
                         while let Some(pos) = buffer.find("\n\n") {
@@ -903,13 +925,11 @@ impl InteractionsHandler {
                     .body(Body::from(body))
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
-            let response_text = upstream.text().await?;
-            guard.response_dump(
-                crate::diagnostics::dump_body_from_bytes(response_text.as_bytes()),
-                200,
-                false,
-                vec![],
-            );
+            let response_bytes = upstream.bytes().await?;
+            let validated =
+                crate::validate_upstream_body(response_bytes, guard.request_id())?;
+            guard.response_dump(validated.dump, 200, false, vec![]);
+            let response_text = validated.text;
             let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
                 AppError::Upstream(format!("failed to parse split interaction: {e}"))
             })?;
@@ -1091,14 +1111,12 @@ impl InteractionsHandler {
                     .body(Body::from(body))
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
-            let response_text = upstream.text().await?;
-            total_response_bytes += response_text.len();
-            guard.response_dump(
-                crate::diagnostics::dump_body_from_bytes(response_text.as_bytes()),
-                200,
-                false,
-                vec![],
-            );
+            let response_bytes = upstream.bytes().await?;
+            total_response_bytes += response_bytes.len();
+            let validated =
+                crate::validate_upstream_body(response_bytes, guard.request_id())?;
+            guard.response_dump(validated.dump, 200, false, vec![]);
+            let response_text = validated.text;
             if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
                 current_prev = Some(interaction.id.clone());
                 last_id = Some(interaction.id);
@@ -1157,14 +1175,12 @@ impl InteractionsHandler {
                         .body(Body::from(body))
                         .map_err(|err| AppError::Internal(err.to_string()));
                 }
-                let response_text = upstream.text().await?;
-                total_response_bytes += response_text.len();
-                guard.response_dump(
-                    crate::diagnostics::dump_body_from_bytes(response_text.as_bytes()),
-                    200,
-                    false,
-                    vec![],
-                );
+                let response_bytes = upstream.bytes().await?;
+                total_response_bytes += response_bytes.len();
+                let validated =
+                    crate::validate_upstream_body(response_bytes, guard.request_id())?;
+                guard.response_dump(validated.dump, 200, false, vec![]);
+                let response_text = validated.text;
                 if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
                     current_prev = Some(interaction.id.clone());
                     last_id = Some(interaction.id.clone());

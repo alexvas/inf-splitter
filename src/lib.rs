@@ -28,6 +28,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use crate::anthropic::AnthropicHandler;
 use crate::config::{cap_numeric_field, Config, ErrorTranslationRule, Protocol, RouteTarget};
 use crate::diagnostics::Diagnostics;
+use crate::diagnostics::DumpBody;
 use crate::error::AppError;
 use crate::interactions_handler::InteractionsHandler;
 use crate::openai::OpenAiHandler;
@@ -109,6 +110,36 @@ pub(crate) fn translate_interactions_error_to_protocol(body: &str, ingress: Prot
         })
         .to_string(),
     }
+}
+
+/// Result of `validate_upstream_body` — the decoded UTF-8 text and a
+/// `DumpBody` ready for `response_dump`.
+pub(crate) struct ValidatedBody {
+    pub text: String,
+    pub dump: DumpBody,
+}
+
+/// Validate that upstream response bytes are UTF-8.
+///
+/// On success returns `ValidatedBody { text, dump }`.  On failure logs a
+/// warning and returns `AppError::Internal("non-utf8 response from upstream")`.
+pub(crate) fn validate_upstream_body(
+    body: bytes::Bytes,
+    request_id: &str,
+) -> Result<ValidatedBody, AppError> {
+    let dump = crate::diagnostics::dump_body_from_bytes(&body);
+    if dump.is_base64() {
+        tracing::warn!(
+            request_id = %request_id,
+            direction = "response",
+            body_len = body.len(),
+            "non-utf8 upstream response body"
+        );
+        return Err(AppError::Internal("non-utf8 response from upstream".into()));
+    }
+    let text =
+        String::from_utf8(body.to_vec()).expect("bytes already validated as UTF-8 by dump_body");
+    Ok(ValidatedBody { text, dump })
 }
 
 /// Apply token limits from the route config to a raw JSON body (passthrough path).

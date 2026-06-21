@@ -505,18 +505,13 @@ async fn relay_openai_upstream(
     }
 
     let body = upstream.bytes().await?;
-    let dump_body = crate::diagnostics::dump_body_from_bytes(&body);
-    let is_base64 = dump_body.is_base64();
-    guard.response_dump(dump_body, status.as_u16(), is_base64, relay_headers.clone());
-    if is_base64 {
-        tracing::warn!(
-            request_id = %guard.request_id(),
-            direction = "response",
-            body_len = body.len(),
-            "non-utf8 upstream response body"
-        );
-        return Err(AppError::Internal("non-utf8 response from upstream".into()));
-    }
+    let validated = crate::validate_upstream_body(body.clone(), guard.request_id())?;
+    guard.response_dump(
+        validated.dump,
+        status.as_u16(),
+        false,
+        relay_headers.clone(),
+    );
     let mut response = Response::builder().status(status);
     for (name, value) in relay_headers {
         response = response.header(name, value);

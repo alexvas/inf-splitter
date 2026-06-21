@@ -143,6 +143,45 @@ All dump events for a single request share the same `request_id` as the correspo
 - WHEN both dump and stats events are recorded
 - THEN all dump lines and the stats line for that request share the same `request_id`
 
+## Requirement: Every Protocol Handler Records Stats Events
+
+Every protocol handler (OpenAI passthrough, Anthropic passthrough, protocol conversion, interactions) must record a `StatsEvent` for every request that produces a dump event. The invariant is: **if a request produces any dump lines, it MUST also produce a stats line, sharing the same `request_id`.**
+
+This includes all code paths:
+- Non-streaming success
+- Non-streaming error
+- Streaming success (recorded in spawned task)
+- Streaming error
+- Split-send (proxy_limit content splitting)
+- System instruction splitting
+
+### Scenario: Split-send produces aggregate stats
+- GIVEN `stats_mode = "all"` and a request whose content exceeds `proxy_limit`
+- WHEN the content is split and sent across multiple interaction chunks
+- THEN one aggregate stats line is recorded after all chunks complete
+- AND the stats line uses the same `request_id` as all per-chunk dump lines
+- AND `response_size_bytes` is the sum of all chunk response sizes
+- AND `duration_ms` covers the total elapsed time for all chunks
+
+### Scenario: System instruction split produces aggregate stats
+- GIVEN `stats_mode = "all"` and a request where system_instruction exceeds `proxy_limit`
+- WHEN the system instruction is split and sent across multiple interactions
+- THEN one aggregate stats line is recorded after all interactions complete
+- AND the stats line uses the same `request_id` as all per-chunk dump lines
+
+### Scenario: Streaming request produces stats
+- GIVEN `stats_mode = "all"` and a streaming request arrives at any handler
+- WHEN the stream completes
+- THEN a stats line is written with `"streaming": true` and `response_size_bytes` set to the accumulated byte count
+- AND the stats line is written from within the spawned stream-processing task
+
+### Scenario: Error request produces stats
+- GIVEN `stats_mode = "error"` (or `"all"`) and the upstream returns a non-2xx status
+- WHEN the error is handled
+- THEN a stats line is written with `error` set to the error body text
+- AND `status` matches the upstream status code
+- AND the dump lines and stats line share the same `request_id`
+
 ## Requirement: Timestamp Format
 
 All diagnostic timestamps use ISO 8601 UTC format: `YYYY-MM-DDTHH:MM:SSZ`. This applies to both `StatsEvent.ts` and `DumpEvent.ts`.

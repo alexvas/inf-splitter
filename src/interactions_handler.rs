@@ -477,48 +477,11 @@ impl InteractionsHandler {
         ingress: Protocol,
         request_headers: &HeaderMap,
     ) -> Result<Response, AppError> {
-        let request_id = self.diagnostics.new_request_id();
+        let mut guard =
+            crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, model);
 
-        // Ingress dump: original client body
-        let ingress_dump_body = crate::diagnostics::dump_body_from_bytes(ingress_body);
-        if ingress_dump_body.is_base64() {
-            tracing::warn!(
-                request_id = %request_id,
-                direction = "request",
-                body_len = ingress_body.len(),
-                "non-utf8 in interactions ingress request body"
-            );
-        }
-        self.diagnostics.record_request_dump(
-            &request_id,
-            &route.section,
-            "ingress",
-            model,
-            request_headers,
-            ingress_dump_body,
-            None,
-            false,
-        );
-        // Egress dump: interactions request body sent upstream
-        let egress_dump_body = crate::diagnostics::dump_body_from_bytes(egress_body);
-        if egress_dump_body.is_base64() {
-            tracing::warn!(
-                request_id = %request_id,
-                direction = "request",
-                body_len = egress_body.len(),
-                "non-utf8 in interactions egress request body"
-            );
-        }
-        self.diagnostics.record_request_dump(
-            &request_id,
-            &route.section,
-            "egress",
-            model,
-            request_headers,
-            egress_dump_body,
-            None,
-            false,
-        );
+        guard.ingress_dump(ingress_body, request_headers);
+        guard.egress_dump(egress_body, request_headers);
 
         let builder = build_interactions_headers(
             self.http
@@ -535,30 +498,20 @@ impl InteractionsHandler {
         if !upstream.status().is_success() {
             let status = upstream.status();
             let error_body = upstream.text().await.unwrap_or_default();
-            self.diagnostics.record_stats(&StatsEvent {
-                section: route.section.clone(),
-                request_id: request_id.clone(),
-                ts: crate::diagnostics::ts_string(),
-                direction: direction.into(),
-                model: model.into(),
-                upstream: upstream_label.into(),
-                status: status.as_u16(),
-                duration_ms,
-                request_size_bytes: ingress_body.len(),
-                response_size_bytes: Some(error_body.len()),
-                streaming: stream,
-                error: Some(error_body.clone()),
-                ..Default::default()
-            });
-            // Response dump for error path
-            self.diagnostics.record_response_dump(
-                &request_id,
-                &route.section,
-                model,
-                vec![],
+            guard.response_dump(
                 crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                 status.as_u16(),
                 true,
+            );
+            guard.finish_with_error(
+                status.as_u16(),
+                duration_ms,
+                ingress_body.len(),
+                Some(error_body.len()),
+                upstream_label,
+                direction,
+                stream,
+                error_body.clone(),
             );
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
@@ -570,6 +523,7 @@ impl InteractionsHandler {
         }
 
         if stream {
+            let request_id = guard.disarm();
             return self
                 .handle_stream_response(
                     upstream,
@@ -598,30 +552,19 @@ impl InteractionsHandler {
             .update(session_id, interaction_id, new_count, false)
             .await;
 
-        // Record success diagnostics
-        self.diagnostics.record_stats(&StatsEvent {
-            section: route.section.clone(),
-            request_id: request_id.clone(),
-            ts: crate::diagnostics::ts_string(),
-            direction: direction.into(),
-            model: model.into(),
-            upstream: upstream_label.into(),
-            status: 200,
-            duration_ms,
-            request_size_bytes: ingress_body.len(),
-            response_size_bytes: Some(response_body.len()),
-            streaming: stream,
-            ..Default::default()
-        });
-        // Response dump for non-streaming success
-        self.diagnostics.record_response_dump(
-            &request_id,
-            &route.section,
-            model,
-            vec![],
+        guard.response_dump(
             crate::diagnostics::dump_body_from_bytes(response_body.as_bytes()),
             200,
             false,
+        );
+        guard.finish(
+            200,
+            duration_ms,
+            ingress_body.len(),
+            Some(response_body.len()),
+            upstream_label,
+            direction,
+            stream,
         );
 
         // Translate response back to ingress protocol

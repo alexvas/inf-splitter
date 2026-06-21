@@ -3136,3 +3136,369 @@ models = "gemini-3.1-flash-lite"
         );
     }
 }
+
+// ── Phase 2: diag stats coverage tests ───────────────────────────────
+
+#[tokio::test]
+async fn interactions_split_send_records_aggregate_stats() {
+    // Use a low proxy_limit to trigger content splitting.
+    // 3 messages of ~37 bytes each → ~117 bytes > 80 byte limit → split into chunks.
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-split-stats-1", "Split stats test"),
+    )
+    .await;
+
+    let tmp =
+        std::env::temp_dir().join(format!("inf-splitter-split-stats-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let pad = "x".repeat(230);
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let msg = |n: &str| -> serde_json::Value {
+        serde_json::json!({"role": "user", "content": format!("{n} msg {pad}")})
+    };
+    let body = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [msg("first"), msg("second"), msg("third"), msg("fourth"), msg("fifth")]
+    });
+    let response = post_anthropic(&proxy_addr, body).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _body = response.text().await.expect("response body");
+
+    // Aggregate stats must be recorded
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_lines = wait_for_file(&stats_path).await;
+    assert!(
+        !stats_lines.is_empty(),
+        "split-send must produce aggregate stats line"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&stats_lines[0]).expect("valid NDJSON stats");
+    assert_eq!(stats["section"], "gemini");
+    assert_eq!(stats["model"], "gemini-3.1-flash-lite");
+    assert_eq!(stats["status"], 200);
+    assert!(stats["request_size_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(stats["response_size_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(stats["error"].is_null() || stats.get("error").is_none());
+    let stats_request_id = stats["request_id"]
+        .as_str()
+        .expect("stats must have request_id");
+
+    // All per-chunk dump lines share the same request_id as the aggregate stats
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_lines = wait_for_file(&dump_path).await;
+    assert!(!dump_lines.is_empty(), "split-send must produce dump lines");
+    for line in &dump_lines {
+        let dump: serde_json::Value = serde_json::from_str(line).expect("valid NDJSON dump");
+        let dump_rid = dump["request_id"]
+            .as_str()
+            .expect("dump must have request_id");
+        assert_eq!(
+            dump_rid, stats_request_id,
+            "dump request_id must match stats request_id"
+        );
+    }
+}
+
+#[tokio::test]
+async fn interactions_system_instruction_split_records_stats() {
+    // Content > proxy_limit triggers handle_split_send;
+    // large system instruction > proxy_limit triggers send_split_system_instruction.
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-sys-split-1", "System instruction split test"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-sys-stats-{}.ndjson", uuid_suffix()));
+    let large_system = "x".repeat(400);
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let pad = "x".repeat(230);
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let msg = |n: &str| -> serde_json::Value {
+        serde_json::json!({"role": "user", "content": format!("{n} msg {pad}")})
+    };
+    let body = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "system": large_system,
+        "messages": [msg("first"), msg("second"), msg("third"), msg("fourth"), msg("fifth")]
+    });
+    let response = post_anthropic(&proxy_addr, body).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _body = response.text().await.expect("response body");
+
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_lines = wait_for_file(&stats_path).await;
+    assert!(
+        !stats_lines.is_empty(),
+        "system-instruction split must produce aggregate stats line"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&stats_lines[0]).expect("valid NDJSON stats");
+    assert_eq!(stats["section"], "gemini");
+    assert_eq!(stats["status"], 200);
+    assert!(stats["error"].is_null() || stats.get("error").is_none());
+}
+
+#[tokio::test]
+async fn interactions_streaming_records_streaming_true_in_stats() {
+    let sse_body = format!(
+        "data: {created}\n\ndata: {delta}\n\ndata: {completed}\n\n",
+        created = serde_json::json!({
+            "event_type": "INTERACTION_CREATED",
+            "interaction": {
+                "id": "int-stream-stats-1",
+                "status": "started",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:00:00Z",
+                "steps": []
+            }
+        }),
+        delta = serde_json::json!({
+            "event_type": "CONTENT_DELTA",
+            "delta": {"type": "text_delta", "text": "Streaming stats body!"},
+            "index": 0
+        }),
+        completed = serde_json::json!({
+            "event_type": "INTERACTION_COMPLETED",
+            "interaction": {
+                "id": "int-stream-stats-1",
+                "status": "completed",
+                "created": "2026-01-01T00:00:00Z",
+                "updated": "2026-01-01T00:01:01Z",
+                "steps": [],
+                "usage": {"total_input_tokens": 5, "total_output_tokens": 10}
+            }
+        }),
+    );
+
+    let session_store_path =
+        std::env::temp_dir().join(format!("inf-splitter-stream-stats-{}.sess", uuid_suffix()));
+    let _ = std::fs::remove_file(&session_store_path);
+    let upstream_addr = common::spawn_stream_upstream("/v1beta/interactions", sse_body).await;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "inf-splitter-stream-stats-{}.ndjson",
+        uuid_suffix()
+    ));
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#,
+        store_path = session_store_path.display(),
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello streaming"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _body = response.text().await.expect("response body");
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(
+        !lines.is_empty(),
+        "streaming interactions must produce stats line"
+    );
+    let stats_line = lines
+        .iter()
+        .find(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+            v.get("streaming").and_then(|s| s.as_bool()) == Some(true)
+        })
+        .expect("must have a stats line with streaming=true");
+    let stats: serde_json::Value = serde_json::from_str(stats_line).expect("valid NDJSON stats");
+    assert_eq!(stats["streaming"], true, "stats must have streaming=true");
+    assert!(stats["response_size_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(stats["error"].is_null() || stats.get("error").is_none());
+}
+
+#[tokio::test]
+async fn interactions_error_records_stats_with_error_field() {
+    let upstream_addr = spawn_error_upstream(
+        "/v1beta/interactions",
+        axum::http::StatusCode::BAD_GATEWAY,
+        serde_json::json!({"error": {"message": "upstream exploded during stats test"}}),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-err-stats-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::Error,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_mode: DiagnosticMode::Error,
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello error test"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let _body = response.text().await.expect("response body");
+
+    // Stats must be recorded with error field
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_lines = wait_for_file(&stats_path).await;
+    assert!(
+        !stats_lines.is_empty(),
+        "interactions error must produce stats line"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&stats_lines[0]).expect("valid NDJSON stats");
+    assert_eq!(stats["section"], "gemini");
+    assert!(stats["status"].as_u64().unwrap_or(200) >= 400);
+    assert!(
+        stats["error"].is_string(),
+        "stats must have error field on error response"
+    );
+    let stats_request_id = stats["request_id"]
+        .as_str()
+        .expect("stats must have request_id");
+
+    // Dump lines must share the same request_id
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_lines = wait_for_file(&dump_path).await;
+    assert!(
+        !dump_lines.is_empty(),
+        "interactions error must produce dump lines"
+    );
+    for line in &dump_lines {
+        let dump: serde_json::Value = serde_json::from_str(line).expect("valid NDJSON dump");
+        let dump_rid = dump["request_id"]
+            .as_str()
+            .expect("dump must have request_id");
+        assert_eq!(dump_rid, stats_request_id);
+    }
+}
+
+#[tokio::test]
+async fn openai_passthrough_streaming_records_streaming_true_in_stats() {
+    let sse_body = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello from stream\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string();
+
+    let upstream_addr = common::spawn_stream_upstream("/v1/chat/completions", sse_body).await;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "inf-splitter-oa-stream-stats-{}.ndjson",
+        uuid_suffix()
+    ));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[local]
+endpoint_openai = "http://{upstream_addr}"
+models = "test-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello openai streaming"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _body = response.text().await.expect("response body");
+
+    let lines = wait_for_file(&tmp).await;
+    assert!(
+        !lines.is_empty(),
+        "openai streaming passthrough must produce stats line"
+    );
+    let has_streaming = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+        v.get("streaming").and_then(|s| s.as_bool()) == Some(true)
+    });
+    assert!(
+        has_streaming,
+        "openai passthrough streaming must record streaming=true in stats"
+    );
+}

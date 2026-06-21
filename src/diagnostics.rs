@@ -537,6 +537,212 @@ impl Diagnostics {
     }
 }
 
+// ── RequestDiagnostics guard ────────────────────────────────────────
+
+/// Session guard that binds stats and dump recording for a single request.
+///
+/// Created at request start.  On drop, if `finish()` or `finish_with_error()`
+/// was never called, a best-effort stats event is recorded with
+/// `error: "diagnostics guard dropped without finish"`.
+pub struct RequestDiagnostics {
+    diagnostics: Diagnostics,
+    request_id: String,
+    section: String,
+    model: String,
+    start: std::time::Instant,
+    finished: bool,
+    ingress_size: usize,
+}
+
+impl RequestDiagnostics {
+    pub fn new(diagnostics: &Diagnostics, section: &str, model: &str) -> Self {
+        Self {
+            diagnostics: diagnostics.clone(),
+            request_id: diagnostics.new_request_id(),
+            section: section.to_string(),
+            model: model.to_string(),
+            start: std::time::Instant::now(),
+            finished: false,
+            ingress_size: 0,
+        }
+    }
+
+    /// The unique request_id shared by all events for this request.
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Mark the guard as finished without recording stats.
+    /// Use when the completion is handled elsewhere (e.g., streaming tasks).
+    pub fn disarm(mut self) -> String {
+        self.finished = true;
+        self.request_id.clone()
+    }
+
+    /// Record an ingress request dump and track request size.
+    pub fn ingress_dump(&mut self, body: &[u8], headers: &axum::http::HeaderMap) {
+        self.ingress_size = body.len();
+        let dump_body = dump_body_from_bytes(body);
+        if dump_body.is_base64() {
+            tracing::warn!(
+                request_id = %self.request_id,
+                direction = "request",
+                body_len = body.len(),
+                "non-utf8 in ingress request body"
+            );
+        }
+        self.diagnostics.record_request_dump(
+            &self.request_id,
+            &self.section,
+            "ingress",
+            &self.model,
+            headers,
+            dump_body,
+            None,
+            false,
+        );
+    }
+
+    /// Record an egress request dump.
+    pub fn egress_dump(&self, body: &[u8], headers: &axum::http::HeaderMap) {
+        let dump_body = dump_body_from_bytes(body);
+        if dump_body.is_base64() {
+            tracing::warn!(
+                request_id = %self.request_id,
+                direction = "request",
+                body_len = body.len(),
+                "non-utf8 in egress request body"
+            );
+        }
+        self.diagnostics.record_request_dump(
+            &self.request_id,
+            &self.section,
+            "egress",
+            &self.model,
+            headers,
+            dump_body,
+            None,
+            false,
+        );
+    }
+
+    /// Record a response dump (non-streaming).
+    pub fn response_dump(&self, body: impl Into<DumpBody>, status: u16, is_error: bool) {
+        self.diagnostics.record_response_dump(
+            &self.request_id,
+            &self.section,
+            &self.model,
+            vec![],
+            body,
+            status,
+            is_error,
+        );
+    }
+
+    /// Record a streaming response dump.
+    pub fn response_dump_streaming(&self, body: impl Into<DumpBody>, status: u16) {
+        self.diagnostics.record_response_dump(
+            &self.request_id,
+            &self.section,
+            &self.model,
+            vec![],
+            body,
+            status,
+            false,
+        );
+    }
+
+    /// Record success stats and mark the guard as finished.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish(
+        mut self,
+        status: u16,
+        duration_ms: u64,
+        request_size: usize,
+        response_size: Option<usize>,
+        upstream: &str,
+        direction: &str,
+        streaming: bool,
+    ) {
+        self.finished = true;
+        self.diagnostics.record_stats(&StatsEvent {
+            section: self.section.clone(),
+            request_id: self.request_id.clone(),
+            ts: ts_string(),
+            direction: direction.into(),
+            model: self.model.clone(),
+            upstream: upstream.into(),
+            status,
+            duration_ms,
+            request_size_bytes: request_size,
+            response_size_bytes: response_size,
+            streaming,
+            error: None,
+            ..Default::default()
+        });
+    }
+
+    /// Record error stats and mark the guard as finished.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_with_error(
+        mut self,
+        status: u16,
+        duration_ms: u64,
+        request_size: usize,
+        response_size: Option<usize>,
+        upstream: &str,
+        direction: &str,
+        streaming: bool,
+        error: String,
+    ) {
+        self.finished = true;
+        self.diagnostics.record_stats(&StatsEvent {
+            section: self.section.clone(),
+            request_id: self.request_id.clone(),
+            ts: ts_string(),
+            direction: direction.into(),
+            model: self.model.clone(),
+            upstream: upstream.into(),
+            status,
+            duration_ms,
+            request_size_bytes: request_size,
+            response_size_bytes: response_size,
+            streaming,
+            error: Some(error),
+            ..Default::default()
+        });
+    }
+}
+
+impl Drop for RequestDiagnostics {
+    fn drop(&mut self) {
+        if !self.finished {
+            let duration_ms = self.start.elapsed().as_millis() as u64;
+            tracing::error!(
+                request_id = %self.request_id,
+                section = %self.section,
+                model = %self.model,
+                "diagnostics guard dropped without finish"
+            );
+            self.diagnostics.record_stats(&StatsEvent {
+                section: self.section.clone(),
+                request_id: self.request_id.clone(),
+                ts: ts_string(),
+                direction: String::new(),
+                model: self.model.clone(),
+                upstream: String::new(),
+                status: 0,
+                duration_ms,
+                request_size_bytes: self.ingress_size,
+                response_size_bytes: None,
+                streaming: false,
+                error: Some("diagnostics guard dropped without finish".into()),
+                ..Default::default()
+            });
+        }
+    }
+}
+
 // ── background writer ────────────────────────────────────────────
 
 fn open_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -1499,5 +1705,16 @@ mod tests {
             }
             DumpBody::Utf8(_) => panic!("expected Base64, got Utf8"),
         }
+    }
+
+    #[test]
+    fn request_diagnostics_drop_records_safety_net_stats() {
+        let diag = Diagnostics::new_noop();
+        // Create a guard, do nothing, drop it — should not panic.
+        let guard = super::RequestDiagnostics::new(&diag, "test-section", "test-model");
+        let request_id = guard.request_id().to_string();
+        drop(guard);
+        assert!(!request_id.is_empty());
+        assert!(request_id.contains('-'));
     }
 }

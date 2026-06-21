@@ -79,10 +79,27 @@ fn main() {
         "pub r#type: serde_json::Value,",
         "#[serde(default, skip_serializing_if = \"serde_json::Value::is_null\")]\n    pub r#type: serde_json::Value,",
     );
-    let code = code.replace(
+    let mut code = code.replace(
         "pub event_type: serde_json::Value,",
         "#[serde(default, skip_serializing_if = \"serde_json::Value::is_null\")]\n    pub event_type: serde_json::Value,",
     );
+    // Add Default to structs whose non-Option fields are all Default-able
+    // (String, i64, f64, bool, Vec<T>, serde_json::Value).
+    // Cannot add Default to all generated structs because some contain enum fields
+    // (HarmCategory, ResponseModality, etc.) that don't implement Default.
+    for struct_name in [
+        "CreateModelInteractionParams",
+        "GenerationConfig",
+        "Interaction",
+        "TextContent",
+        "InteractionStatusUpdate",
+        "ModelOutputStep",
+    ] {
+        let from = format!("#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct {struct_name}");
+        let to = format!("#[derive(Debug, Clone, Default, Serialize, Deserialize)]\npub struct {struct_name}");
+        code = code.replace(&from, &to);
+    }
+
     // Suppress clippy::large_enum_variant for large oneOf types
     let code = code.replace(
         "pub enum Tool {",

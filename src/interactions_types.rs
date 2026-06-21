@@ -8,6 +8,14 @@
 // Include the generated types
 include!(concat!(env!("OUT_DIR"), "/interactions_types.rs"));
 
+// Manual Default impl for InteractionsInput — cannot derive because
+// it's a data-carrying untagged enum (String, StepList, ContentList, Content).
+impl Default for InteractionsInput {
+    fn default() -> Self {
+        InteractionsInput::String(String::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,8 +102,7 @@ mod tests {
     fn content_serialization_has_correct_type_field() {
         let c = Content::TextContent(TextContent {
             text: "hello".into(),
-            annotations: None,
-            r#type: serde_json::Value::Null,
+            ..Default::default()
         });
         let v = serde_json::to_value(&c).unwrap();
         let obj = v.as_object().unwrap();
@@ -109,11 +116,9 @@ mod tests {
     #[test]
     fn sse_event_serialization_has_correct_event_type_field() {
         let ev = InteractionSseEvent::InteractionStatusUpdate(InteractionStatusUpdate {
-            event_id: None,
             interaction_id: "int1".into(),
-            event_type: serde_json::Value::Null,
-            metadata: None,
             status: "running".into(),
+            ..Default::default()
         });
         let v = serde_json::to_value(&ev).unwrap();
         let obj = v.as_object().unwrap();

@@ -3,102 +3,133 @@
 //! Uses generated types from interactions_types for type-safe
 //! request construction and response parsing.
 
-use crate::config::RouteTarget;
-use crate::interactions_types::{Content, GenerationConfig, Interaction, Step, TextContent};
+#![allow(clippy::too_many_arguments)]
 
-/// Build an interactions request from Anthropic ingress body.
+use crate::config::RouteTarget;
+use crate::interactions_types::{
+    Content, CreateModelInteractionParams, GenerationConfig, Interaction, InteractionsInput, Step,
+    TextContent,
+};
+
+/// Build an interactions request from Anthropic ingress.
+///
+/// `messages` are the pre-cleaned ingress messages (control messages already stripped).
+/// All other parameters are typed scalars extracted at the ingress boundary.
 pub fn build_interactions_request_anthropic(
-    body: &serde_json::Value,
+    messages: &[serde_json::Value],
     start_index: usize,
     route: &RouteTarget,
     previous_interaction_id: Option<&str>,
-) -> serde_json::Value {
-    let messages = body
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .cloned()
-        .unwrap_or_default();
-
+    model: &str,
+    stream: bool,
+    temperature: Option<f64>,
+    ingress_max_tokens: Option<u32>,
+    system: Option<String>,
+) -> CreateModelInteractionParams {
     let contents: Vec<Content> = messages
         .iter()
         .skip(start_index)
         .filter_map(extract_anthropic_content)
         .collect();
 
-    build_request_body(&contents, route, body, previous_interaction_id, || {
-        extract_anthropic_system(body)
-    })
+    build_request_body(
+        &contents,
+        route,
+        previous_interaction_id,
+        model,
+        stream,
+        temperature,
+        ingress_max_tokens,
+        system,
+    )
 }
 
-/// Build an interactions request from OpenAI ingress body.
+/// Build an interactions request from OpenAI ingress.
 pub fn build_interactions_request_openai(
-    body: &serde_json::Value,
+    messages: &[serde_json::Value],
     start_index: usize,
     route: &RouteTarget,
     previous_interaction_id: Option<&str>,
-) -> serde_json::Value {
-    let messages = body
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .cloned()
-        .unwrap_or_default();
-
+    model: &str,
+    stream: bool,
+    temperature: Option<f64>,
+    ingress_max_tokens: Option<u32>,
+) -> CreateModelInteractionParams {
     let contents: Vec<Content> = messages
         .iter()
         .skip(start_index)
         .filter_map(extract_openai_content)
         .collect();
 
-    build_request_body(&contents, route, body, previous_interaction_id, || {
-        extract_openai_system(body)
-    })
+    let system = extract_openai_system(messages);
+
+    build_request_body(
+        &contents,
+        route,
+        previous_interaction_id,
+        model,
+        stream,
+        temperature,
+        ingress_max_tokens,
+        system,
+    )
 }
 
 fn build_request_body(
     contents: &[Content],
     route: &RouteTarget,
-    body: &serde_json::Value,
     previous_interaction_id: Option<&str>,
-    system_fn: impl FnOnce() -> Option<String>,
-) -> serde_json::Value {
-    let mut req = serde_json::json!({
-        "input": contents,
-        "stream": body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
-    });
+    model: &str,
+    stream: bool,
+    temperature: Option<f64>,
+    ingress_max_tokens: Option<u32>,
+    system_instruction: Option<String>,
+) -> CreateModelInteractionParams {
+    let mut params = CreateModelInteractionParams {
+        model: model.to_string(),
+        input: InteractionsInput::ContentList(contents.to_vec()),
+        stream: Some(stream),
+        ..Default::default()
+    };
 
-    // Generation config
-    let max_tokens = route.max_tokens.or_else(|| {
-        body.get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32)
-    });
-    if max_tokens.is_some() {
-        let gc = GenerationConfig {
-            temperature: body.get("temperature").and_then(|v| v.as_f64()),
-            top_p: None,
+    let max_tokens = route.max_tokens.or(ingress_max_tokens);
+    if max_tokens.is_some() || temperature.is_some() {
+        params.generation_config = Some(GenerationConfig {
+            temperature,
             max_output_tokens: max_tokens.map(|v| v as i64),
-            seed: None,
-            stop_sequences: None,
-            thinking_level: None,
-            thinking_summaries: None,
-            speech_config: None,
-            image_config: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            tool_choice: None,
-        };
-        req["generation_config"] = serde_json::to_value(&gc).unwrap_or_default();
+            ..Default::default()
+        });
     }
 
-    if let Some(sys) = system_fn() {
-        req["system_instruction"] = serde_json::json!(sys);
+    if let Some(sys) = system_instruction {
+        params.system_instruction = Some(sys);
     }
 
     if let Some(prev) = previous_interaction_id {
-        req["previous_interaction_id"] = serde_json::json!(prev);
+        params.previous_interaction_id = Some(prev.to_string());
     }
 
-    req
+    params
+}
+
+/// Build a `CreateModelInteractionParams` for a single chunk in a split-send sequence.
+///
+/// Chunks are always sent non-streaming. They carry the model name, chunked input,
+/// and optionally a system instruction + previous interaction ID for session chaining.
+pub fn build_chunk_request(
+    model: &str,
+    input: Vec<Content>,
+    system_instruction: Option<String>,
+    previous_interaction_id: Option<String>,
+) -> CreateModelInteractionParams {
+    CreateModelInteractionParams {
+        model: model.to_string(),
+        input: InteractionsInput::ContentList(input),
+        stream: Some(false),
+        system_instruction,
+        previous_interaction_id,
+        ..Default::default()
+    }
 }
 
 /// Serialize content array and measure byte size.
@@ -163,6 +194,26 @@ pub fn extract_interaction_text(interaction: &Interaction) -> String {
         .join("")
 }
 
+/// Extract system prompt from an Anthropic ingress body.
+pub fn extract_anthropic_system(body: &serde_json::Value) -> Option<String> {
+    if let Some(sys) = body.get("system") {
+        if let Some(s) = sys.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(blocks) = sys.as_array() {
+            let text: String = blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<&str>>()
+                .join("\n");
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 /// Get interaction ID from response.
 pub fn extract_interaction_id(interaction: &Interaction) -> Option<String> {
     Some(interaction.id.clone())
@@ -190,8 +241,7 @@ fn extract_anthropic_content(msg: &serde_json::Value) -> Option<Content> {
 
     Some(Content::TextContent(TextContent {
         text,
-        annotations: None,
-        r#type: serde_json::Value::Null,
+        ..Default::default()
     }))
 }
 
@@ -218,35 +268,13 @@ fn extract_openai_content(msg: &serde_json::Value) -> Option<Content> {
 
     Some(Content::TextContent(TextContent {
         text,
-        annotations: None,
-        r#type: serde_json::Value::Null,
+        ..Default::default()
     }))
 }
 
-fn extract_anthropic_system(body: &serde_json::Value) -> Option<String> {
-    // Top-level system field (Anthropic format)
-    if let Some(sys) = body.get("system") {
-        if let Some(s) = sys.as_str() {
-            return Some(s.to_string());
-        }
-        if let Some(blocks) = sys.as_array() {
-            let text: String = blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<&str>>()
-                .join("\n");
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    None
-}
-
-fn extract_openai_system(body: &serde_json::Value) -> Option<String> {
-    body.get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|arr| arr.first())
+fn extract_openai_system(messages: &[serde_json::Value]) -> Option<String> {
+    messages
+        .first()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
         .and_then(|m| {
             m.get("content").and_then(|c| {
@@ -291,55 +319,86 @@ mod tests {
         }
     }
 
+    fn anthropic_msgs() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({"role": "user", "content": "Hello"})]
+    }
+
+    fn anthropic_system() -> Option<String> {
+        Some("You are helpful.".to_string())
+    }
+
     #[test]
     fn build_anthropic_request_basic() {
-        let body = serde_json::json!({
-            "model": "gemini-3.1-flash-lite",
-            "max_tokens": 100,
-            "messages": [
-                {"role": "user", "content": "Hello"}
-            ]
-        });
-        let req = build_interactions_request_anthropic(&body, 0, &test_route(), None);
-        assert_eq!(req["input"].as_array().unwrap().len(), 1);
-        assert_eq!(req["stream"], false);
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &test_route(),
+            None,
+            "gemini-3.1-flash-lite",
+            false,
+            None,
+            Some(100),
+            anthropic_system(),
+        );
+        match &req.input {
+            InteractionsInput::ContentList(list) => assert_eq!(list.len(), 1),
+            _ => panic!("expected ContentList"),
+        }
+        assert_eq!(req.stream, Some(false));
     }
 
     #[test]
     fn build_anthropic_with_previous_id() {
-        let body = serde_json::json!({
-            "model": "gemini-3.1-flash-lite",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-        let req = build_interactions_request_anthropic(&body, 0, &test_route(), Some("prev-123"));
-        assert_eq!(req["previous_interaction_id"].as_str().unwrap(), "prev-123");
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &test_route(),
+            Some("prev-123"),
+            "gemini-3.1-flash-lite",
+            false,
+            None,
+            Some(100),
+            None,
+        );
+        assert_eq!(req.previous_interaction_id.as_deref(), Some("prev-123"));
     }
 
     #[test]
     fn build_openai_request_basic() {
-        let body = serde_json::json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-        let req = build_interactions_request_openai(&body, 0, &test_route(), None);
-        assert_eq!(req["input"].as_array().unwrap().len(), 1);
+        let msgs = vec![serde_json::json!({"role": "user", "content": "Hello"})];
+        let req = build_interactions_request_openai(
+            &msgs,
+            0,
+            &test_route(),
+            None,
+            "gpt-4",
+            false,
+            None,
+            None,
+        );
+        match &req.input {
+            InteractionsInput::ContentList(list) => assert_eq!(list.len(), 1),
+            _ => panic!("expected ContentList"),
+        }
     }
 
     #[test]
     fn build_openai_with_system_message() {
-        let body = serde_json::json!({
-            "model": "gpt-4",
-            "messages": [
-                {"role": "system", "content": "You are helpful."},
-                {"role": "user", "content": "Hi"}
-            ]
-        });
-        let req = build_interactions_request_openai(&body, 0, &test_route(), None);
-        assert_eq!(
-            req["system_instruction"].as_str().unwrap(),
-            "You are helpful."
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "You are helpful."}),
+            serde_json::json!({"role": "user", "content": "Hi"}),
+        ];
+        let req = build_interactions_request_openai(
+            &msgs,
+            0,
+            &test_route(),
+            None,
+            "gpt-4",
+            false,
+            None,
+            None,
         );
+        assert_eq!(req.system_instruction.as_deref(), Some("You are helpful."));
     }
 
     #[test]
@@ -353,31 +412,12 @@ mod tests {
             steps: vec![Step::ModelOutputStep(ModelOutputStep {
                 content: Some(vec![Content::TextContent(TextContent {
                     text: "Hello!".into(),
-                    annotations: None,
-                    r#type: serde_json::Value::Null,
+                    ..Default::default()
                 })]),
-                r#type: serde_json::Value::Null,
+                ..Default::default()
             })],
             model: Some("gemini-3.1-flash-lite".into()),
-            agent: None,
-            agent_config: None,
-            cached_content: None,
-            environment: None,
-            environment_id: None,
-            generation_config: None,
-            input: None,
-            previous_interaction_id: None,
-            response_format: None,
-            response_mime_type: None,
-            response_modalities: None,
-            role: None,
-            safety_settings: None,
-            service_tier: None,
-            system_instruction: None,
-            tools: None,
-            usage: None,
-            webhook_config: None,
-            labels: None,
+            ..Default::default()
         };
         assert_eq!(extract_interaction_text(&interaction), "Hello!");
     }
@@ -391,8 +431,7 @@ mod tests {
     fn split_content_single_chunk() {
         let c = Content::TextContent(TextContent {
             text: "hello".into(),
-            annotations: None,
-            r#type: serde_json::Value::Null,
+            ..Default::default()
         });
         let chunks = split_content_for_limit(&[c], 1024 * 1024);
         assert_eq!(chunks.len(), 1);
@@ -402,21 +441,18 @@ mod tests {
     fn serialized_content_size_positive() {
         let c = Content::TextContent(TextContent {
             text: "hello".into(),
-            annotations: None,
-            r#type: serde_json::Value::Null,
+            ..Default::default()
         });
         assert!(serialized_content_size(&[c]) > 0);
     }
 
     #[test]
     fn extract_openai_system_handles_array_content() {
-        let body = serde_json::json!({
-            "messages": [
-                {"role": "system", "content": [{"type": "text", "text": "You are helpful."}]},
-                {"role": "user", "content": "Hi"}
-            ]
-        });
-        let sys = extract_openai_system(&body);
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": [{"type": "text", "text": "You are helpful."}]}),
+            serde_json::json!({"role": "user", "content": "Hi"}),
+        ];
+        let sys = extract_openai_system(&msgs);
         assert_eq!(sys, Some("You are helpful.".to_string()));
     }
 }

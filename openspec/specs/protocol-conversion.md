@@ -126,14 +126,17 @@ All other upstream response headers are filtered out. The OpenAI response relay 
 
 ## Requirement: Anthropic → Interactions Translation
 
-`InteractionsHandler` converts Anthropic `MessageCreateRequest` to `CreateModelInteractionParams`:
+`InteractionsHandler` converts Anthropic ingress to `CreateModelInteractionParams`:
 
-- `messages[]` → interactions `Content[]`
-- `system` → `system_instruction` field
+- Ingress body parsed at boundary — `model`, `stream`, `temperature`, `max_tokens` extracted as typed scalars
+- `messages[]` → interactions `Content[]` via typed extractors
+- `system` → `system_instruction` (extracted by `extract_anthropic_system`)
 - `max_tokens` → `generation_config.max_output_tokens`
 - `previous_interaction_id` set from session state (if exists)
+- All parameters passed as typed scalars to `build_interactions_request_anthropic`, which returns `CreateModelInteractionParams` directly
+- Split-path accesses struct fields (`params.input`, `params.system_instruction`, `params.previous_interaction_id`) — no `.get()` on `serde_json::Value`
 
-Only messages not yet delivered to the session are included (delta computation).
+Only messages not yet delivered to the session are included (delta computation). Control messages are stripped before construction.
 
 ### Scenario: First request in session
 - GIVEN no prior session state
@@ -160,9 +163,12 @@ Only messages not yet delivered to the session are included (delta computation).
 
 ## Requirement: OpenAI → Interactions Translation
 
-OpenAI `ChatCompletionRequest` → `CreateModelInteractionParams`:
-- `messages[]` → interactions `Content[]`
+OpenAI ingress → `CreateModelInteractionParams`:
+- Ingress body parsed at boundary — `model`, `stream`, `temperature`, `max_tokens` extracted as typed scalars
+- `messages[]` → interactions `Content[]` via typed extractors
+- System message (role=system) → `system_instruction`
 - `max_tokens` → `generation_config.max_output_tokens`
+- All parameters passed as typed scalars to `build_interactions_request_openai`, which returns `CreateModelInteractionParams` directly
 
 ## Requirement: Interactions → OpenAI Translation
 
@@ -199,3 +205,44 @@ Rust types for the interactions protocol are generated at build time from `schem
 - GIVEN `schemas/interactions.openapi.json` exists in the repo
 - WHEN `cargo build` runs
 - THEN build.rs generates types without network access
+
+## Requirement: Typed Construction Pipeline
+
+Interactions request construction uses typed structs throughout, never raw `serde_json::Value`:
+
+- `build_request_body()` takes typed scalars (`stream: bool`, `temperature: Option<f64>`, `ingress_max_tokens: Option<u32>`, `system_instruction: Option<String>`) and returns `CreateModelInteractionParams`
+- `build_interactions_request_anthropic`/`build_interactions_request_openai` accept `&[Value]` messages + typed scalars, not a raw body `Value`
+- `build_chunk_request()` helper constructs chunk requests with `model`, `input: Vec<Content>`, optional `system_instruction`/`previous_interaction_id`
+- Split-path reads struct fields (`params.input`, `params.system_instruction`, `params.previous_interaction_id`)
+- Serialization to HTTP body bytes happens at the call site via `serde_json::to_vec(&params)`
+
+### Scenario: Request body never converted to/from JSON
+- GIVEN parsed ingress values (`model`, `stream`, `temperature`, `messages`, `system`)
+- WHEN `build_interactions_request_anthropic` constructs the request
+- THEN all parameters are typed scalars or typed structs
+- AND the return value is `CreateModelInteractionParams` (not `serde_json::Value`)
+
+## Requirement: Parse at Ingress Boundary
+
+Raw `serde_json::Value` must not thread through functions when typed equivalents exist. Ingress JSON is parsed into typed structs at the protocol boundary. All downstream functions receive typed parameters.
+
+### Scenario: Control message cleaning on typed messages
+- GIVEN `messages: Vec<Value>` from parsed ingress body
+- WHEN `scan_control_messages` processes the messages
+- THEN cleaned messages are passed directly to build functions (no JSON body clone + mutation)
+
+## Requirement: Generated Struct Defaults
+
+Selected generated structs derive `Default` for ergonomic construction with `..Default::default()`:
+
+- `CreateModelInteractionParams` — ~20 optional fields default to `None`
+- `GenerationConfig` — all `Option<T>` fields default to `None`
+- `TextContent` — `annotations` defaults to `None`, `r#type` to `Value::Null` (skipped on serialize)
+- `Interaction`, `InteractionStatusUpdate`, `ModelOutputStep`
+
+`InteractionsInput` has a manual `impl Default` (returns `String("")` variant — only used as struct field default, never sent over the wire).
+
+### Scenario: Ergonomic struct construction
+- GIVEN `TextContent { text: "hello".into(), ..Default::default() }`
+- WHEN serialized as part of `Content::TextContent`
+- THEN output has `{"text":"hello","type":"text"}` — no `null` fields

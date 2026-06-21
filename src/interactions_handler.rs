@@ -22,7 +22,8 @@ use crate::diagnostics::{Diagnostics, StatsEvent};
 use crate::error::AppError;
 use crate::interactions as interactions_lib;
 use crate::interactions_types::{
-    ContentDelta, ContentDeltaData, Interaction, InteractionCompletedEvent, InteractionCreatedEvent,
+    ContentDelta, ContentDeltaData, CreateModelInteractionParams, Interaction,
+    InteractionCompletedEvent, InteractionCreatedEvent, InteractionsInput,
 };
 use crate::session::SessionStore;
 use crate::sse;
@@ -174,53 +175,57 @@ impl InteractionsHandler {
         let (start_index, new_count) = crate::session::compute_delta(delivered, incoming_count);
 
         // Use cleaned messages (control messages removed) for the upstream request
-        let request_body_val = if control_result.stripped_count > 0 {
-            let mut cleaned = body_val.clone();
-            cleaned["messages"] = serde_json::json!(control_result.cleaned_messages);
-            cleaned
+        let cleaned_messages = if control_result.stripped_count > 0 {
+            control_result.cleaned_messages
         } else {
-            body_val.clone()
+            messages
         };
 
-        // Build the request
-        let req_body_lib = interactions_lib::build_interactions_request_anthropic(
-            &request_body_val,
-            start_index,
-            route,
-            if session.interaction_id.is_empty() {
-                None
-            } else {
-                Some(&session.interaction_id)
-            },
-        );
-
+        // Extract typed scalars from ingress body
         let stream = body_val
             .get("stream")
             .and_then(|s| s.as_bool())
             .unwrap_or(false);
+        let temperature = body_val.get("temperature").and_then(|v| v.as_f64());
+        let ingress_max_tokens = body_val
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        let system = interactions_lib::extract_anthropic_system(&body_val);
+
+        let prev_id = if session.interaction_id.is_empty() {
+            None
+        } else {
+            Some(session.interaction_id.as_str())
+        };
+
+        // Build the request
+        let params = interactions_lib::build_interactions_request_anthropic(
+            &cleaned_messages,
+            start_index,
+            route,
+            prev_id,
+            &model,
+            stream,
+            temperature,
+            ingress_max_tokens,
+            system,
+        );
 
         // Send to upstream
         let backend_url = endpoint.to_string();
         let request_body =
-            serde_json::to_vec(&req_body_lib).map_err(|e| AppError::Internal(e.to_string()))?;
+            serde_json::to_vec(&params).map_err(|e| AppError::Internal(e.to_string()))?;
 
         // Apply proxy_limit splitting if needed
         if let Some(limit) = route.proxy_limit {
-            let contents = req_body_lib
-                .get("input")
-                .and_then(|i| i.as_array())
-                .cloned()
-                .unwrap_or_default();
+            let contents = match &params.input {
+                InteractionsInput::ContentList(list) => list.clone(),
+                _ => vec![],
+            };
             let size = serde_json::to_vec(&contents).map(|v| v.len()).unwrap_or(0);
             if size > limit {
-                // Check for unsplittable element
-                if interactions_lib::single_element_too_large(
-                    &contents
-                        .iter()
-                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                        .collect::<Vec<crate::interactions_types::Content>>(),
-                    limit,
-                ) {
+                if interactions_lib::single_element_too_large(&contents, limit) {
                     return Err(AppError::BadRequest(
                         "Unable to split ingress message into chunks under proxy limit."
                             .to_string(),
@@ -228,7 +233,7 @@ impl InteractionsHandler {
                 }
                 return self
                     .handle_split_send(
-                        &req_body_lib,
+                        &params,
                         &contents,
                         limit,
                         &backend_url,
@@ -366,49 +371,52 @@ impl InteractionsHandler {
         let (start_index, new_count) = crate::session::compute_delta(delivered, incoming_count);
 
         // Use cleaned messages (control messages removed) for the upstream request
-        let request_body_val = if control_result.stripped_count > 0 {
-            let mut cleaned = body_val.clone();
-            cleaned["messages"] = serde_json::json!(control_result.cleaned_messages);
-            cleaned
+        let cleaned_messages = if control_result.stripped_count > 0 {
+            control_result.cleaned_messages
         } else {
-            body_val.clone()
+            messages
         };
 
-        let req_body_lib = interactions_lib::build_interactions_request_openai(
-            &request_body_val,
-            start_index,
-            route,
-            if session.interaction_id.is_empty() {
-                None
-            } else {
-                Some(&session.interaction_id)
-            },
-        );
-
+        // Extract typed scalars from ingress body
         let stream = body_val
             .get("stream")
             .and_then(|s| s.as_bool())
             .unwrap_or(false);
+        let temperature = body_val.get("temperature").and_then(|v| v.as_f64());
+        let ingress_max_tokens = body_val
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+
+        let prev_id = if session.interaction_id.is_empty() {
+            None
+        } else {
+            Some(session.interaction_id.as_str())
+        };
+
+        let params = interactions_lib::build_interactions_request_openai(
+            &cleaned_messages,
+            start_index,
+            route,
+            prev_id,
+            &model,
+            stream,
+            temperature,
+            ingress_max_tokens,
+        );
 
         let backend_url = endpoint.to_string();
         let request_body =
-            serde_json::to_vec(&req_body_lib).map_err(|e| AppError::Internal(e.to_string()))?;
+            serde_json::to_vec(&params).map_err(|e| AppError::Internal(e.to_string()))?;
 
         if let Some(limit) = route.proxy_limit {
-            let contents = req_body_lib
-                .get("input")
-                .and_then(|i| i.as_array())
-                .cloned()
-                .unwrap_or_default();
+            let contents = match &params.input {
+                InteractionsInput::ContentList(list) => list.clone(),
+                _ => vec![],
+            };
             let size = serde_json::to_vec(&contents).map(|v| v.len()).unwrap_or(0);
             if size > limit {
-                if interactions_lib::single_element_too_large(
-                    &contents
-                        .iter()
-                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                        .collect::<Vec<crate::interactions_types::Content>>(),
-                    limit,
-                ) {
+                if interactions_lib::single_element_too_large(&contents, limit) {
                     return Err(AppError::BadRequest(
                         "Unable to split ingress message into chunks under proxy limit."
                             .to_string(),
@@ -416,7 +424,7 @@ impl InteractionsHandler {
                 }
                 return self
                     .handle_split_send(
-                        &req_body_lib,
+                        &params,
                         &contents,
                         limit,
                         &backend_url,
@@ -796,8 +804,8 @@ impl InteractionsHandler {
     /// Handle split sending: break content into chunks under proxy_limit.
     async fn handle_split_send(
         &self,
-        req_body: &serde_json::Value,
-        contents: &[serde_json::Value],
+        params: &CreateModelInteractionParams,
+        contents: &[crate::interactions_types::Content],
         limit: usize,
         url: &str,
         route: &RouteTarget,
@@ -811,27 +819,22 @@ impl InteractionsHandler {
         request_headers: &HeaderMap,
         ingress: Protocol,
     ) -> Result<Response, AppError> {
-        let content_types: Vec<crate::interactions_types::Content> = contents
-            .iter()
-            .filter_map(|v| serde_json::from_value(v.clone()).ok())
-            .collect();
-        let chunks = interactions_lib::split_content_for_limit(&content_types, limit);
+        let chunks = interactions_lib::split_content_for_limit(contents, limit);
         let mut last_id: Option<String> = None;
         let mut last_interaction: Option<Interaction> = None;
 
         // Check if there's a system_instruction that needs splitting
-        let system_instruction = req_body
-            .get("system_instruction")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let system_instruction = params.system_instruction.clone();
 
         // If system_instruction + empty content exceeds limit, split system_instruction first
         if let Some(ref sys) = system_instruction {
-            let empty_body = serde_json::json!({
-                "input": [],
-                "stream": false,
-                "system_instruction": sys
-            });
+            let empty_body = CreateModelInteractionParams {
+                model: model.to_string(),
+                input: InteractionsInput::ContentList(vec![]),
+                stream: Some(false),
+                system_instruction: Some(sys.clone()),
+                ..Default::default()
+            };
             let empty_size = serde_json::to_vec(&empty_body)
                 .map(|v| v.len())
                 .unwrap_or(0);
@@ -858,22 +861,15 @@ impl InteractionsHandler {
         }
 
         // Send each chunk sequentially
-        let mut current_prev = req_body
-            .get("previous_interaction_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let mut current_prev = params.previous_interaction_id.clone();
 
         for chunk in &chunks {
-            let mut chunk_req = serde_json::json!({
-                "input": chunk,
-                "stream": false,
-            });
-            if let Some(ref prev) = current_prev {
-                chunk_req["previous_interaction_id"] = serde_json::json!(prev);
-            }
-            if let Some(ref sys) = system_instruction {
-                chunk_req["system_instruction"] = serde_json::json!(sys);
-            }
+            let chunk_req = interactions_lib::build_chunk_request(
+                model,
+                chunk.clone(),
+                system_instruction.clone(),
+                current_prev.clone(),
+            );
             let chunk_body =
                 serde_json::to_vec(&chunk_req).map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -994,7 +990,7 @@ impl InteractionsHandler {
         chunks: &[Vec<crate::interactions_types::Content>],
         total_message_count: usize,
         limit: usize,
-        _model: &str,
+        model: &str,
         _upstream_label: &str,
         _request_size: usize,
         _direction: &str,
@@ -1010,19 +1006,17 @@ impl InteractionsHandler {
         // Send empty interactions with system_instruction chunks
         for (i, part) in sys_parts.iter().enumerate() {
             let is_last_sys = i == sys_parts.len() - 1;
-            let input_for_chunk: serde_json::Value = if is_last_sys && !chunks.is_empty() {
-                serde_json::to_value(&chunks[0]).unwrap_or(serde_json::json!([]))
+            let input_for_chunk = if is_last_sys && !chunks.is_empty() {
+                chunks[0].clone()
             } else {
-                serde_json::json!([])
+                vec![]
             };
-            let mut chunk_req = serde_json::json!({
-                "input": input_for_chunk,
-                "stream": false,
-                "system_instruction": part,
-            });
-            if let Some(ref prev) = current_prev {
-                chunk_req["previous_interaction_id"] = serde_json::json!(prev);
-            }
+            let chunk_req = interactions_lib::build_chunk_request(
+                model,
+                input_for_chunk,
+                Some(part.clone()),
+                current_prev.clone(),
+            );
             let chunk_body =
                 serde_json::to_vec(&chunk_req).map_err(|e| AppError::Internal(e.to_string()))?;
             let builder = build_interactions_headers(
@@ -1055,13 +1049,12 @@ impl InteractionsHandler {
         // Send remaining chunks if more than one
         if chunks.len() > 1 {
             for chunk in chunks.iter().skip(1) {
-                let mut chunk_req = serde_json::json!({
-                    "input": chunk,
-                    "stream": false,
-                });
-                if let Some(ref prev) = current_prev {
-                    chunk_req["previous_interaction_id"] = serde_json::json!(prev);
-                }
+                let chunk_req = interactions_lib::build_chunk_request(
+                    model,
+                    chunk.clone(),
+                    None,
+                    current_prev.clone(),
+                );
                 let chunk_body = serde_json::to_vec(&chunk_req)
                     .map_err(|e| AppError::Internal(e.to_string()))?;
                 let builder = build_interactions_headers(
@@ -1122,7 +1115,7 @@ impl InteractionsHandler {
                 let typed = ChatCompletionResponse {
                     id: last_id.unwrap_or_default(),
                     object: "chat.completion".to_string(),
-                    model: _model.to_string(),
+                    model: model.to_string(),
                     choices: vec![Choice {
                         index: 0,
                         message: ChatMessage {
@@ -1155,7 +1148,7 @@ impl InteractionsHandler {
                     id: last_id.unwrap_or_default(),
                     response_type: "message".to_string(),
                     role: Role::Assistant,
-                    model: _model.to_string(),
+                    model: model.to_string(),
                     content: vec![ContentBlock::Text { text: text.clone() }],
                     stop_reason: Some(StopReason::EndTurn),
                     stop_sequence: None,
@@ -1683,8 +1676,7 @@ If you don't know the answer, say so honestly.";
             let padding = "x".repeat(size.saturating_sub(text.len()));
             Content::TextContent(TextContent {
                 text: format!("{}{}", text, padding),
-                annotations: None,
-                r#type: serde_json::Value::Null,
+                ..Default::default()
             })
         };
         // Each content serializes to roughly 100 bytes
@@ -1708,8 +1700,7 @@ If you don't know the answer, say so honestly.";
         let make = |i: usize| {
             Content::TextContent(TextContent {
                 text: format!("message_{}", i),
-                annotations: None,
-                r#type: serde_json::Value::Null,
+                ..Default::default()
             })
         };
         let contents: Vec<Content> = (0..5).map(make).collect();
@@ -1734,8 +1725,7 @@ If you don't know the answer, say so honestly.";
     fn single_element_under_limit() {
         let c = Content::TextContent(TextContent {
             text: "hello".into(),
-            annotations: None,
-            r#type: serde_json::Value::Null,
+            ..Default::default()
         });
         let size = serde_json::to_vec(&c).unwrap().len();
         assert!(!single_element_too_large(&[c], size + 100));
@@ -1745,8 +1735,7 @@ If you don't know the answer, say so honestly.";
     fn single_element_above_limit() {
         let c = Content::TextContent(TextContent {
             text: "hello".into(),
-            annotations: None,
-            r#type: serde_json::Value::Null,
+            ..Default::default()
         });
         let size = serde_json::to_vec(&c).unwrap().len();
         assert!(single_element_too_large(&[c], size.saturating_sub(1)));

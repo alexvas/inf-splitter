@@ -86,7 +86,8 @@ Both streaming and non-streaming paths are handled. `stream_options` is always d
 
 ## Scope constraints
 
-- Serialization and deserialization must use strict type-checked structs from the protocol schemas whenever possible — never raw `json!()` or string snippets when a typed constructor or serde struct exists
+- Serialization and deserialization must use strict type-checked structs from the protocol schemas whenever possible — never raw `json!()` or string snippets when a typed constructor or serde struct exists. The generated types in `crate::interactions_types` (from `schemas/interactions.openapi.json` via `build.rs`) include `CreateModelInteractionParams`, `InteractionsInput`, `GenerationConfig`, and all response/event types. Use `..Default::default()` for ergonomic construction of structs with many optional fields. Manual `impl Default` is added in `src/interactions_types.rs` for key types; add new ones there as needed.
+- Parse ingress JSON into typed structs at the protocol boundary. Pass typed values down the call stack. Avoid threading raw `serde_json::Value` through functions when typed equivalents exist. For the interactions pipeline, `build_interactions_request_anthropic`/`build_interactions_request_openai` accept typed scalars and `&[Value]` messages (not a raw body Value), and return `CreateModelInteractionParams` (not a generic Value). Split-path logic accesses struct fields directly, not `.get("key")`.
 - Ingress is **no-auth** by design; do not add authentication without explicit product decision
 - Default listen address is `127.0.0.1:{port}` from TOML (no `LISTEN_ADDR` env var)
 - Limits use suffix notation: `s`/`m` for durations, `k`/`m` for byte sizes

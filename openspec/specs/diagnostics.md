@@ -204,7 +204,8 @@ This includes all code paths:
 
 A `RequestDiagnostics` session object binds stats and dump recording into a single guard, enforcing the stats-dump parity invariant structurally. Created at request start with `RequestDiagnostics::new(diagnostics, section, model)`. All methods take `&self`; the guard uses `Mutex` for interior mutability and is `Send + Sync`.
 
-The guard struct:
+The guard struct (`StoredDump` is `(DumpBody, Vec<(String, String)>, String, Option<u16>)` — body, headers, capture timestamp, response status):
+
 ```rust
 pub struct RequestDiagnostics {
     diagnostics: Diagnostics,
@@ -230,12 +231,12 @@ pub struct RequestDiagnostics {
 - `section()` — returns `&str`
 - `diagnostics_handle()` — returns `Diagnostics` clone
 - `set_input_messages(n)`, `set_max_tokens(n)`, `set_messages_detail_ingress(v)`, `set_messages_detail_egress(v)` — optional stats detail setters
-- `ingress_dump(body, headers)` — stores ingress dump for deferred recording
-- `egress_dump(body, headers)` — stores egress dump for deferred recording
+- `ingress_dump(body, headers)` — stores ingress dump with capture-time timestamp for deferred recording
+- `egress_dump(body, headers)` — stores egress dump with capture-time timestamp for deferred recording
 - `response_dump(body, status, is_error, headers)` — records non-streaming response dump with headers
 - `response_dump_streaming(body, status)` — records streaming response dump
-- `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, flushes deferred dumps with `is_error: false`, idempotent
-- `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, streaming, error)` — records error stats, flushes deferred dumps with `is_error: true`, idempotent
+- `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, flushes deferred dumps with `is_error: false` and `status` applied to request dumps, idempotent
+- `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, streaming, error)` — records error stats, flushes deferred dumps with `is_error: true` and `status` applied to request dumps, idempotent
 
 **Drop safety net:** If dropped without `finish()`/`finish_with_error()`, logs `tracing::error!` and records a stats event with `error: "diagnostics guard dropped without finish"`.
 
@@ -300,6 +301,22 @@ pub struct RequestDiagnostics {
 - GIVEN `finish()` was already called
 - WHEN `finish()` or `finish_with_error()` is called again
 - THEN the call is a no-op (returns immediately)
+
+### Scenario: Per-dump capture-time timestamps
+- GIVEN a split-send with 2 chunks sent seconds apart
+- WHEN `guard.finish()` flushes deferred dumps
+- THEN each egress dump has the timestamp from when it was captured by `egress_dump()`
+- AND the timestamps differ from the stats event timestamp
+
+### Scenario: Passthrough request dumps carry response status
+- GIVEN an anthropic→anthropic passthrough success request
+- WHEN the request completes with status 200
+- THEN ingress and egress request dumps have `status: 200`
+
+### Scenario: Missing detail fields omitted from stats
+- GIVEN a passthrough request body with no `messages` field
+- WHEN stats are recorded
+- THEN `messages_detail_ingress` is absent from the JSON output (not `null`)
 
 ## Requirement: Router-Level Client Error Visibility
 

@@ -96,8 +96,9 @@ impl OpenAiHandler {
         guard.ingress_dump(&original_body, request_headers);
 
         if self.diagnostics.stats_enabled() {
-            let detail = crate::diagnostics::messages_detail_from_value(&value);
-            guard.set_messages_detail_ingress(detail.unwrap_or(serde_json::Value::Null));
+            if let Some(detail) = crate::diagnostics::messages_detail_from_value(&value) {
+                guard.set_messages_detail_ingress(detail);
+            }
         }
         crate::apply_egress_transforms(&mut value, &model, route);
         if self.diagnostics.stats_enabled() {

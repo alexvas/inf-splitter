@@ -64,8 +64,9 @@ impl AnthropicHandler {
         guard.ingress_dump(&original_body, request_headers);
 
         if self.diagnostics.stats_enabled() {
-            let detail = crate::diagnostics::messages_detail_from_value(&value);
-            guard.set_messages_detail_ingress(detail.unwrap_or(serde_json::Value::Null));
+            if let Some(detail) = crate::diagnostics::messages_detail_from_value(&value) {
+                guard.set_messages_detail_ingress(detail);
+            }
         }
         crate::apply_egress_transforms(&mut value, &model, route);
         if self.diagnostics.stats_enabled() {
@@ -75,9 +76,10 @@ impl AnthropicHandler {
         }
         let body =
             Bytes::from(serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?);
-        let egress_body = body.clone();
+        if self.diagnostics.dump_enabled() {
+            guard.egress_dump(&body, request_headers);
+        }
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
-        guard.egress_dump(&egress_body, request_headers);
         let start = std::time::Instant::now();
         let upstream = builder.body(body).send().await?;
         let duration_ms = start.elapsed().as_millis() as u64;

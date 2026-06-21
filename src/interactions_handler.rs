@@ -527,7 +527,6 @@ impl InteractionsHandler {
             return self
                 .handle_stream_response(
                     upstream,
-                    route,
                     session_id,
                     new_count,
                     model,
@@ -641,7 +640,6 @@ impl InteractionsHandler {
     async fn handle_stream_response(
         &self,
         upstream: reqwest::Response,
-        _route: &RouteTarget,
         session_id: &str,
         new_count: usize,
         model: &str,

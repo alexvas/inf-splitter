@@ -306,7 +306,7 @@ pub async fn spawn_sse_upstream_with_headers(
     bind_and_serve(app).await.0
 }
 
-async fn bind_and_serve(app: Router) -> (SocketAddr, JoinHandle<()>) {
+pub(crate) async fn bind_and_serve(app: Router) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind upstream");

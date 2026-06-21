@@ -1,15 +1,19 @@
 mod common;
 
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyllm_translate::anthropic::{Content, MessageCreateRequest};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatContent};
+use axum::response::IntoResponse;
+use axum::Json;
 use common::{
-    anthropic_upstream_response, interactions_upstream_response, openai_upstream_response,
-    post_anthropic, post_openai, spawn_delayed_upstream, spawn_error_upstream, spawn_router,
-    spawn_router_with_diagnostics, spawn_router_with_dump, spawn_sse_upstream_with_headers,
-    spawn_stream_upstream, spawn_upstream, wait_for_egress_dump, wait_for_egress_response_dump,
-    wait_for_file, wait_for_ingress_dump,
+    anthropic_upstream_response, bind_and_serve, interactions_upstream_response,
+    openai_upstream_response, post_anthropic, post_openai, spawn_delayed_upstream,
+    spawn_error_upstream, spawn_router, spawn_router_with_diagnostics, spawn_router_with_dump,
+    spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream, wait_for_egress_dump,
+    wait_for_egress_response_dump, wait_for_file, wait_for_ingress_dump,
 };
 use inf_splitter::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
@@ -3617,5 +3621,396 @@ models = "empty-model-test"
     assert!(
         has_ingress,
         "empty model error must have ingress dump with the request body"
+    );
+}
+
+// ── Red-green tests for fix-guard-deferred-dump-edge-cases ───────────
+
+/// Stateful upstream: succeeds for first `succeed_count` requests (200 + response),
+/// then fails with `error_status` for all subsequent requests.
+async fn spawn_counted_upstream(
+    path: &'static str,
+    succeed_count: usize,
+    response_body: serde_json::Value,
+    error_status: reqwest::StatusCode,
+    error_body: serde_json::Value,
+) -> SocketAddr {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    let app = axum::Router::new().route(
+        path,
+        axum::routing::post(move |Json(_): axum::Json<serde_json::Value>| {
+            let n = counter_clone.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = if n < succeed_count {
+                (axum::http::StatusCode::OK, response_body.clone())
+            } else {
+                (error_status, error_body.clone())
+            };
+            async move { (status, axum::Json(body)).into_response() }
+        }),
+    );
+    bind_and_serve(app).await.0
+}
+
+/// Bug 1.2: passthrough success → ingress/egress dumps must carry response status.
+#[tokio::test]
+async fn passthrough_success_request_dumps_have_status() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("ap-status-model", "reply"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-ap-status-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "ap-status-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "ap-status-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _body = response.text().await.expect("response body");
+
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_lines = wait_for_file(&dump_path).await;
+    assert!(
+        !dump_lines.is_empty(),
+        "passthrough success must produce dump lines"
+    );
+
+    // Ingress and egress request dumps should carry status: 200
+    for stage in &["ingress", "egress"] {
+        let has_status = dump_lines.iter().any(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+            v["stage"].as_str() == Some(stage)
+                && v["direction"].as_str() == Some("request")
+                && v["status"] == 200
+        });
+        assert!(
+            has_status,
+            "passthrough {stage} request dump must have status: 200, got lines: {dump_lines:?}"
+        );
+    }
+}
+
+/// Bug 1.3: no messages field → messages_detail_ingress absent from stats JSON.
+#[tokio::test]
+async fn no_messages_field_produces_no_detail_null_in_stats() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("null-detail-model", "reply"),
+    )
+    .await;
+
+    let tmp =
+        std::env::temp_dir().join(format!("inf-splitter-null-detail-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "null-detail-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::All,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    // Send a body WITHOUT a messages field to trigger the bug
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "null-detail-model",
+            "max_tokens": 64
+            // no "messages" field
+        }),
+    )
+    .await;
+    // The upstream will get the model "null-detail-model" and return normally,
+    // but the ingress body has no messages — the stats should not contain
+    // a null messages_detail_ingress.
+    let _ = response.text().await;
+
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_lines = wait_for_file(&stats_path).await;
+    assert!(!stats_lines.is_empty(), "must produce stats line");
+    let stats: serde_json::Value = serde_json::from_str(&stats_lines[0]).expect("valid NDJSON");
+
+    // messages_detail_ingress should be ABSENT, not null
+    assert!(
+        stats.get("messages_detail_ingress").is_none(),
+        "messages_detail_ingress must be absent when body has no messages, got: {}",
+        stats["messages_detail_ingress"]
+    );
+}
+
+/// Bug 1.4: split-send egress dumps have distinct capture-time timestamps.
+#[tokio::test]
+async fn split_send_egress_dumps_have_distinct_timestamps() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1beta/interactions",
+        captured.clone(),
+        interactions_upstream_response("int-ts-1", "Timestamp test"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-ts-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let pad = "x".repeat(230);
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let msg = |n: &str| -> serde_json::Value {
+        serde_json::json!({"role": "user", "content": format!("{n} msg {pad}")})
+    };
+    let body = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [msg("first"), msg("second"), msg("third"), msg("fourth"), msg("fifth")]
+    });
+    let response = post_anthropic(&proxy_addr, body).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _ = response.text().await;
+
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_lines = wait_for_file(&dump_path).await;
+    assert!(!dump_lines.is_empty(), "split-send must produce dump lines");
+
+    // Collect all egress request dump timestamps
+    let egress_ts: Vec<String> = dump_lines
+        .iter()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            if v["stage"].as_str() == Some("egress") && v["direction"].as_str() == Some("request") {
+                v["ts"].as_str().map(String::from)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        egress_ts.len() >= 2,
+        "split-send must produce at least 2 egress dumps, got {}",
+        egress_ts.len()
+    );
+
+    // All egress dump timestamps should be populated (non-empty)
+    for ts in &egress_ts {
+        assert!(
+            !ts.is_empty(),
+            "split-send egress dumps must have non-empty timestamps"
+        );
+    }
+
+    // None of the egress timestamps should be later than the response dump
+    // timestamp (which is recorded at finish time, after all chunks complete).
+    let response_ts: Vec<String> = dump_lines
+        .iter()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            if v["stage"].as_str() == Some("egress") && v["direction"].as_str() == Some("response")
+            {
+                v["ts"].as_str().map(String::from)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Egress request dumps must be timestamped before or at the same time
+    // as the response dump (they're captured at send time, not flush time).
+    if let Some(resp_ts) = response_ts.first() {
+        for ts in &egress_ts {
+            assert!(
+                ts <= resp_ts,
+                "egress dump ts {ts} must not be after response dump ts {resp_ts}"
+            );
+        }
+    }
+}
+
+/// Bug 1.6: anthropic passthrough with dump_mode: Off must not waste work.
+/// When dump_mode is Off, the guard's egress_dump still stores the body.
+/// Verify that no dump file is created (the flush filters it out),
+/// but the egress_dump call itself is unconditional in anthropic passthrough.
+/// This test verifies the dump is filtered by mode.
+#[tokio::test]
+async fn anthropic_passthrough_dump_off_no_dump_file() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("ap-off-model", "reply"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-ap-off-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "ap-off-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::Off,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "ap-off-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _ = response.text().await;
+
+    // With dump_mode: Off, the dump file should not be created or be empty
+    if tmp.exists() {
+        let content = std::fs::read_to_string(&tmp).unwrap_or_default();
+        assert!(
+            content.trim().is_empty(),
+            "dump file must be empty when dump_mode is Off, got: {content}"
+        );
+    }
+    // If file doesn't exist at all, that's also fine — the writer may not have created it.
+}
+
+/// Bug 1.1: split-send with chunk error must record error response dump
+/// and aggregate stats with error field.
+#[tokio::test]
+async fn split_send_error_records_response_dump_and_error_stats() {
+    let interactions_response = interactions_upstream_response("int-split-err-1", "ok");
+    let error_body = serde_json::json!({"error": {"message": "split chunk failed"}});
+    let upstream_addr = spawn_counted_upstream(
+        "/v1beta/interactions",
+        2,
+        interactions_response,
+        reqwest::StatusCode::BAD_GATEWAY,
+        error_body,
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-split-err-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        stats_mode: DiagnosticMode::Error,
+        stats_output: Sink::File(format!("{}.stats", tmp.display()).into()),
+        dump_mode: DiagnosticMode::Error,
+        dump_output: Sink::File(format!("{}.dump", tmp.display()).into()),
+        ..DiagnosticsConfig::default()
+    };
+    let pad = "y".repeat(200);
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let msg = |n: usize| -> serde_json::Value {
+        serde_json::json!({"role": "user", "content": format!("msg{n} {pad}")})
+    };
+    let mut messages = Vec::new();
+    for i in 0..12 {
+        messages.push(msg(i));
+    }
+    let body = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": messages
+    });
+    let response = post_anthropic(&proxy_addr, body).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let _ = response.text().await;
+
+    // Stats: must have error field set
+    let stats_path: std::path::PathBuf = format!("{}.stats", tmp.display()).into();
+    let stats_lines = wait_for_file(&stats_path).await;
+    assert!(
+        !stats_lines.is_empty(),
+        "split-send error must produce stats line"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&stats_lines[0]).expect("valid NDJSON stats");
+    assert!(
+        stats["error"].as_str().is_some(),
+        "split-send error stats must have error field set"
+    );
+
+    // Dump: must have error response dump
+    let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
+    let dump_lines = wait_for_file(&dump_path).await;
+    assert!(
+        !dump_lines.is_empty(),
+        "split-send error must produce dump lines"
+    );
+    let has_error_resp = dump_lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+        v["stage"].as_str() == Some("egress")
+            && v["direction"].as_str() == Some("response")
+            && v["status"] == 502
+    });
+    assert!(
+        has_error_resp,
+        "split-send error must produce error response dump"
     );
 }

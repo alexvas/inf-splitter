@@ -546,8 +546,8 @@ impl Diagnostics {
 /// `error: "diagnostics guard dropped without finish"`.
 ///
 /// Uses `Mutex` for interior mutability so all methods take `&self`
-/// Stored dump: body + header pairs.
-type StoredDump = (DumpBody, Vec<(String, String)>);
+/// Stored dump: body, header pairs, capture-time timestamp, optional response status.
+type StoredDump = (DumpBody, Vec<(String, String)>, String, Option<u16>);
 
 /// and the guard is `Send + Sync` (can cross `tokio::spawn` boundaries,
 /// and `&guard` is `Send`).
@@ -627,12 +627,6 @@ impl RequestDiagnostics {
         *self.messages_detail_egress.lock().unwrap() = Some(v);
     }
 
-    /// Deprecated: prefer moving the `Send` guard into the streaming task directly.
-    pub fn disarm(self) -> String {
-        *self.finished.lock().unwrap() = true;
-        self.request_id.clone()
-    }
-
     /// Record an ingress request dump and track request size.
     /// The dump is deferred — recorded in `finish`/`finish_with_error` with
     /// the correct `is_error` flag.
@@ -653,7 +647,8 @@ impl RequestDiagnostics {
                     .map(|val| (k.as_str().to_string(), val.to_string()))
             })
             .collect();
-        *self.ingress_dump_pending.lock().unwrap() = Some((dump_body, header_pairs));
+        *self.ingress_dump_pending.lock().unwrap() =
+            Some((dump_body, header_pairs, ts_string(), None));
     }
 
     /// Record an egress request dump.
@@ -675,10 +670,12 @@ impl RequestDiagnostics {
                     .map(|val| (k.as_str().to_string(), val.to_string()))
             })
             .collect();
-        self.egress_dumps_pending
-            .lock()
-            .unwrap()
-            .push((dump_body, header_pairs));
+        self.egress_dumps_pending.lock().unwrap().push((
+            dump_body,
+            header_pairs,
+            ts_string(),
+            None,
+        ));
     }
 
     /// Record a response dump (non-streaming).
@@ -733,7 +730,7 @@ impl RequestDiagnostics {
             }
             *finished = true;
         }
-        self.flush_deferred_dumps(false);
+        self.flush_deferred_dumps(false, Some(status));
         self.diagnostics.record_stats(&StatsEvent {
             section: self.section.clone(),
             request_id: self.request_id.clone(),
@@ -775,7 +772,7 @@ impl RequestDiagnostics {
             }
             *finished = true;
         }
-        self.flush_deferred_dumps(true);
+        self.flush_deferred_dumps(true, Some(status));
         self.diagnostics.record_stats(&StatsEvent {
             section: self.section.clone(),
             request_id: self.request_id.clone(),
@@ -796,37 +793,40 @@ impl RequestDiagnostics {
         });
     }
 
-    /// Flush pending ingress and egress dumps with the given `is_error` flag.
-    fn flush_deferred_dumps(&self, is_error: bool) {
-        if let Some((body, headers)) = self.ingress_dump_pending.lock().unwrap().take() {
+    /// Flush pending ingress and egress dumps with the given `is_error` flag
+    /// and overall response `status` applied to request dumps.
+    fn flush_deferred_dumps(&self, is_error: bool, status: Option<u16>) {
+        if let Some((body, headers, ts, _stored_status)) =
+            self.ingress_dump_pending.lock().unwrap().take()
+        {
             self.diagnostics.record_dump(
                 &DumpEvent {
                     section: self.section.clone(),
                     request_id: self.request_id.clone(),
-                    ts: ts_string(),
+                    ts,
                     stage: "ingress".into(),
                     direction: "request".into(),
                     model: self.model.clone(),
                     headers,
                     body,
-                    status: None,
+                    status,
                 },
                 is_error,
             );
         }
         let egresses: Vec<_> = std::mem::take(&mut *self.egress_dumps_pending.lock().unwrap());
-        for (body, headers) in egresses {
+        for (body, headers, ts, _stored_status) in egresses {
             self.diagnostics.record_dump(
                 &DumpEvent {
                     section: self.section.clone(),
                     request_id: self.request_id.clone(),
-                    ts: ts_string(),
+                    ts,
                     stage: "egress".into(),
                     direction: "request".into(),
                     model: self.model.clone(),
                     headers,
                     body,
-                    status: None,
+                    status,
                 },
                 is_error,
             );
@@ -842,7 +842,7 @@ impl Drop for RequestDiagnostics {
                 request_id = %self.request_id, section = %self.section,
                 model = %self.model, "diagnostics guard dropped without finish"
             );
-            self.flush_deferred_dumps(true);
+            self.flush_deferred_dumps(true, None);
             self.diagnostics.record_stats(&StatsEvent {
                 section: self.section.clone(),
                 request_id: self.request_id.clone(),

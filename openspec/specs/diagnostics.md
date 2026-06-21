@@ -200,24 +200,51 @@ This includes all code paths:
 - WHEN constructing the route
 - THEN `RouteTarget { section: "test".into(), ..Default::default() }` sets only the needed fields
 
-## Requirement: RequestDiagnostics Session Guard
+## Requirement: RequestDiagnostics Session Guard (v2)
 
-A `RequestDiagnostics` session object binds stats and dump recording into a single guard, enforcing the stats-dump parity invariant structurally. Created at request start with `RequestDiagnostics::new(diagnostics, section, model)`.
+A `RequestDiagnostics` session object binds stats and dump recording into a single guard, enforcing the stats-dump parity invariant structurally. Created at request start with `RequestDiagnostics::new(diagnostics, section, model)`. All methods take `&self`; the guard uses `Mutex` for interior mutability and is `Send + Sync`.
+
+The guard struct:
+```rust
+pub struct RequestDiagnostics {
+    diagnostics: Diagnostics,
+    request_id: String,
+    section: String,
+    model: String,
+    start: Instant,
+    finished: Mutex<bool>,
+    ingress_size: Mutex<usize>,
+    input_messages: Mutex<Option<usize>>,
+    max_tokens: Mutex<Option<u32>>,
+    messages_detail_ingress: Mutex<Option<serde_json::Value>>,
+    messages_detail_egress: Mutex<Option<serde_json::Value>>,
+    ingress_dump_pending: Mutex<Option<StoredDump>>,
+    egress_dumps_pending: Mutex<Vec<StoredDump>>,
+}
+```
 
 **Methods:**
-- `ingress_dump(body, headers)` — records ingress request dump, tracks `ingress_size`
-- `egress_dump(body, headers)` — records egress request dump
-- `response_dump(body, status, is_error)` — records non-streaming response dump
+- `request_id()` — returns `&str`
+- `ingress_size()` — returns `usize`
+- `model()` — returns `&str`
+- `section()` — returns `&str`
+- `diagnostics_handle()` — returns `Diagnostics` clone
+- `set_input_messages(n)`, `set_max_tokens(n)`, `set_messages_detail_ingress(v)`, `set_messages_detail_egress(v)` — optional stats detail setters
+- `ingress_dump(body, headers)` — stores ingress dump for deferred recording
+- `egress_dump(body, headers)` — stores egress dump for deferred recording
+- `response_dump(body, status, is_error, headers)` — records non-streaming response dump with headers
 - `response_dump_streaming(body, status)` — records streaming response dump
-- `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, consumes guard
-- `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, error)` — records error stats, consumes guard
+- `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, flushes deferred dumps with `is_error: false`, idempotent
+- `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, streaming, error)` — records error stats, flushes deferred dumps with `is_error: true`, idempotent
+
 **Drop safety net:** If dropped without `finish()`/`finish_with_error()`, logs `tracing::error!` and records a stats event with `error: "diagnostics guard dropped without finish"`.
 
 ### Scenario: Normal completion
 - GIVEN a `RequestDiagnostics` guard created for a request
-- AND ingress/egress dumps recorded via guard methods
+- AND ingress/egress dumps stored via guard methods
 - WHEN `guard.finish(200, ...)` is called
-- THEN a success stats event is recorded
+- THEN deferred dumps are flushed with `is_error: false`
+- AND a success stats event is recorded
 - AND the guard does not log on drop
 
 ### Scenario: Guard dropped without finish
@@ -225,20 +252,54 @@ A `RequestDiagnostics` session object binds stats and dump recording into a sing
 - AND `finish()` was NOT called
 - WHEN the guard is dropped
 - THEN `tracing::error!` is emitted
+- AND deferred dumps are flushed with `is_error: true`
 - AND a stats event is recorded with `error: "diagnostics guard dropped without finish"` and `status: 0`
 
-### Scenario: Pilot migration in send_and_translate
-- GIVEN `send_and_translate` uses `RequestDiagnostics`
-- WHEN a request completes (success or error, streaming or non-streaming)
-- THEN the same stats and dump events are recorded as before migration
-- AND the `request_id` is shared across all events
+### Scenario: All handler patterns use the guard
+- GIVEN any protocol handler (passthrough, translation, interactions, split-send)
+- WHEN a request is processed
+- THEN `RequestDiagnostics` is created once at request start
+- AND all dumps and the stats event share the same `request_id`
+
+### Scenario: Multi-chunk split-send
+- GIVEN a request whose content exceeds `proxy_limit`
+- WHEN the content is split into N chunks and sent sequentially
+- THEN the guard records one ingress dump, N egress dumps, N response dumps
+- AND `guard.finish()` records one aggregate stats event with `response_size_bytes` = sum of all chunk responses
+- AND all events share the same `request_id`
+
+### Scenario: Per-chunk error with early return
+- GIVEN a split-send where chunk 2 of 5 fails
+- WHEN the upstream returns an error for chunk 2
+- THEN `guard.finish_with_error()` records an error stats event
+- AND the function returns early
+- AND subsequent `guard.drop()` is a no-op (already finished)
+
+### Scenario: Relay-interaction with shared request_id
+- GIVEN a passthrough handler using `RequestDiagnostics`
+- WHEN the error path records stats via `guard.finish_with_error()`
+- OR the success path relays through `relay_*_upstream` and records stats via `guard.finish()`
+- THEN both paths use the same `request_id` (created once at guard construction)
+- AND the relay function uses `guard` for response dump recording
+
+### Scenario: Conditional diagnostics
+- GIVEN a translation handler where `dump_enabled()` is false
+- WHEN the handler uses `RequestDiagnostics`
+- THEN `ingress_dump`/`egress_dump` are never called (body strings are `None`)
+- AND `set_input_messages`/`set_max_tokens`/`set_messages_detail_*` are only called when `stats_enabled()` is true
+- AND `finish()` still records a stats event with the fields that were set
 
 ### Scenario: Streaming task moves guard by value
 - GIVEN a streaming handler that spawns a `tokio::spawn` task
-- WHEN the guard is `Send` (uses `Mutex` not `RefCell`)
+- WHEN the guard is `Send + Sync`
 - THEN the guard is moved into the spawned task by value
 - AND `guard.response_dump_streaming()` + `guard.finish()` are called inside the task
 - AND no raw `diagnostics.record_*` calls remain in the spawned task
+
+### Scenario: Idempotent finish
+- GIVEN `finish()` was already called
+- WHEN `finish()` or `finish_with_error()` is called again
+- THEN the call is a no-op (returns immediately)
 
 ## Requirement: Router-Level Client Error Visibility
 

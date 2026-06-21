@@ -545,20 +545,28 @@ impl Diagnostics {
 /// was never called, a best-effort stats event is recorded with
 /// `error: "diagnostics guard dropped without finish"`.
 ///
-/// Uses `Cell`/`Mutex` for interior mutability so all methods take `&self`
-/// and the guard is `Send` (can cross `tokio::spawn` boundaries).
+/// Uses `Mutex` for interior mutability so all methods take `&self`
+/// Stored dump: body + header pairs.
+type StoredDump = (DumpBody, Vec<(String, String)>);
+
+/// and the guard is `Send + Sync` (can cross `tokio::spawn` boundaries,
+/// and `&guard` is `Send`).
 pub struct RequestDiagnostics {
     diagnostics: Diagnostics,
     request_id: String,
     section: String,
     model: String,
     start: std::time::Instant,
-    finished: std::cell::Cell<bool>,
-    ingress_size: std::cell::Cell<usize>,
-    input_messages: std::cell::Cell<Option<usize>>,
-    max_tokens: std::cell::Cell<Option<u32>>,
+    finished: std::sync::Mutex<bool>,
+    ingress_size: std::sync::Mutex<usize>,
+    input_messages: std::sync::Mutex<Option<usize>>,
+    max_tokens: std::sync::Mutex<Option<u32>>,
     messages_detail_ingress: std::sync::Mutex<Option<serde_json::Value>>,
     messages_detail_egress: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Deferred ingress dump — stored by `ingress_dump`, flushed in `finish`/`finish_with_error`.
+    ingress_dump_pending: std::sync::Mutex<Option<StoredDump>>,
+    /// Deferred egress dumps — stored by `egress_dump`, flushed in `finish`/`finish_with_error`.
+    egress_dumps_pending: std::sync::Mutex<Vec<StoredDump>>,
 }
 
 impl RequestDiagnostics {
@@ -569,12 +577,14 @@ impl RequestDiagnostics {
             section: section.to_string(),
             model: model.to_string(),
             start: std::time::Instant::now(),
-            finished: std::cell::Cell::new(false),
-            ingress_size: std::cell::Cell::new(0),
-            input_messages: std::cell::Cell::new(None),
-            max_tokens: std::cell::Cell::new(None),
+            finished: std::sync::Mutex::new(false),
+            ingress_size: std::sync::Mutex::new(0),
+            input_messages: std::sync::Mutex::new(None),
+            max_tokens: std::sync::Mutex::new(None),
             messages_detail_ingress: std::sync::Mutex::new(None),
             messages_detail_egress: std::sync::Mutex::new(None),
+            ingress_dump_pending: std::sync::Mutex::new(None),
+            egress_dumps_pending: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -583,12 +593,32 @@ impl RequestDiagnostics {
         &self.request_id
     }
 
+    /// The ingress body size in bytes (set by `ingress_dump`).
+    pub fn ingress_size(&self) -> usize {
+        *self.ingress_size.lock().unwrap()
+    }
+
+    /// The model name for this request.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The config section for this request.
+    pub fn section(&self) -> &str {
+        &self.section
+    }
+
+    /// Clone of the underlying `Diagnostics` handle (cheap — clones the channel sender).
+    pub fn diagnostics_handle(&self) -> Diagnostics {
+        self.diagnostics.clone()
+    }
+
     /// Set optional stats detail fields (only recorded when `stats_enabled()`).
     pub fn set_input_messages(&self, n: usize) {
-        self.input_messages.set(Some(n));
+        *self.input_messages.lock().unwrap() = Some(n);
     }
     pub fn set_max_tokens(&self, n: u32) {
-        self.max_tokens.set(Some(n));
+        *self.max_tokens.lock().unwrap() = Some(n);
     }
     pub fn set_messages_detail_ingress(&self, v: serde_json::Value) {
         *self.messages_detail_ingress.lock().unwrap() = Some(v);
@@ -599,13 +629,15 @@ impl RequestDiagnostics {
 
     /// Deprecated: prefer moving the `Send` guard into the streaming task directly.
     pub fn disarm(self) -> String {
-        self.finished.set(true);
+        *self.finished.lock().unwrap() = true;
         self.request_id.clone()
     }
 
     /// Record an ingress request dump and track request size.
+    /// The dump is deferred — recorded in `finish`/`finish_with_error` with
+    /// the correct `is_error` flag.
     pub fn ingress_dump(&self, body: &[u8], headers: &axum::http::HeaderMap) {
-        self.ingress_size.set(body.len());
+        *self.ingress_size.lock().unwrap() = body.len();
         let dump_body = dump_body_from_bytes(body);
         if dump_body.is_base64() {
             tracing::warn!(
@@ -613,19 +645,20 @@ impl RequestDiagnostics {
                 body_len = body.len(), "non-utf8 in ingress request body"
             );
         }
-        self.diagnostics.record_request_dump(
-            &self.request_id,
-            &self.section,
-            "ingress",
-            &self.model,
-            headers,
-            dump_body,
-            None,
-            false,
-        );
+        let header_pairs: Vec<(String, String)> = headers
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|val| (k.as_str().to_string(), val.to_string()))
+            })
+            .collect();
+        *self.ingress_dump_pending.lock().unwrap() = Some((dump_body, header_pairs));
     }
 
     /// Record an egress request dump.
+    /// The dump is deferred — recorded in `finish`/`finish_with_error` with
+    /// the correct `is_error` flag.
     pub fn egress_dump(&self, body: &[u8], headers: &axum::http::HeaderMap) {
         let dump_body = dump_body_from_bytes(body);
         if dump_body.is_base64() {
@@ -634,25 +667,33 @@ impl RequestDiagnostics {
                 body_len = body.len(), "non-utf8 in egress request body"
             );
         }
-        self.diagnostics.record_request_dump(
-            &self.request_id,
-            &self.section,
-            "egress",
-            &self.model,
-            headers,
-            dump_body,
-            None,
-            false,
-        );
+        let header_pairs: Vec<(String, String)> = headers
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|val| (k.as_str().to_string(), val.to_string()))
+            })
+            .collect();
+        self.egress_dumps_pending
+            .lock()
+            .unwrap()
+            .push((dump_body, header_pairs));
     }
 
     /// Record a response dump (non-streaming).
-    pub fn response_dump(&self, body: impl Into<DumpBody>, status: u16, is_error: bool) {
+    pub fn response_dump(
+        &self,
+        body: impl Into<DumpBody>,
+        status: u16,
+        is_error: bool,
+        headers: Vec<(String, String)>,
+    ) {
         self.diagnostics.record_response_dump(
             &self.request_id,
             &self.section,
             &self.model,
-            vec![],
+            headers,
             body,
             status,
             is_error,
@@ -673,6 +714,7 @@ impl RequestDiagnostics {
     }
 
     /// Record success stats and mark the guard as finished. Idempotent.
+    /// Flushes deferred ingress/egress dumps with `is_error: false`.
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
         &self,
@@ -684,9 +726,14 @@ impl RequestDiagnostics {
         direction: &str,
         streaming: bool,
     ) {
-        if self.finished.replace(true) {
-            return;
+        {
+            let mut finished = self.finished.lock().unwrap();
+            if *finished {
+                return;
+            }
+            *finished = true;
         }
+        self.flush_deferred_dumps(false);
         self.diagnostics.record_stats(&StatsEvent {
             section: self.section.clone(),
             request_id: self.request_id.clone(),
@@ -700,14 +747,15 @@ impl RequestDiagnostics {
             response_size_bytes: response_size,
             streaming,
             error: None,
-            input_messages: self.input_messages.get(),
-            max_tokens: self.max_tokens.get(),
+            input_messages: *self.input_messages.lock().unwrap(),
+            max_tokens: *self.max_tokens.lock().unwrap(),
             messages_detail_ingress: self.messages_detail_ingress.lock().unwrap().clone(),
             messages_detail_egress: self.messages_detail_egress.lock().unwrap().clone(),
         });
     }
 
     /// Record error stats and mark the guard as finished. Idempotent.
+    /// Flushes deferred ingress/egress dumps with `is_error: true`.
     #[allow(clippy::too_many_arguments)]
     pub fn finish_with_error(
         &self,
@@ -720,9 +768,14 @@ impl RequestDiagnostics {
         streaming: bool,
         error: String,
     ) {
-        if self.finished.replace(true) {
-            return;
+        {
+            let mut finished = self.finished.lock().unwrap();
+            if *finished {
+                return;
+            }
+            *finished = true;
         }
+        self.flush_deferred_dumps(true);
         self.diagnostics.record_stats(&StatsEvent {
             section: self.section.clone(),
             request_id: self.request_id.clone(),
@@ -736,22 +789,60 @@ impl RequestDiagnostics {
             response_size_bytes: response_size,
             streaming,
             error: Some(error),
-            input_messages: self.input_messages.get(),
-            max_tokens: self.max_tokens.get(),
+            input_messages: *self.input_messages.lock().unwrap(),
+            max_tokens: *self.max_tokens.lock().unwrap(),
             messages_detail_ingress: self.messages_detail_ingress.lock().unwrap().clone(),
             messages_detail_egress: self.messages_detail_egress.lock().unwrap().clone(),
         });
+    }
+
+    /// Flush pending ingress and egress dumps with the given `is_error` flag.
+    fn flush_deferred_dumps(&self, is_error: bool) {
+        if let Some((body, headers)) = self.ingress_dump_pending.lock().unwrap().take() {
+            self.diagnostics.record_dump(
+                &DumpEvent {
+                    section: self.section.clone(),
+                    request_id: self.request_id.clone(),
+                    ts: ts_string(),
+                    stage: "ingress".into(),
+                    direction: "request".into(),
+                    model: self.model.clone(),
+                    headers,
+                    body,
+                    status: None,
+                },
+                is_error,
+            );
+        }
+        let egresses: Vec<_> = std::mem::take(&mut *self.egress_dumps_pending.lock().unwrap());
+        for (body, headers) in egresses {
+            self.diagnostics.record_dump(
+                &DumpEvent {
+                    section: self.section.clone(),
+                    request_id: self.request_id.clone(),
+                    ts: ts_string(),
+                    stage: "egress".into(),
+                    direction: "request".into(),
+                    model: self.model.clone(),
+                    headers,
+                    body,
+                    status: None,
+                },
+                is_error,
+            );
+        }
     }
 }
 
 impl Drop for RequestDiagnostics {
     fn drop(&mut self) {
-        if !self.finished.get() {
+        if !*self.finished.lock().unwrap() {
             let duration_ms = self.start.elapsed().as_millis() as u64;
             tracing::error!(
                 request_id = %self.request_id, section = %self.section,
                 model = %self.model, "diagnostics guard dropped without finish"
             );
+            self.flush_deferred_dumps(true);
             self.diagnostics.record_stats(&StatsEvent {
                 section: self.section.clone(),
                 request_id: self.request_id.clone(),
@@ -761,7 +852,7 @@ impl Drop for RequestDiagnostics {
                 upstream: String::new(),
                 status: 0,
                 duration_ms,
-                request_size_bytes: self.ingress_size.get(),
+                request_size_bytes: *self.ingress_size.lock().unwrap(),
                 response_size_bytes: None,
                 streaming: false,
                 error: Some("diagnostics guard dropped without finish".into()),
@@ -1762,8 +1853,8 @@ mod tests {
         guard.set_max_tokens(4096);
         guard.set_messages_detail_ingress(serde_json::json!([{"role": "user"}]));
         guard.set_messages_detail_egress(serde_json::json!([{"role": "assistant"}]));
-        assert_eq!(guard.input_messages.get(), Some(3));
-        assert_eq!(guard.max_tokens.get(), Some(4096));
+        assert_eq!(*guard.input_messages.lock().unwrap(), Some(3));
+        assert_eq!(*guard.max_tokens.lock().unwrap(), Some(4096));
         assert!(guard.messages_detail_ingress.lock().unwrap().is_some());
         assert!(guard.messages_detail_egress.lock().unwrap().is_some());
     }

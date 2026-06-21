@@ -18,7 +18,7 @@ use reqwest::Client as HttpClient;
 use crate::auth::{is_auth_header, should_forward_request_header};
 use crate::config::{Config, Protocol, RouteTarget};
 use crate::control::{scan_control_messages, ControlAction};
-use crate::diagnostics::{Diagnostics, StatsEvent};
+use crate::diagnostics::Diagnostics;
 use crate::error::AppError;
 use crate::interactions as interactions_lib;
 use crate::interactions_types::{
@@ -502,6 +502,7 @@ impl InteractionsHandler {
                 crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                 status.as_u16(),
                 true,
+                vec![],
             );
             guard.finish_with_error(
                 status.as_u16(),
@@ -523,7 +524,6 @@ impl InteractionsHandler {
         }
 
         if stream {
-            let request_id = guard.disarm();
             return self
                 .handle_stream_response(
                     upstream,
@@ -532,10 +532,9 @@ impl InteractionsHandler {
                     new_count,
                     model,
                     upstream_label,
-                    ingress_body.len(),
                     direction,
                     ingress,
-                    request_id,
+                    guard,
                 )
                 .await;
         }
@@ -556,6 +555,7 @@ impl InteractionsHandler {
             crate::diagnostics::dump_body_from_bytes(response_body.as_bytes()),
             200,
             false,
+            vec![],
         );
         guard.finish(
             200,
@@ -641,16 +641,17 @@ impl InteractionsHandler {
     async fn handle_stream_response(
         &self,
         upstream: reqwest::Response,
-        route: &RouteTarget,
+        _route: &RouteTarget,
         session_id: &str,
         new_count: usize,
         model: &str,
         upstream_label: &str,
-        request_size: usize,
         direction: &str,
         ingress: Protocol,
-        request_id: String,
+        guard: crate::diagnostics::RequestDiagnostics,
     ) -> Result<Response, AppError> {
+        let request_size = guard.ingress_size();
+        let request_id = guard.request_id().to_string();
         let mut byte_stream = upstream.bytes_stream();
         let mut buffer = String::new();
         let mut interaction_id = String::new();
@@ -662,12 +663,11 @@ impl InteractionsHandler {
         let model_owned = model.to_string();
         let session_store = self.session_store.clone();
         let sid = session_id.to_string();
-        let diagnostics = self.diagnostics.clone();
-        let section = route.section.clone();
         let dir = direction.to_string();
         let label = upstream_label.to_string();
         let start = std::time::Instant::now();
         let is_openai = matches!(ingress, Protocol::OpenAi);
+        let dump_enabled = self.diagnostics.dump_enabled();
 
         // Eagerly commit message_count to prevent racing follow-up requests
         // from re-sending messages the in-flight stream is about to deliver.
@@ -684,7 +684,7 @@ impl InteractionsHandler {
                 match chunk_result {
                     Ok(chunk) => {
                         total_bytes += chunk.len();
-                        if diagnostics.dump_enabled()
+                        if dump_enabled
                             && dump_buffer.len() < crate::relay::MAX_STREAMING_DUMP_BYTES
                         {
                             let remaining =
@@ -791,31 +791,18 @@ impl InteractionsHandler {
                     "non-utf8 streaming interactions upstream response"
                 );
             }
-            diagnostics.record_response_dump(
-                &request_id,
-                &section,
-                &model_owned,
-                vec![],
-                dump_body,
-                200,
-                false,
-            );
+            guard.response_dump_streaming(dump_body, 200);
 
             let duration_ms = start.elapsed().as_millis() as u64;
-            diagnostics.record_stats(&StatsEvent {
-                section,
-                request_id: request_id.clone(),
-                ts: crate::diagnostics::ts_string(),
-                direction: dir,
-                model: model_owned,
-                upstream: label,
-                status: 200,
+            guard.finish(
+                200,
                 duration_ms,
-                request_size_bytes: request_size,
-                response_size_bytes: Some(total_bytes),
-                streaming: true,
-                ..Default::default()
-            });
+                request_size,
+                Some(total_bytes),
+                &label,
+                &dir,
+                true,
+            );
         });
 
         let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -840,30 +827,12 @@ impl InteractionsHandler {
         request_headers: &HeaderMap,
         ingress: Protocol,
     ) -> Result<Response, AppError> {
-        let request_id = self.diagnostics.new_request_id();
+        let guard =
+            crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, model);
         let start = std::time::Instant::now();
         let mut total_response_bytes: usize = 0;
 
-        // Ingress dump: original client body
-        let ingress_dump_body = crate::diagnostics::dump_body_from_bytes(ingress_body);
-        if ingress_dump_body.is_base64() {
-            tracing::warn!(
-                request_id = %request_id,
-                direction = "request",
-                body_len = ingress_body.len(),
-                "non-utf8 in interactions split-send ingress request body"
-            );
-        }
-        self.diagnostics.record_request_dump(
-            &request_id,
-            &route.section,
-            "ingress",
-            model,
-            request_headers,
-            ingress_dump_body,
-            None,
-            false,
-        );
+        guard.ingress_dump(ingress_body, request_headers);
 
         let chunks = interactions_lib::split_content_for_limit(contents, limit);
         let mut last_id: Option<String> = None;
@@ -885,7 +854,6 @@ impl InteractionsHandler {
                 .map(|v| v.len())
                 .unwrap_or(0);
             if empty_size > limit {
-                // System instruction is too large — split it
                 return self
                     .send_split_system_instruction(
                         sys,
@@ -901,7 +869,7 @@ impl InteractionsHandler {
                         direction,
                         request_headers,
                         ingress,
-                        request_id,
+                        guard,
                     )
                     .await;
             }
@@ -920,26 +888,7 @@ impl InteractionsHandler {
             let chunk_body =
                 serde_json::to_vec(&chunk_req).map_err(|e| AppError::Internal(e.to_string()))?;
 
-            // Egress dump per chunk
-            let chunk_dump_body = crate::diagnostics::dump_body_from_bytes(&chunk_body);
-            if chunk_dump_body.is_base64() {
-                tracing::warn!(
-                    request_id = %request_id,
-                    direction = "request",
-                    body_len = chunk_body.len(),
-                    "non-utf8 in interactions split-send egress chunk body"
-                );
-            }
-            self.diagnostics.record_request_dump(
-                &request_id,
-                &route.section,
-                "egress",
-                model,
-                request_headers,
-                chunk_dump_body,
-                None,
-                false,
-            );
+            guard.egress_dump(&chunk_body, request_headers);
 
             let builder = build_interactions_headers(
                 self.http
@@ -952,30 +901,22 @@ impl InteractionsHandler {
             if !upstream.status().is_success() {
                 let status = upstream.status();
                 let error_body = upstream.text().await.unwrap_or_default();
-                // Response dump for chunk error
-                self.diagnostics.record_response_dump(
-                    &request_id,
-                    &route.section,
-                    model,
-                    vec![],
+                guard.response_dump(
                     crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                     status.as_u16(),
                     true,
+                    vec![],
                 );
-                self.diagnostics.record_stats(&StatsEvent {
-                    section: route.section.clone(),
-                    request_id: request_id.clone(),
-                    ts: crate::diagnostics::ts_string(),
-                    direction: direction.into(),
-                    model: model.into(),
-                    upstream: upstream_label.into(),
-                    status: status.as_u16(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    request_size_bytes: ingress_body.len(),
-                    response_size_bytes: Some(error_body.len()),
-                    error: Some(error_body.clone()),
-                    ..Default::default()
-                });
+                guard.finish_with_error(
+                    status.as_u16(),
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    Some(error_body.len()),
+                    upstream_label,
+                    direction,
+                    false,
+                    error_body.clone(),
+                );
                 let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
                 return Response::builder()
@@ -985,15 +926,11 @@ impl InteractionsHandler {
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
             let response_text = upstream.text().await?;
-            // Response dump per chunk
-            self.diagnostics.record_response_dump(
-                &request_id,
-                &route.section,
-                model,
-                vec![],
+            guard.response_dump(
                 crate::diagnostics::dump_body_from_bytes(response_text.as_bytes()),
                 200,
                 false,
+                vec![],
             );
             let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
                 AppError::Upstream(format!("failed to parse split interaction: {e}"))
@@ -1004,7 +941,6 @@ impl InteractionsHandler {
             last_interaction = Some(interaction);
         }
 
-        // Store the LAST chunk's interaction ID
         if let Some(ref final_id) = last_id {
             let _ = self
                 .session_store
@@ -1012,7 +948,16 @@ impl InteractionsHandler {
                 .await;
         }
 
-        // Return the last response, translated to the ingress protocol
+        guard.finish(
+            200,
+            start.elapsed().as_millis() as u64,
+            ingress_body.len(),
+            Some(total_response_bytes),
+            upstream_label,
+            direction,
+            false,
+        );
+
         let text = last_interaction
             .as_ref()
             .map(interactions_lib::extract_interaction_text)
@@ -1027,20 +972,6 @@ impl InteractionsHandler {
             .and_then(|i| i.usage.as_ref())
             .and_then(|u| u.total_output_tokens)
             .unwrap_or(0);
-
-        self.diagnostics.record_stats(&StatsEvent {
-            section: route.section.clone(),
-            request_id: request_id.clone(),
-            ts: crate::diagnostics::ts_string(),
-            direction: direction.into(),
-            model: model.into(),
-            upstream: upstream_label.into(),
-            status: 200,
-            duration_ms: start.elapsed().as_millis() as u64,
-            request_size_bytes: ingress_body.len(),
-            response_size_bytes: Some(total_response_bytes),
-            ..Default::default()
-        });
 
         let resp = match ingress {
             Protocol::OpenAi => {
@@ -1113,7 +1044,7 @@ impl InteractionsHandler {
         direction: &str,
         request_headers: &HeaderMap,
         ingress: Protocol,
-        request_id: String,
+        guard: crate::diagnostics::RequestDiagnostics,
     ) -> Result<Response, AppError> {
         let start = std::time::Instant::now();
         let mut total_response_bytes: usize = 0;
@@ -1140,26 +1071,7 @@ impl InteractionsHandler {
             let chunk_body =
                 serde_json::to_vec(&chunk_req).map_err(|e| AppError::Internal(e.to_string()))?;
 
-            // Egress dump per system-instruction chunk
-            let chunk_dump_body = crate::diagnostics::dump_body_from_bytes(&chunk_body);
-            if chunk_dump_body.is_base64() {
-                tracing::warn!(
-                    request_id = %request_id,
-                    direction = "request",
-                    body_len = chunk_body.len(),
-                    "non-utf8 in split-sys-instruction egress chunk body"
-                );
-            }
-            self.diagnostics.record_request_dump(
-                &request_id,
-                &route.section,
-                "egress",
-                model,
-                request_headers,
-                chunk_dump_body,
-                None,
-                false,
-            );
+            guard.egress_dump(&chunk_body, request_headers);
 
             let builder = build_interactions_headers(
                 self.http
@@ -1172,29 +1084,22 @@ impl InteractionsHandler {
             let upstream_status = upstream.status();
             if !upstream_status.is_success() {
                 let error_body = upstream.text().await.unwrap_or_default();
-                self.diagnostics.record_response_dump(
-                    &request_id,
-                    &route.section,
-                    model,
-                    vec![],
+                guard.response_dump(
                     crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                     upstream_status.as_u16(),
                     true,
+                    vec![],
                 );
-                self.diagnostics.record_stats(&StatsEvent {
-                    section: route.section.clone(),
-                    request_id: request_id.clone(),
-                    ts: crate::diagnostics::ts_string(),
-                    direction: direction.into(),
-                    model: model.into(),
-                    upstream: upstream_label.into(),
-                    status: upstream_status.as_u16(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    request_size_bytes: ingress_body.len(),
-                    response_size_bytes: Some(error_body.len()),
-                    error: Some(error_body.clone()),
-                    ..Default::default()
-                });
+                guard.finish_with_error(
+                    upstream_status.as_u16(),
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    Some(error_body.len()),
+                    upstream_label,
+                    direction,
+                    false,
+                    error_body.clone(),
+                );
                 let sc = StatusCode::from_u16(upstream_status.as_u16())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
                 let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
@@ -1206,15 +1111,11 @@ impl InteractionsHandler {
             }
             let response_text = upstream.text().await?;
             total_response_bytes += response_text.len();
-            // Response dump per system-instruction chunk
-            self.diagnostics.record_response_dump(
-                &request_id,
-                &route.section,
-                model,
-                vec![],
+            guard.response_dump(
                 crate::diagnostics::dump_body_from_bytes(response_text.as_bytes()),
                 200,
                 false,
+                vec![],
             );
             if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
                 current_prev = Some(interaction.id.clone());
@@ -1234,26 +1135,7 @@ impl InteractionsHandler {
                 let chunk_body = serde_json::to_vec(&chunk_req)
                     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-                // Egress dump per content chunk
-                let chunk_dump_body = crate::diagnostics::dump_body_from_bytes(&chunk_body);
-                if chunk_dump_body.is_base64() {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        direction = "request",
-                        body_len = chunk_body.len(),
-                        "non-utf8 in split-sys-instruction content egress chunk body"
-                    );
-                }
-                self.diagnostics.record_request_dump(
-                    &request_id,
-                    &route.section,
-                    "egress",
-                    model,
-                    request_headers,
-                    chunk_dump_body,
-                    None,
-                    false,
-                );
+                guard.egress_dump(&chunk_body, request_headers);
 
                 let builder = build_interactions_headers(
                     self.http
@@ -1266,29 +1148,22 @@ impl InteractionsHandler {
                 let upstream_status = upstream.status();
                 if !upstream_status.is_success() {
                     let error_body = upstream.text().await.unwrap_or_default();
-                    self.diagnostics.record_response_dump(
-                        &request_id,
-                        &route.section,
-                        model,
-                        vec![],
+                    guard.response_dump(
                         crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                         upstream_status.as_u16(),
                         true,
+                        vec![],
                     );
-                    self.diagnostics.record_stats(&StatsEvent {
-                        section: route.section.clone(),
-                        request_id: request_id.clone(),
-                        ts: crate::diagnostics::ts_string(),
-                        direction: direction.into(),
-                        model: model.into(),
-                        upstream: upstream_label.into(),
-                        status: upstream_status.as_u16(),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        request_size_bytes: ingress_body.len(),
-                        response_size_bytes: Some(error_body.len()),
-                        error: Some(error_body.clone()),
-                        ..Default::default()
-                    });
+                    guard.finish_with_error(
+                        upstream_status.as_u16(),
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        Some(error_body.len()),
+                        upstream_label,
+                        direction,
+                        false,
+                        error_body.clone(),
+                    );
                     let sc = StatusCode::from_u16(upstream_status.as_u16())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     let body =
@@ -1301,15 +1176,11 @@ impl InteractionsHandler {
                 }
                 let response_text = upstream.text().await?;
                 total_response_bytes += response_text.len();
-                // Response dump per content chunk
-                self.diagnostics.record_response_dump(
-                    &request_id,
-                    &route.section,
-                    model,
-                    vec![],
+                guard.response_dump(
                     crate::diagnostics::dump_body_from_bytes(response_text.as_bytes()),
                     200,
                     false,
+                    vec![],
                 );
                 if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
                     current_prev = Some(interaction.id.clone());
@@ -1326,6 +1197,16 @@ impl InteractionsHandler {
                 .await;
         }
 
+        guard.finish(
+            200,
+            start.elapsed().as_millis() as u64,
+            ingress_body.len(),
+            Some(total_response_bytes),
+            upstream_label,
+            direction,
+            false,
+        );
+
         // Translate last response to ingress protocol
         let text = last_interaction
             .as_ref()
@@ -1341,20 +1222,6 @@ impl InteractionsHandler {
             .and_then(|i| i.usage.as_ref())
             .and_then(|u| u.total_output_tokens)
             .unwrap_or(0);
-
-        self.diagnostics.record_stats(&StatsEvent {
-            section: route.section.clone(),
-            request_id: request_id.clone(),
-            ts: crate::diagnostics::ts_string(),
-            direction: direction.into(),
-            model: model.into(),
-            upstream: upstream_label.into(),
-            status: 200,
-            duration_ms: start.elapsed().as_millis() as u64,
-            request_size_bytes: ingress_body.len(),
-            response_size_bytes: Some(total_response_bytes),
-            ..Default::default()
-        });
 
         let resp = match ingress {
             Protocol::OpenAi => {

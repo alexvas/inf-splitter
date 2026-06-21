@@ -8,13 +8,6 @@ use crate::diagnostics::Diagnostics;
 
 pub(crate) const MAX_STREAMING_DUMP_BYTES: usize = 1024 * 1024;
 
-pub(crate) struct RelayContext<'a> {
-    pub(crate) diagnostics: &'a Diagnostics,
-    pub(crate) request_id: String,
-    pub(crate) model: String,
-    pub(crate) section: String,
-}
-
 pub(crate) struct DiagnosticStream<S> {
     pub(crate) inner: S,
     pub(crate) buffer: Vec<u8>,

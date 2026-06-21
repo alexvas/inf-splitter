@@ -10,10 +10,10 @@ use axum::response::IntoResponse;
 use axum::Json;
 use common::{
     anthropic_upstream_response, bind_and_serve, interactions_upstream_response,
-    openai_upstream_response, post_anthropic, post_openai, spawn_delayed_upstream,
-    spawn_error_upstream, spawn_router, spawn_router_with_diagnostics, spawn_router_with_dump,
-    spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream, wait_for_egress_dump,
-    wait_for_egress_response_dump, wait_for_file, wait_for_ingress_dump,
+    openai_upstream_response, poll_diagnostics_file, post_anthropic, post_openai,
+    spawn_delayed_upstream, spawn_error_upstream, spawn_router, spawn_router_with_diagnostics,
+    spawn_router_with_dump, spawn_sse_upstream_with_headers, spawn_stream_upstream, spawn_upstream,
+    wait_for_egress_dump, wait_for_egress_response_dump, wait_for_file, wait_for_ingress_dump,
 };
 use inf_splitter::diagnostics::{DiagnosticMode, DiagnosticsConfig, Sink};
 
@@ -3838,7 +3838,27 @@ models = "ts-egress-model"
     let _ = response.text().await;
 
     let dump_path: std::path::PathBuf = format!("{}.dump", tmp.display()).into();
-    let dump_lines = wait_for_file(&dump_path).await;
+    // Wait for the egress request dump specifically — it is deferred (flushed in
+    // guard.finish() after relay_upstream_response), so wait_for_file may return
+    // too early when only the non-deferred response dump has been written.
+    let dump_lines = poll_diagnostics_file(
+        &dump_path,
+        &format!(
+            "timed out waiting for egress request dump in: {}",
+            dump_path.display()
+        ),
+        |c| {
+            c.lines().any(|line| {
+                serde_json::from_str(line)
+                    .ok()
+                    .map_or(false, |v: serde_json::Value| {
+                        v["stage"].as_str() == Some("egress")
+                            && v["direction"].as_str() == Some("request")
+                    })
+            })
+        },
+    )
+    .await;
     assert!(!dump_lines.is_empty(), "must produce dump lines");
 
     let egress_req_ts: Vec<String> = dump_lines

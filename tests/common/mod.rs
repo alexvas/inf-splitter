@@ -196,7 +196,7 @@ pub async fn spawn_stream_upstream(path: &'static str, sse_body: String) -> Sock
     bind_and_serve(app).await.0
 }
 
-async fn poll_diagnostics_file(
+pub async fn poll_diagnostics_file(
     path: &std::path::Path,
     deadline_msg: &str,
     pred: impl Fn(&str) -> bool,

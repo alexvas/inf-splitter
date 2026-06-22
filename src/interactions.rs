@@ -222,8 +222,7 @@ pub fn can_split_under_limit(
         previous_interaction_id: params.previous_interaction_id.clone(),
         ..Default::default()
     };
-    let envelope_size =
-        serde_json::to_vec(&envelope).map(|v| v.len()).unwrap_or(0);
+    let envelope_size = serde_json::to_vec(&envelope).map(|v| v.len()).unwrap_or(0);
     if envelope_size >= limit {
         return Err(format!(
             "Non-splittable request fields ({envelope_size} bytes) exceed proxy limit ({limit} bytes)"

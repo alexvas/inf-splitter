@@ -25,6 +25,18 @@ pub fn forward_request_headers_map(api_key: Option<&str>, headers: &HeaderMap) -
         }
         out.insert(name.clone(), value.clone());
     }
+    // Map between x-claude-code-session-id and x-request-id so both
+    // Anthropic (Claude CLI) and OpenAI clients get their expected header.
+    if !out.contains_key("x-request-id") {
+        if let Some(val) = out.get("x-claude-code-session-id").cloned() {
+            out.insert("x-request-id", val);
+        }
+    }
+    if !out.contains_key("x-claude-code-session-id") {
+        if let Some(val) = out.get("x-request-id").cloned() {
+            out.insert("x-claude-code-session-id", val);
+        }
+    }
     out
 }
 
@@ -195,6 +207,72 @@ mod tests {
         assert_eq!(
             result.get("x-request-id").unwrap().to_str().unwrap(),
             "req-1"
+        );
+    }
+
+    // ── x-claude-code-session-id ↔ x-request-id mapping ──────
+
+    #[test]
+    fn map_adds_x_request_id_from_x_claude_code_session_id() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-123"),
+        );
+        let result = forward_request_headers_map(None, &headers);
+        assert_eq!(
+            result.get("x-request-id").unwrap().to_str().unwrap(),
+            "session-123"
+        );
+        assert_eq!(
+            result
+                .get("x-claude-code-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "session-123"
+        );
+    }
+
+    #[test]
+    fn map_adds_x_claude_code_session_id_from_x_request_id() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("req-456"));
+        let result = forward_request_headers_map(None, &headers);
+        assert_eq!(
+            result
+                .get("x-claude-code-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "req-456"
+        );
+        assert_eq!(
+            result.get("x-request-id").unwrap().to_str().unwrap(),
+            "req-456"
+        );
+    }
+
+    #[test]
+    fn map_does_not_overwrite_when_both_headers_present() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("req-789"));
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-789"),
+        );
+        let result = forward_request_headers_map(None, &headers);
+        assert_eq!(
+            result.get("x-request-id").unwrap().to_str().unwrap(),
+            "req-789"
+        );
+        assert_eq!(
+            result
+                .get("x-claude-code-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "session-789"
         );
     }
 }

@@ -438,7 +438,7 @@ impl OpenAiHandler {
 
 /// Forward relevant non-hop-by-hop headers from OpenAI upstream responses.
 fn relay_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    headers
+    let mut result: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
             let name = name.as_str();
@@ -447,6 +447,7 @@ fn relay_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
                 || lower.starts_with("x-ratelimit-")
                 || lower == "x-request-id"
                 || lower == "request-id"
+                || lower == "x-claude-code-session-id"
                 || lower.starts_with("openai-")
             {
                 value
@@ -457,7 +458,17 @@ fn relay_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
                 None
             }
         })
-        .collect()
+        .collect();
+    // Map x-request-id → x-claude-code-session-id for Anthropic (Claude CLI) clients
+    if !result.iter().any(|(n, _)| n == "x-claude-code-session-id") {
+        if let Some((_, v)) = result
+            .iter()
+            .find(|(n, _)| n == "x-request-id" || n == "request-id")
+        {
+            result.push(("x-claude-code-session-id".into(), v.clone()));
+        }
+    }
+    result
 }
 
 async fn relay_openai_upstream(
@@ -599,5 +610,23 @@ mod tests {
         let mut req = make_req(4096);
         cap_anthropic_max_tokens(&mut req, None);
         assert_eq!(req.max_tokens, 4096);
+    }
+
+    // ── relay_response_headers ────────────────────────────────
+
+    /// OpenAI upstream sent x-request-id → Anthropic client gets x-claude-code-session-id.
+    #[test]
+    fn relay_response_headers_maps_x_request_id_to_x_claude_code_session_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "req-abc".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let result = relay_response_headers(&headers);
+        let has_mapped = result
+            .iter()
+            .any(|(n, v)| n == "x-claude-code-session-id" && v == "req-abc");
+        assert!(
+            has_mapped,
+            "x-request-id must be mapped to x-claude-code-session-id"
+        );
     }
 }

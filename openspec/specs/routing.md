@@ -127,6 +127,25 @@ Translation applies to all four routing directions (openai→openai, openai→an
 - WHEN forwarding headers to upstream
 - THEN the client's `Authorization` header is passed through unchanged
 
+## Requirement: Session Identifier Header Mapping (Egress)
+
+`forward_request_headers_map()` in `auth.rs` adds complementary session identifier headers when forwarding to upstreams. If one header is present and the other is absent, the missing header is inserted with the same value.
+
+### Scenario: Anthropic client → adds x-request-id for OpenAI upstream
+- GIVEN client sends `x-claude-code-session-id: abc123` but no `x-request-id`
+- WHEN headers are forwarded
+- THEN both `x-claude-code-session-id: abc123` and `x-request-id: abc123` are present
+
+### Scenario: OpenAI client → adds x-claude-code-session-id for Anthropic upstream
+- GIVEN client sends `x-request-id: def456` but no `x-claude-code-session-id`
+- WHEN headers are forwarded
+- THEN both `x-request-id: def456` and `x-claude-code-session-id: def456` are present
+
+### Scenario: Both headers present — no overwrite
+- GIVEN client sends both `x-request-id: req-789` and `x-claude-code-session-id: sess-789`
+- WHEN headers are forwarded
+- THEN each keeps its original value unchanged
+
 ## Requirement: Error Format
 
 All error responses follow the Anthropic API error shape: `{"type":"error","error":{"type":"...","message":"..."}}`.
@@ -214,8 +233,9 @@ Session state fields: `interaction_id`, `message_count`, `last_access_utc`, `exp
 
 **Session ID resolution** (priority order):
 1. HTTP header `x-request-id` (primary)
-2. Body field `request_id` (fallback)
-3. Random UUID (last resort)
+2. HTTP header `x-claude-code-session-id` (Claude CLI)
+3. Body field `request_id` (fallback)
+4. Random UUID v7 (last resort)
 
 ### Scenario: First request in session
 - GIVEN no prior messages for session
@@ -231,6 +251,16 @@ Session state fields: `interaction_id`, `message_count`, `last_access_utc`, `exp
 - GIVEN `x-request-id: conv-abc123` header and `request_id: "..."` in body
 - WHEN session is resolved
 - THEN `session_id = "conv-abc123"` (header wins)
+
+### Scenario: Claude CLI session ID
+- GIVEN `x-claude-code-session-id: 1b9db61a-154f-45ba-827c-6f898f4cf831` header and no `x-request-id`
+- WHEN session is resolved
+- THEN `session_id = "1b9db61a-154f-45ba-827c-6f898f4cf831"`
+
+### Scenario: x-request-id still wins over x-claude-code-session-id
+- GIVEN both `x-request-id: req-123` and `x-claude-code-session-id: session-456`
+- WHEN session is resolved
+- THEN `session_id = "req-123"` (x-request-id wins)
 
 ## Requirement: Session Persistence
 
@@ -255,6 +285,30 @@ Session state is persisted to a TOML file. Written atomically on every state cha
 - GIVEN eviction triggers DELETE for `interaction_id = "abc123"`
 - WHEN upstream returns 404 "no such interaction"
 - THEN error is logged, session removed from local store
+
+## Requirement: Interactions Session Response Header
+
+All `InteractionsHandler` response paths return the resolved session ID as a response header. The header name depends on ingress protocol:
+- Anthropic ingress → `x-claude-code-session-id: <session_id>`
+- OpenAI ingress → `x-request-id: <session_id>`
+
+The header is set via `session_header_name(ingress)` which maps `Protocol::Anthropic` → `"x-claude-code-session-id"`, `Protocol::OpenAi` → `"x-request-id"`.
+
+Covered response paths:
+- `send_and_translate` — non-streaming success and error
+- `handle_stream_response` — streaming (via `sse_response_with_extra_header`)
+- `handle_split_send` — split-send chunk responses
+- Control message responses (clean-all, extend-lifetime)
+
+### Scenario: Anthropic client gets x-claude-code-session-id
+- GIVEN an Anthropic ingress request with `x-claude-code-session-id: abc`
+- WHEN the Interactions response is returned
+- THEN response includes header `x-claude-code-session-id: abc`
+
+### Scenario: OpenAI client gets x-request-id
+- GIVEN an OpenAI ingress request with `x-request-id: def`
+- WHEN the Interactions response is returned
+- THEN response includes header `x-request-id: def`
 
 ## Requirement: In-Band Control Messages
 
@@ -324,3 +378,24 @@ When `proxy_limit` is configured, the serialized `Content[]` is measured. If it 
 ## Requirement: Graceful Shutdown
 
 `main.rs` handles SIGTERM/SIGINT via `tokio::signal`. On shutdown signal, the server stops accepting new connections and drains in-flight requests before exiting. This is the standard Axum graceful shutdown pattern.
+
+## Requirement: SSE Response with Extra Header
+
+`sse_response_with_extra_header()` in `sse.rs` extends the standard SSE response builder with one caller-specified header, used by the Interactions streaming path to include the session identifier.
+
+### Scenario: SSE response carries session header
+- GIVEN a streaming interactions response
+- WHEN the SSE response is built
+- THEN it includes the session header (`x-claude-code-session-id` or `x-request-id`) alongside `content-type: text/event-stream`
+
+## Requirement: Control Action Helper
+
+`handle_control_action(&self, action, session_id, route, ingress)` executes a control action and returns a 200 OK JSON response with the session identifier header. Used by both `handle_from_anthropic` and `handle_from_openai` to avoid duplicating the control message handling logic.
+
+## Requirement: Fallback Response Builder
+
+`build_fallback_response(last_interaction, last_id, model, ingress)` builds a protocol-appropriate response body (`ChatCompletionResponse` or `MessageResponse`) from interaction usage stats when `build_response_from_interaction` is unavailable. Used by `handle_split_send` and `send_split_system_instruction`.
+
+## Requirement: OK Response with Session Header
+
+`ok_with_session_header(ingress, session_id, json)` returns a `200 OK` response with the given JSON body and the session identifier header (`x-claude-code-session-id` for Anthropic ingress, `x-request-id` for OpenAI ingress). Replaces the repeated pattern of building a response and manually inserting the header.

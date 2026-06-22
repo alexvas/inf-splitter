@@ -105,70 +105,12 @@ impl InteractionsHandler {
 
         // Execute control action if any
         if let Some(action) = &control_result.action {
-            match action {
-                ControlAction::CleanAll => {
-                    let all = self.session_store.remove_all().await.map_err(|e| {
-                        AppError::Internal(format!("session clean-all failed: {e}"))
-                    })?;
-                    let mut cancelled = 0usize;
-                    let mut deleted = 0usize;
-                    let mut errors: Vec<String> = Vec::new();
-                    for (_sid, state) in &all {
-                        if !state.interaction_id.is_empty() {
-                            if let Err(e) =
-                                self.cancel_interaction(&state.interaction_id, route).await
-                            {
-                                errors.push(format!("cancel {}: {}", state.interaction_id, e));
-                            } else {
-                                cancelled += 1;
-                            }
-                            if let Err(e) =
-                                self.delete_interaction(&state.interaction_id, route).await
-                            {
-                                errors.push(format!("delete {}: {}", state.interaction_id, e));
-                            } else {
-                                deleted += 1;
-                            }
-                        }
-                    }
-                    let msg = if errors.is_empty() {
-                        format!(
-                            "Cleaned all {} sessions ({} cancelled, {} deleted)",
-                            all.len(),
-                            cancelled,
-                            deleted
-                        )
-                    } else {
-                        format!(
-                            "Cleaned all {} sessions ({} cancelled, {} deleted). Errors: {}",
-                            all.len(),
-                            cancelled,
-                            deleted,
-                            errors.join("; ")
-                        )
-                    };
-                    return Ok((
-                        StatusCode::OK,
-                        axum::Json(serde_json::json!({"status": "ok", "message": msg})),
-                    )
-                        .into_response());
-                }
-                ControlAction::ExtendLifetime(until) => {
-                    self.session_store
-                        .extend_lifetime(&session_id, *until)
-                        .await
-                        .map_err(|e| AppError::Internal(format!("session extend failed: {e}")))?;
-                    let msg = format!("Session {} lifetime extended to UTC {}", session_id, until);
-                    return Ok((
-                        StatusCode::OK,
-                        axum::Json(serde_json::json!({"status": "ok", "message": msg})),
-                    )
-                        .into_response());
-                }
-            }
+            return self
+                .handle_control_action(action, &session_id, route, Protocol::Anthropic)
+                .await;
         }
 
-        // Get session state for delta computation
+        // Get session state for delta computation (Anthropic ingress)
         let session = self.session_store.get_or_create(&session_id).await;
         let delivered = session.message_count;
         let incoming_count = messages.len() - control_result.stripped_count;
@@ -302,67 +244,9 @@ impl InteractionsHandler {
         );
 
         if let Some(action) = &control_result.action {
-            match action {
-                ControlAction::CleanAll => {
-                    let all = self.session_store.remove_all().await.map_err(|e| {
-                        AppError::Internal(format!("session clean-all failed: {e}"))
-                    })?;
-                    let mut cancelled = 0usize;
-                    let mut deleted = 0usize;
-                    let mut errors: Vec<String> = Vec::new();
-                    for (_sid, state) in &all {
-                        if !state.interaction_id.is_empty() {
-                            if let Err(e) =
-                                self.cancel_interaction(&state.interaction_id, route).await
-                            {
-                                errors.push(format!("cancel {}: {}", state.interaction_id, e));
-                            } else {
-                                cancelled += 1;
-                            }
-                            if let Err(e) =
-                                self.delete_interaction(&state.interaction_id, route).await
-                            {
-                                errors.push(format!("delete {}: {}", state.interaction_id, e));
-                            } else {
-                                deleted += 1;
-                            }
-                        }
-                    }
-                    let msg = if errors.is_empty() {
-                        format!(
-                            "Cleaned all {} sessions ({} cancelled, {} deleted)",
-                            all.len(),
-                            cancelled,
-                            deleted
-                        )
-                    } else {
-                        format!(
-                            "Cleaned all {} sessions ({} cancelled, {} deleted). Errors: {}",
-                            all.len(),
-                            cancelled,
-                            deleted,
-                            errors.join("; ")
-                        )
-                    };
-                    return Ok((
-                        StatusCode::OK,
-                        axum::Json(serde_json::json!({"status": "ok", "message": msg})),
-                    )
-                        .into_response());
-                }
-                ControlAction::ExtendLifetime(until) => {
-                    self.session_store
-                        .extend_lifetime(&session_id, *until)
-                        .await
-                        .map_err(|e| AppError::Internal(format!("session extend failed: {e}")))?;
-                    let msg = format!("Session {} lifetime extended to UTC {}", session_id, until);
-                    return Ok((
-                        StatusCode::OK,
-                        axum::Json(serde_json::json!({"status": "ok", "message": msg})),
-                    )
-                        .into_response());
-                }
-            }
+            return self
+                .handle_control_action(action, &session_id, route, Protocol::OpenAi)
+                .await;
         }
 
         let session = self.session_store.get_or_create(&session_id).await;
@@ -522,6 +406,7 @@ impl InteractionsHandler {
             return Response::builder()
                 .status(sc)
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(Self::session_header_name(ingress), session_id)
                 .body(Body::from(body))
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
@@ -570,7 +455,7 @@ impl InteractionsHandler {
             stream,
         );
 
-        Ok((StatusCode::OK, axum::Json(resp)).into_response())
+        Ok(Self::ok_with_session_header(ingress, session_id, resp))
     }
 
     /// Stream interactions response events translated to the client's protocol.
@@ -604,6 +489,8 @@ impl InteractionsHandler {
         let start = std::time::Instant::now();
         let is_openai = matches!(ingress, Protocol::OpenAi);
         let dump_enabled = self.diagnostics.dump_enabled();
+        let session_hdr_name = Self::session_header_name(ingress);
+        let session_hdr_value = session_id.to_string();
 
         // Eagerly commit message_count to prevent racing follow-up requests
         // from re-sending messages the in-flight stream is about to deliver.
@@ -800,7 +687,12 @@ impl InteractionsHandler {
         });
 
         let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        sse::sse_response(&HeaderMap::new(), sse_stream)
+        sse::sse_response_with_extra_header(
+            &HeaderMap::new(),
+            sse_stream,
+            session_hdr_name,
+            &session_hdr_value,
+        )
     }
 
     /// Handle split sending: break content into chunks under proxy_limit.
@@ -947,72 +839,7 @@ impl InteractionsHandler {
             interactions_lib::build_response_from_interaction(inter, model, ingress)
                 .map_err(AppError::Internal)?
         } else {
-            let text = last_interaction
-                .as_ref()
-                .map(interactions_lib::extract_interaction_text)
-                .unwrap_or_default();
-            let input_tokens = last_interaction
-                .as_ref()
-                .and_then(|i| i.usage.as_ref())
-                .and_then(|u| u.total_input_tokens)
-                .unwrap_or(0);
-            let output_tokens = last_interaction
-                .as_ref()
-                .and_then(|i| i.usage.as_ref())
-                .and_then(|u| u.total_output_tokens)
-                .unwrap_or(0);
-            match ingress {
-                Protocol::OpenAi => {
-                    let typed = ChatCompletionResponse {
-                        id: last_id.unwrap_or_default(),
-                        object: "chat.completion".to_string(),
-                        model: model.to_string(),
-                        choices: vec![Choice {
-                            index: 0,
-                            message: ChatMessage {
-                                role: ChatRole::Assistant,
-                                content: Some(ChatContent::Text(text)),
-                                name: None,
-                                tool_calls: None,
-                                tool_call_id: None,
-                                refusal: None,
-                                reasoning_content: None,
-                            },
-                            finish_reason: Some(FinishReason::Stop),
-                            logprobs: None,
-                        }],
-                        usage: Some(ChatUsage {
-                            prompt_tokens: input_tokens as u32,
-                            completion_tokens: output_tokens as u32,
-                            total_tokens: (input_tokens + output_tokens) as u32,
-                            completion_tokens_details: None,
-                            prompt_tokens_details: None,
-                        }),
-                        created: None,
-                        system_fingerprint: None,
-                        service_tier: None,
-                    };
-                    serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-                }
-                Protocol::Anthropic => {
-                    let typed = MessageResponse {
-                        id: last_id.unwrap_or_default(),
-                        response_type: "message".to_string(),
-                        role: Role::Assistant,
-                        model: model.to_string(),
-                        content: vec![ContentBlock::Text { text: text.clone() }],
-                        stop_reason: Some(StopReason::EndTurn),
-                        stop_sequence: None,
-                        usage: Usage {
-                            input_tokens: input_tokens as u32,
-                            output_tokens: output_tokens as u32,
-                            ..Default::default()
-                        },
-                        created: None,
-                    };
-                    serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-                }
-            }
+            build_fallback_response(last_interaction.as_ref(), last_id.clone(), model, ingress)?
         };
         guard.finish(
             200,
@@ -1023,7 +850,7 @@ impl InteractionsHandler {
             direction,
             false,
         );
-        Ok((StatusCode::OK, axum::Json(resp)).into_response())
+        Ok(Self::ok_with_session_header(ingress, session_id, resp))
     }
 
     /// Split system_instruction across multiple interactions, then send chunks.
@@ -1198,72 +1025,7 @@ impl InteractionsHandler {
             interactions_lib::build_response_from_interaction(inter, model, ingress)
                 .map_err(AppError::Internal)?
         } else {
-            let text = last_interaction
-                .as_ref()
-                .map(interactions_lib::extract_interaction_text)
-                .unwrap_or_default();
-            let input_tokens = last_interaction
-                .as_ref()
-                .and_then(|i| i.usage.as_ref())
-                .and_then(|u| u.total_input_tokens)
-                .unwrap_or(0);
-            let output_tokens = last_interaction
-                .as_ref()
-                .and_then(|i| i.usage.as_ref())
-                .and_then(|u| u.total_output_tokens)
-                .unwrap_or(0);
-            match ingress {
-                Protocol::OpenAi => {
-                    let typed = ChatCompletionResponse {
-                        id: last_id.unwrap_or_default(),
-                        object: "chat.completion".to_string(),
-                        model: model.to_string(),
-                        choices: vec![Choice {
-                            index: 0,
-                            message: ChatMessage {
-                                role: ChatRole::Assistant,
-                                content: Some(ChatContent::Text(text)),
-                                name: None,
-                                tool_calls: None,
-                                tool_call_id: None,
-                                refusal: None,
-                                reasoning_content: None,
-                            },
-                            finish_reason: Some(FinishReason::Stop),
-                            logprobs: None,
-                        }],
-                        usage: Some(ChatUsage {
-                            prompt_tokens: input_tokens as u32,
-                            completion_tokens: output_tokens as u32,
-                            total_tokens: (input_tokens + output_tokens) as u32,
-                            completion_tokens_details: None,
-                            prompt_tokens_details: None,
-                        }),
-                        created: None,
-                        system_fingerprint: None,
-                        service_tier: None,
-                    };
-                    serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-                }
-                Protocol::Anthropic => {
-                    let typed = MessageResponse {
-                        id: last_id.unwrap_or_default(),
-                        response_type: "message".to_string(),
-                        role: Role::Assistant,
-                        model: model.to_string(),
-                        content: vec![ContentBlock::Text { text: text.clone() }],
-                        stop_reason: Some(StopReason::EndTurn),
-                        stop_sequence: None,
-                        usage: Usage {
-                            input_tokens: input_tokens as u32,
-                            output_tokens: output_tokens as u32,
-                            ..Default::default()
-                        },
-                        created: None,
-                    };
-                    serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))?
-                }
-            }
+            build_fallback_response(last_interaction.as_ref(), last_id.clone(), model, ingress)?
         };
         guard.finish(
             200,
@@ -1274,7 +1036,7 @@ impl InteractionsHandler {
             direction,
             false,
         );
-        Ok((StatusCode::OK, axum::Json(resp)).into_response())
+        Ok(Self::ok_with_session_header(ingress, session_id, resp))
     }
 
     /// Cancel an interaction upstream (ignores 404).
@@ -1322,6 +1084,76 @@ impl InteractionsHandler {
         }
     }
 
+    /// Execute a control action and return the response.
+    async fn handle_control_action(
+        &self,
+        action: &ControlAction,
+        session_id: &str,
+        route: &RouteTarget,
+        ingress: Protocol,
+    ) -> Result<Response, AppError> {
+        match action {
+            ControlAction::CleanAll => {
+                let all =
+                    self.session_store.remove_all().await.map_err(|e| {
+                        AppError::Internal(format!("session clean-all failed: {e}"))
+                    })?;
+                let mut cancelled = 0usize;
+                let mut deleted = 0usize;
+                let mut errors: Vec<String> = Vec::new();
+                for (_sid, state) in &all {
+                    if !state.interaction_id.is_empty() {
+                        if let Err(e) = self.cancel_interaction(&state.interaction_id, route).await
+                        {
+                            errors.push(format!("cancel {}: {}", state.interaction_id, e));
+                        } else {
+                            cancelled += 1;
+                        }
+                        if let Err(e) = self.delete_interaction(&state.interaction_id, route).await
+                        {
+                            errors.push(format!("delete {}: {}", state.interaction_id, e));
+                        } else {
+                            deleted += 1;
+                        }
+                    }
+                }
+                let msg = if errors.is_empty() {
+                    format!(
+                        "Cleaned all {} sessions ({} cancelled, {} deleted)",
+                        all.len(),
+                        cancelled,
+                        deleted
+                    )
+                } else {
+                    format!(
+                        "Cleaned all {} sessions ({} cancelled, {} deleted). Errors: {}",
+                        all.len(),
+                        cancelled,
+                        deleted,
+                        errors.join("; ")
+                    )
+                };
+                Ok(Self::ok_with_session_header(
+                    ingress,
+                    session_id,
+                    serde_json::json!({"status": "ok", "message": msg}),
+                ))
+            }
+            ControlAction::ExtendLifetime(until) => {
+                self.session_store
+                    .extend_lifetime(session_id, *until)
+                    .await
+                    .map_err(|e| AppError::Internal(format!("session extend failed: {e}")))?;
+                let msg = format!("Session {} lifetime extended to UTC {}", session_id, until);
+                Ok(Self::ok_with_session_header(
+                    ingress,
+                    session_id,
+                    serde_json::json!({"status": "ok", "message": msg}),
+                ))
+            }
+        }
+    }
+
     /// GET interaction state (for startup pending verification).
     pub async fn get_interaction(
         &self,
@@ -1344,9 +1176,16 @@ impl InteractionsHandler {
     }
 
     fn resolve_session_id(&self, headers: &HeaderMap, body: &serde_json::Value) -> String {
-        // Priority: x-request-id header → request_id body field → random
+        // Priority: x-request-id header → x-claude-code-session-id header → request_id body field → random
         if let Some(hdr) = headers
             .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+        {
+            return hdr.to_string();
+        }
+        if let Some(hdr) = headers
+            .get("x-claude-code-session-id")
             .and_then(|v| v.to_str().ok())
             .filter(|s| !s.is_empty())
         {
@@ -1358,6 +1197,102 @@ impl InteractionsHandler {
             }
         }
         uuid::Uuid::now_v7().to_string()
+    }
+
+    /// Maps ingress protocol to the response header name carrying the session id.
+    fn session_header_name(ingress: Protocol) -> &'static str {
+        match ingress {
+            Protocol::Anthropic => "x-claude-code-session-id",
+            Protocol::OpenAi => "x-request-id",
+        }
+    }
+
+    /// Build a `200 OK` JSON response with the session identifier header.
+    fn ok_with_session_header(
+        ingress: Protocol,
+        session_id: &str,
+        json: serde_json::Value,
+    ) -> Response {
+        let hdr_name = Self::session_header_name(ingress);
+        let hdr_value = HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
+        let mut response = (StatusCode::OK, axum::Json(json)).into_response();
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(hdr_name), hdr_value);
+        response
+    }
+}
+
+/// Build a protocol-appropriate response body from the last interaction
+/// when `build_response_from_interaction` is not available.
+fn build_fallback_response(
+    last_interaction: Option<&Interaction>,
+    last_id: Option<String>,
+    model: &str,
+    ingress: Protocol,
+) -> Result<serde_json::Value, AppError> {
+    let text = last_interaction
+        .map(interactions_lib::extract_interaction_text)
+        .unwrap_or_default();
+    let input_tokens = last_interaction
+        .and_then(|i| i.usage.as_ref())
+        .and_then(|u| u.total_input_tokens)
+        .unwrap_or(0);
+    let output_tokens = last_interaction
+        .and_then(|i| i.usage.as_ref())
+        .and_then(|u| u.total_output_tokens)
+        .unwrap_or(0);
+    match ingress {
+        Protocol::OpenAi => {
+            let typed = ChatCompletionResponse {
+                id: last_id.unwrap_or_default(),
+                object: "chat.completion".to_string(),
+                model: model.to_string(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage {
+                        role: ChatRole::Assistant,
+                        content: Some(ChatContent::Text(text)),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        refusal: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: Some(FinishReason::Stop),
+                    logprobs: None,
+                }],
+                usage: Some(ChatUsage {
+                    prompt_tokens: input_tokens as u32,
+                    completion_tokens: output_tokens as u32,
+                    total_tokens: (input_tokens + output_tokens) as u32,
+                    completion_tokens_details: None,
+                    prompt_tokens_details: None,
+                }),
+                created: None,
+                system_fingerprint: None,
+                service_tier: None,
+            };
+            serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))
+        }
+        Protocol::Anthropic => {
+            let typed = MessageResponse {
+                id: last_id.unwrap_or_default(),
+                response_type: "message".to_string(),
+                role: Role::Assistant,
+                model: model.to_string(),
+                content: vec![ContentBlock::Text { text: text.clone() }],
+                stop_reason: Some(StopReason::EndTurn),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: input_tokens as u32,
+                    output_tokens: output_tokens as u32,
+                    ..Default::default()
+                },
+                created: None,
+            };
+            serde_json::to_value(typed).map_err(|e| AppError::Internal(e.to_string()))
+        }
     }
 }
 
@@ -1966,10 +1901,8 @@ If you don't know the answer, say so honestly.";
         };
         let envelope_size = serde_json::to_vec(&params).unwrap().len();
         // Use a limit just below the envelope size
-        let result = crate::interactions::can_split_under_limit(
-            &params,
-            envelope_size.saturating_sub(1),
-        );
+        let result =
+            crate::interactions::can_split_under_limit(&params, envelope_size.saturating_sub(1));
         assert!(result.is_err());
     }
 
@@ -2003,7 +1936,9 @@ If you don't know the answer, say so honestly.";
             ..Default::default()
         });
         let params = CreateModelInteractionParams {
-            system_instruction: Some("You are a helpful assistant. Each sentence can be split.".into()),
+            system_instruction: Some(
+                "You are a helpful assistant. Each sentence can be split.".into(),
+            ),
             ..minimal_params(vec![c])
         };
         let result = crate::interactions::can_split_under_limit(&params, 100);
@@ -2245,9 +2180,81 @@ If you don't know the answer, say so honestly.";
         );
     }
 
-    // --- build_interactions_headers tests ---
+    // ── resolve_session_id ────────────────────────────────────
 
+    use crate::config::Config;
+    use crate::diagnostics::{Diagnostics, DiagnosticsConfig};
     use axum::http::{HeaderMap, HeaderValue};
+
+    fn test_interactions_handler() -> InteractionsHandler {
+        let config = Config::load_from_str(
+            r#"
+            listen_host = "127.0.0.1"
+            listen_port = 3000
+            upstream_timeout = "30s"
+            max_request_body = "1m"
+
+            [test]
+            endpoint_interactions = "https://test.example.com/v1beta/interactions"
+            models = "test-model"
+            "#,
+        )
+        .expect("test config");
+        let diagnostics = Diagnostics::new(DiagnosticsConfig::default());
+        let session_store = Arc::new(SessionStore::new(
+            std::env::temp_dir().join("test-resolve-session-id.toml"),
+        ));
+        InteractionsHandler::new(&config, diagnostics, session_store).expect("build handler")
+    }
+
+    #[tokio::test]
+    async fn resolve_session_id_prefers_x_request_id_over_x_claude_code_session_id() {
+        let handler = test_interactions_handler();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("req-id-123"));
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-456"),
+        );
+        let body = serde_json::json!({});
+        let result = handler.resolve_session_id(&headers, &body);
+        assert_eq!(result, "req-id-123");
+    }
+
+    #[tokio::test]
+    async fn resolve_session_id_uses_x_claude_code_session_id_when_x_request_id_absent() {
+        let handler = test_interactions_handler();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-456"),
+        );
+        let body = serde_json::json!({});
+        let result = handler.resolve_session_id(&headers, &body);
+        assert_eq!(result, "session-456");
+    }
+
+    #[tokio::test]
+    async fn resolve_session_id_falls_back_to_body_request_id_when_no_headers() {
+        let handler = test_interactions_handler();
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({"request_id": "body-id-789"});
+        let result = handler.resolve_session_id(&headers, &body);
+        assert_eq!(result, "body-id-789");
+    }
+
+    #[tokio::test]
+    async fn resolve_session_id_uses_random_uuid_as_last_resort() {
+        let handler = test_interactions_handler();
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({});
+        let result = handler.resolve_session_id(&headers, &body);
+        assert!(!result.is_empty());
+        // Should be a valid UUID
+        assert!(uuid::Uuid::try_parse(&result).is_ok());
+    }
+
+    // --- build_interactions_headers tests ---
     use reqwest::Client;
 
     fn request_headers_with_auth() -> HeaderMap {

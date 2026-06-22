@@ -530,7 +530,7 @@ async fn relay_upstream_response(
 }
 
 fn copy_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    headers
+    let mut result: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
             let name = name.as_str();
@@ -538,6 +538,8 @@ fn copy_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
                 name,
                 "content-type"
                     | "request-id"
+                    | "x-request-id"
+                    | "x-claude-code-session-id"
                     | "anthropic-ratelimit-requests-limit"
                     | "anthropic-ratelimit-requests-remaining"
                     | "anthropic-ratelimit-requests-reset"
@@ -553,7 +555,14 @@ fn copy_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
                 None
             }
         })
-        .collect()
+        .collect();
+    // Map x-claude-code-session-id → x-request-id for OpenAI clients
+    if !result.iter().any(|(n, _)| n == "x-request-id") {
+        if let Some((_, v)) = result.iter().find(|(n, _)| n == "x-claude-code-session-id") {
+            result.push(("x-request-id".into(), v.clone()));
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -579,5 +588,28 @@ mod tests {
         assert!(names.contains(&"anthropic-ratelimit-requests-limit"));
         assert!(!names.contains(&"x-custom"));
         assert!(!names.contains(&"connection"));
+    }
+
+    // ── response header mapping tests ─────────────────────────
+
+    /// Anthropic upstream sent x-claude-code-session-id → OpenAI client gets x-request-id.
+    #[test]
+    fn copy_response_headers_maps_x_claude_code_session_id_to_x_request_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-claude-code-session-id", "sess-1".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let result = copy_response_headers(&headers);
+        // x-claude-code-session-id relayed as-is for Anthropic clients
+        assert!(result
+            .iter()
+            .any(|(n, v)| n == "x-claude-code-session-id" && v == "sess-1"));
+        // Also mapped to x-request-id for OpenAI clients
+        let found = result
+            .iter()
+            .any(|(n, v)| n == "x-request-id" && v == "sess-1");
+        assert!(
+            found,
+            "x-claude-code-session-id must be mapped to x-request-id"
+        );
     }
 }

@@ -226,3 +226,23 @@ where
         .body(Body::from_stream(body))
         .map_err(|err| AppError::Internal(err.to_string()))
 }
+
+/// Like [`sse_response`] but adds an extra header to the response.
+pub fn sse_response_with_extra_header<S>(
+    _request_headers: &HeaderMap,
+    body: S,
+    extra_name: &str,
+    extra_value: &str,
+) -> Result<Response, AppError>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+{
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .header(extra_name, extra_value)
+        .body(Body::from_stream(body))
+        .map_err(|err| AppError::Internal(err.to_string()))
+}

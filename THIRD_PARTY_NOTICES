@@ -94,9 +94,25 @@ SPDX-License-Identifier: BSD-2-Clause OR Apache-2.0 OR MIT
 ---
 SPDX-License-Identifier: BSD-3-Clause
 
+(3 crates)
+
+  - alloc-no-stdlib 2.0.4
+  - alloc-stdlib 0.2.2
+  - subtle 2.6.1
+
+---
+SPDX-License-Identifier: BSD-3-Clause AND MIT
+
 (1 crates)
 
-  - subtle 2.6.1
+  - brotli 8.0.2
+
+---
+SPDX-License-Identifier: BSD-3-Clause/MIT
+
+(1 crates)
+
+  - brotli-decompressor 5.0.0
 
 ---
 SPDX-License-Identifier: bzip2-1.0.6

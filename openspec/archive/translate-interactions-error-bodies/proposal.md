@@ -65,3 +65,18 @@ The translation happens **before** `apply_error_translation`, so user-configured
 | Risk | Probability | Impact | Mitigation |
 |------|-------------|--------|------------|
 | Existing error_translation rules matching raw Gemini format break | Low | Low | Users would need to update rules to match Anthropic/OpenAI format; documented in release notes |
+
+---
+
+## Archive Information
+
+**Archived:** 2026-06-22
+**Duration:** 1 day
+**Outcome:** Successfully implemented
+
+### Files Modified
+- `src/lib.rs` — added `translate_interactions_error_to_protocol` function
+- `src/interactions_handler.rs` — wired translation into 4 non-streaming error paths
+
+### Specs Updated
+- `openspec/specs/protocol-conversion.md` — added Gemini Error Body Translation requirement

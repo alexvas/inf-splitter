@@ -193,6 +193,83 @@ pub fn single_element_too_large(contents: &[Content], limit: usize) -> bool {
         .any(|c| serde_json::to_vec(c).map(|v| v.len()).unwrap_or(0) > limit)
 }
 
+/// Check whether a request that exceeds `proxy_limit` can be split at all.
+///
+/// Verifies three things:
+/// 1. The non-splittable envelope (model, generation_config, tools, etc.,
+///    but NOT input or system_instruction) fits within the limit.
+/// 2. Every single input Content element, when wrapped in the full envelope,
+///    fits within the limit.
+/// 3. If system_instruction also needs splitting, no space-delimited word
+///    is so large that it cannot fit when wrapped in the full envelope.
+pub fn can_split_under_limit(
+    params: &CreateModelInteractionParams,
+    limit: usize,
+) -> Result<(), String> {
+    let contents = match &params.input {
+        InteractionsInput::ContentList(list) => list.clone(),
+        _ => vec![],
+    };
+
+    // 1. Minimal envelope (no input, no system_instruction)
+    let envelope = CreateModelInteractionParams {
+        model: params.model.clone(),
+        input: InteractionsInput::ContentList(vec![]),
+        system_instruction: None,
+        stream: params.stream,
+        generation_config: params.generation_config.clone(),
+        tools: params.tools.clone(),
+        previous_interaction_id: params.previous_interaction_id.clone(),
+        ..Default::default()
+    };
+    let envelope_size =
+        serde_json::to_vec(&envelope).map(|v| v.len()).unwrap_or(0);
+    if envelope_size >= limit {
+        return Err(format!(
+            "Non-splittable request fields ({envelope_size} bytes) exceed proxy limit ({limit} bytes)"
+        ));
+    }
+
+    // 2. Each single content element, wrapped in the full envelope, must fit
+    for c in &contents {
+        let single = CreateModelInteractionParams {
+            input: InteractionsInput::ContentList(vec![c.clone()]),
+            ..envelope.clone()
+        };
+        if serde_json::to_vec(&single).map(|v| v.len()).unwrap_or(0) > limit {
+            return Err(format!(
+                "Single content element too large for proxy limit ({limit} bytes)"
+            ));
+        }
+    }
+
+    // 3. System instruction: if it needs splitting, check worst-case splittability
+    if let Some(ref sys) = params.system_instruction {
+        let sys_body = CreateModelInteractionParams {
+            system_instruction: Some(sys.clone()),
+            ..envelope.clone()
+        };
+        if serde_json::to_vec(&sys_body).map(|v| v.len()).unwrap_or(0) > limit {
+            // split_text_for_limit splits on hierarchical delimiters, final
+            // fallback is space. If any space-delimited word + envelope > limit,
+            // splitting will fail.
+            for word in sys.split_whitespace() {
+                let word_body = CreateModelInteractionParams {
+                    system_instruction: Some(word.to_string()),
+                    ..envelope.clone()
+                };
+                if serde_json::to_vec(&word_body).map(|v| v.len()).unwrap_or(0) > limit {
+                    return Err(format!(
+                        "System instruction contains unsplittable word exceeding proxy limit ({limit} bytes)"
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Extract function tool calls from an Interaction response.
 ///
 /// Returns `None` when the interaction has no function_call steps (i.e., the

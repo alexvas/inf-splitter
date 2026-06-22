@@ -1656,10 +1656,26 @@ models = "er-model"
 
     let egress = &egress_responses[0];
     assert_eq!(egress["model"], "er-model");
-    assert!(egress["body"]
-        .as_str()
-        .unwrap()
-        .contains("egress-response-body"));
+    // body may be embedded JSON (object) or a string
+    let body_contains = |v: &serde_json::Value| -> bool {
+        v.as_str()
+            .map(|s| s.contains("egress-response-body"))
+            .unwrap_or_else(|| {
+                v.as_object()
+                    .and_then(|o| o.get("content"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|b| b.get("text"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.contains("egress-response-body"))
+                    .unwrap_or(false)
+            })
+    };
+    assert!(
+        body_contains(&egress["body"]),
+        "body must contain egress-response-body, got: {}",
+        egress["body"]
+    );
     assert_eq!(egress["status"], 200);
     // Verify response headers are captured.
     assert!(
@@ -1831,10 +1847,26 @@ models = "oai-er-model"
 
     let egress = &egress_responses[0];
     assert_eq!(egress["model"], "oai-er-model");
-    assert!(egress["body"]
-        .as_str()
-        .unwrap()
-        .contains("openai-egress-response-body"));
+    let body_contains = |v: &serde_json::Value| -> bool {
+        v.as_str()
+            .map(|s| s.contains("openai-egress-response-body"))
+            .unwrap_or_else(|| {
+                v.as_object()
+                    .and_then(|o| o.get("choices"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|ch| ch.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.contains("openai-egress-response-body"))
+                    .unwrap_or(false)
+            })
+    };
+    assert!(
+        body_contains(&egress["body"]),
+        "body must contain openai-egress-response-body, got: {}",
+        egress["body"]
+    );
     assert_eq!(egress["status"], 200);
     assert!(
         egress["headers"]
@@ -2870,10 +2902,11 @@ models = "gemini-3.1-flash-lite"
         })
         .expect("must have response dump");
     let response_val: serde_json::Value = serde_json::from_str(response_line).expect("valid JSON");
-    let body = response_val["body"].as_str().expect("body must be string");
+    // body may be embedded JSON (object) or a string
+    let body_as_str = response_val["body"].to_string();
     assert!(
-        body.contains("Hello from interactions dump test!"),
-        "response dump body must contain expected text, got: {body}"
+        body_as_str.contains("Hello from interactions dump test!"),
+        "response dump body must contain expected text, got: {body_as_str}"
     );
 }
 

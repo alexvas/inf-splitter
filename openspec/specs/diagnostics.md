@@ -70,7 +70,8 @@ Each stats line is an NDJSON `StatsEvent` with fields:
 
 ## Requirement: Dump Event Format
 
-Each dump line is an NDJSON `DumpEvent` with fields:
+Each dump line is an NDJSON `DumpEvent` with fields.
+Valid JSON bodies are embedded as native JSON objects/arrays; non-JSON text remains a JSON string.
 
 ```json
 {
@@ -81,15 +82,25 @@ Each dump line is an NDJSON `DumpEvent` with fields:
   "direction": "request",
   "model": "deepseek-v4-pro",
   "headers": [["content-type", "application/json"]],
-  "body": "{\"model\":\"deepseek-v4-pro\",\"max_tokens\":100}",
+  "body": {"error": {"message": "permission denied"}},
   "status": null
 }
 ```
 
-### Scenario: Dump with UTF-8 body
-- GIVEN request body is valid UTF-8
+### Scenario: Dump with UTF-8 body (valid JSON)
+- GIVEN request/response body is valid UTF-8 that parses as JSON
 - WHEN a dump event is recorded
-- THEN `body` contains the plain text and no `encoding` field
+- THEN `body` contains the embedded JSON value (not a JSON-escaped string)
+
+### Scenario: Dump with UTF-8 body (non-JSON)
+- GIVEN request/response body is valid UTF-8 but not valid JSON (e.g., "plain text error")
+- WHEN a dump event is recorded
+- THEN `body` contains the plain text as a JSON string
+
+### Scenario: Dump with empty body
+- GIVEN body is an empty string `""`
+- WHEN a dump event is recorded
+- THEN `body` is serialized as `""` (empty JSON string parsing fails, falls back to string)
 
 ### Scenario: Dump with binary body
 - GIVEN request body is not valid UTF-8
@@ -100,6 +111,59 @@ Each dump line is an NDJSON `DumpEvent` with fields:
 - GIVEN binary body exceeds `MAX_NON_UTF8_DUMP_LEN` (65536 bytes)
 - WHEN a dump event is recorded
 - THEN the body is truncated to 65536 bytes before base64 encoding
+
+## Requirement: Sensitive Header Masking
+
+Header values for `x-goog-api-key`, `authorization`, and `x-api-key` are
+masked as `"***"` in all dump output. The masking is case-insensitive and
+applied at the lowest level across all entry points:
+
+- `Diagnostics::record_request_dump` — via `header_pairs_with_masking`
+- `Diagnostics::record_response_dump` — via `mask_header_values`
+- `RequestDiagnostics::ingress_dump` / `egress_dump` — via `header_pairs_with_masking`
+
+This covers Router direct calls, Relay/DiagnosticStream, and all three handlers.
+
+### Scenario: Egress dump with api_key
+- GIVEN `x-goog-api-key: AIzaSy...` is set in egress headers
+- WHEN the dump is recorded through ANY path
+- THEN the header appears as `["x-goog-api-key", "***"]`
+
+### Scenario: Non-sensitive headers pass through
+- GIVEN `x-request-id: trace-12345` and `content-type: application/json`
+- WHEN the dump is recorded
+- THEN these headers appear with their original values unchanged
+
+## Requirement: Egress Dump Uses Actual Upstream Headers (All Handlers)
+
+All `egress_dump` calls in `interactions_handler.rs`, `openai.rs`, and
+`anthropic.rs` receive the actual headers sent to the upstream (after
+`build_interactions_headers` / `forward_request_headers` transformation),
+not the ingress `request_headers`. Two helpers enable this:
+
+- `auth::forward_request_headers_map(api_key, request_headers) -> HeaderMap`
+- `interactions_handler::build_interactions_headers_map(api_key, request_headers) -> HeaderMap`
+
+### Scenario: Interactions handler with API key
+- GIVEN `api_key = "some-key"` in config
+- WHEN an interactions request is sent
+- THEN the egress dump shows `x-goog-api-key: ***` (masked) and `Api-Revision`, `Content-Type` headers
+
+### Scenario: OpenAI/Anthropic handler with API key
+- GIVEN `api_key = "some-key"` in config
+- WHEN a passthrough/conversion request is sent
+- THEN the egress dump shows `x-api-key: ***` and `authorization: ***` (masked)
+
+## Requirement: proxy_limit Size Check Uses Full Request Body
+
+The proxy_limit size check in `interactions_handler.rs` measures the full
+serialized `CreateModelInteractionParams` body, including `system_instruction`,
+`tools`, and all other fields — not just the `input` ContentList.
+
+### Scenario: Small input but large system_instruction
+- GIVEN `proxy_limit = "100k"` and a request with 10K input but 120K system_instruction
+- WHEN the request is processed
+- THEN the full body exceeds 100K limit and splitting is triggered
 
 ## Requirement: Every Protocol Handler Records Dump Events
 

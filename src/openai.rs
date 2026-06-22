@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
-use crate::auth::forward_request_headers;
+use crate::auth::{forward_request_headers, forward_request_headers_map};
 use crate::config::{Config, ErrorTranslationRule, RouteTarget};
 use crate::diagnostics::{Diagnostics, RequestDiagnostics, StatsEvent};
 use crate::error::AppError;
@@ -122,7 +122,9 @@ impl OpenAiHandler {
             None
         };
         if let Some(ref body_bytes) = downstream_body {
-            guard.egress_dump(body_bytes, request_headers);
+            let egress_headers =
+                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            guard.egress_dump(body_bytes, &egress_headers);
         }
         let start = std::time::Instant::now();
         let upstream = builder.body(body).send().await?;
@@ -209,7 +211,9 @@ impl OpenAiHandler {
             }
         }
         if let Some(ref s) = prepared.egress_str {
-            guard.egress_dump(s.as_bytes(), request_headers);
+            let egress_headers =
+                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            guard.egress_dump(s.as_bytes(), &egress_headers);
         }
         let ingress_str = if self.diagnostics.dump_enabled() {
             serde_json::to_string(req).ok()
@@ -301,7 +305,9 @@ impl OpenAiHandler {
             }
         }
         if let Some(ref s) = prepared.egress_str {
-            guard.egress_dump(s.as_bytes(), request_headers);
+            let egress_headers =
+                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            guard.egress_dump(s.as_bytes(), &egress_headers);
         }
         let ingress_str = if self.diagnostics.dump_enabled() {
             serde_json::to_string(req).ok()

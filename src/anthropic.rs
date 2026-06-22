@@ -15,7 +15,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use reqwest::RequestBuilder;
 
-use crate::auth::forward_request_headers;
+use crate::auth::{forward_request_headers, forward_request_headers_map};
 use crate::config::RouteTarget;
 use crate::diagnostics::{Diagnostics, RequestDiagnostics, StatsEvent};
 use crate::error::AppError;
@@ -77,7 +77,9 @@ impl AnthropicHandler {
         let body =
             Bytes::from(serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?);
         if self.diagnostics.dump_enabled() {
-            guard.egress_dump(&body, request_headers);
+            let egress_headers =
+                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            guard.egress_dump(&body, &egress_headers);
         }
         let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
         let start = std::time::Instant::now();
@@ -199,7 +201,9 @@ impl AnthropicHandler {
             }
         }
         if let Some(ref s) = prepared.egress_str {
-            guard.egress_dump(s.as_bytes(), request_headers);
+            let egress_headers =
+                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            guard.egress_dump(s.as_bytes(), &egress_headers);
         }
         let ingress_str = if self.diagnostics.dump_enabled() {
             serde_json::to_string(&openai_req).ok()
@@ -287,7 +291,9 @@ impl AnthropicHandler {
             }
         }
         if let Some(ref s) = prepared.egress_str {
-            guard.egress_dump(s.as_bytes(), request_headers);
+            let egress_headers =
+                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            guard.egress_dump(s.as_bytes(), &egress_headers);
         }
         let ingress_str = if self.diagnostics.dump_enabled() {
             serde_json::to_string(openai_req).ok()

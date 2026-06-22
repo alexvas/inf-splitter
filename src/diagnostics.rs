@@ -154,7 +154,13 @@ impl Serialize for DumpEvent {
         s.serialize_field("model", &self.model)?;
         s.serialize_field("headers", &self.headers)?;
         match &self.body {
-            DumpBody::Utf8(v) => s.serialize_field("body", v)?,
+            DumpBody::Utf8(v) => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(v) {
+                    s.serialize_field("body", &json)?;
+                } else {
+                    s.serialize_field("body", v)?;
+                }
+            }
             DumpBody::Base64(v) => {
                 s.serialize_field("body", v)?;
                 s.serialize_field("encoding", "base64")?;
@@ -213,6 +219,46 @@ pub fn dump_body_from_bytes(body: &[u8]) -> DumpBody {
             DumpBody::Base64(encoded)
         }
     }
+}
+
+/// Header names whose values should be masked in dump output.
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "x-goog-api-key" | "authorization" | "x-api-key"
+    )
+}
+
+/// Convert a `HeaderMap` to `Vec<(String, String)>`, masking sensitive values.
+fn header_pairs_with_masking(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str().ok().map(|val| {
+                let name = k.as_str().to_string();
+                let value = if is_sensitive_header(&name) {
+                    "***".to_string()
+                } else {
+                    val.to_string()
+                };
+                (name, value)
+            })
+        })
+        .collect()
+}
+
+/// Mask sensitive header values in an existing `Vec<(String, String)>`.
+fn mask_header_values(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(k, v)| {
+            if is_sensitive_header(&k) {
+                (k, "***".to_string())
+            } else {
+                (k, v)
+            }
+        })
+        .collect()
 }
 
 impl Diagnostics {
@@ -493,14 +539,7 @@ impl Diagnostics {
                 stage: stage.into(),
                 direction: "request".into(),
                 model: model.to_string(),
-                headers: headers
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        v.to_str()
-                            .ok()
-                            .map(|val| (k.as_str().to_string(), val.to_string()))
-                    })
-                    .collect(),
+                headers: header_pairs_with_masking(headers),
                 body: body.into(),
                 status,
             },
@@ -520,6 +559,7 @@ impl Diagnostics {
         status: u16,
         is_error: bool,
     ) {
+        let headers = mask_header_values(headers);
         self.record_dump(
             &DumpEvent {
                 section: section.to_string(),
@@ -639,14 +679,7 @@ impl RequestDiagnostics {
                 body_len = body.len(), "non-utf8 in ingress request body"
             );
         }
-        let header_pairs: Vec<(String, String)> = headers
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|val| (k.as_str().to_string(), val.to_string()))
-            })
-            .collect();
+        let header_pairs = header_pairs_with_masking(headers);
         *self.ingress_dump_pending.lock().unwrap() =
             Some((dump_body, header_pairs, ts_string(), None));
     }
@@ -662,14 +695,7 @@ impl RequestDiagnostics {
                 body_len = body.len(), "non-utf8 in egress request body"
             );
         }
-        let header_pairs: Vec<(String, String)> = headers
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|val| (k.as_str().to_string(), val.to_string()))
-            })
-            .collect();
+        let header_pairs = header_pairs_with_masking(headers);
         self.egress_dumps_pending.lock().unwrap().push((
             dump_body,
             header_pairs,
@@ -1857,5 +1883,188 @@ mod tests {
         assert_eq!(*guard.max_tokens.lock().unwrap(), Some(4096));
         assert!(guard.messages_detail_ingress.lock().unwrap().is_some());
         assert!(guard.messages_detail_egress.lock().unwrap().is_some());
+    }
+
+    // ── is_sensitive_header ─────────────────────────────────
+
+    #[test]
+    fn is_sensitive_header_detects_x_goog_api_key() {
+        assert!(super::is_sensitive_header("x-goog-api-key"));
+        assert!(super::is_sensitive_header("X-Goog-Api-Key"));
+        assert!(super::is_sensitive_header("X-GOOG-API-KEY"));
+    }
+
+    #[test]
+    fn is_sensitive_header_detects_authorization() {
+        assert!(super::is_sensitive_header("authorization"));
+        assert!(super::is_sensitive_header("Authorization"));
+        assert!(super::is_sensitive_header("AUTHORIZATION"));
+    }
+
+    #[test]
+    fn is_sensitive_header_detects_x_api_key() {
+        assert!(super::is_sensitive_header("x-api-key"));
+        assert!(super::is_sensitive_header("X-Api-Key"));
+    }
+
+    #[test]
+    fn is_sensitive_header_rejects_non_sensitive() {
+        assert!(!super::is_sensitive_header("content-type"));
+        assert!(!super::is_sensitive_header("x-request-id"));
+        assert!(!super::is_sensitive_header("accept"));
+        assert!(!super::is_sensitive_header("host"));
+    }
+
+    // ── header_pairs_with_masking ──────────────────────────
+
+    fn make_test_header_map() -> axum::http::HeaderMap {
+        use axum::http::HeaderValue;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-goog-api-key",
+            HeaderValue::from_static("AIzaSySecret123"),
+        );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer sk-ant-token"),
+        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("x-request-id", HeaderValue::from_static("trace-42"));
+        headers
+    }
+
+    #[test]
+    fn header_pairs_with_masking_masks_sensitive_values() {
+        let pairs = super::header_pairs_with_masking(&make_test_header_map());
+        // Find sensitive headers
+        let goog = pairs.iter().find(|(k, _)| k == "x-goog-api-key").unwrap();
+        let auth = pairs.iter().find(|(k, _)| k == "authorization").unwrap();
+        assert_eq!(goog.1, "***");
+        assert_eq!(auth.1, "***");
+    }
+
+    #[test]
+    fn header_pairs_with_masking_preserves_non_sensitive() {
+        let pairs = super::header_pairs_with_masking(&make_test_header_map());
+        let ct = pairs.iter().find(|(k, _)| k == "content-type").unwrap();
+        let rid = pairs.iter().find(|(k, _)| k == "x-request-id").unwrap();
+        assert_eq!(ct.1, "application/json");
+        assert_eq!(rid.1, "trace-42");
+    }
+
+    // ── mask_header_values ──────────────────────────────────
+
+    #[test]
+    fn mask_header_values_masks_sensitive_in_vec() {
+        let input: Vec<(String, String)> = vec![
+            ("x-goog-api-key".into(), "secret-key".into()),
+            ("content-type".into(), "application/json".into()),
+            ("authorization".into(), "Bearer token".into()),
+            ("x-request-id".into(), "req-1".into()),
+        ];
+        let result = super::mask_header_values(input);
+        assert_eq!(
+            result
+                .iter()
+                .find(|(k, _)| k == "x-goog-api-key")
+                .unwrap()
+                .1,
+            "***"
+        );
+        assert_eq!(
+            result.iter().find(|(k, _)| k == "authorization").unwrap().1,
+            "***"
+        );
+        assert_eq!(
+            result.iter().find(|(k, _)| k == "content-type").unwrap().1,
+            "application/json"
+        );
+        assert_eq!(
+            result.iter().find(|(k, _)| k == "x-request-id").unwrap().1,
+            "req-1"
+        );
+    }
+
+    // ── DumpEvent JSON body embedding ───────────────────────
+
+    #[test]
+    fn dump_event_utf8_valid_json_embedded_as_json() {
+        let event = DumpEvent {
+            section: "s".into(),
+            request_id: "1".into(),
+            ts: "2026-01-01T00:00:00Z".into(),
+            stage: "egress".into(),
+            direction: "response".into(),
+            model: "m".into(),
+            headers: vec![],
+            body: DumpBody::Utf8(r#"{"error":{"message":"denied"}}"#.into()),
+            status: Some(403),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // JSON body must be embedded as object, not as escaped string
+        assert!(
+            json.contains(r#""body":{"error":{"message":"denied"}}"#),
+            "expected embedded JSON object, got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn dump_event_utf8_plain_text_remains_string() {
+        let event = DumpEvent {
+            section: "s".into(),
+            request_id: "1".into(),
+            ts: "2026-01-01T00:00:00Z".into(),
+            stage: "egress".into(),
+            direction: "response".into(),
+            model: "m".into(),
+            headers: vec![],
+            body: DumpBody::Utf8("plain text error".into()),
+            status: Some(500),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains(r#""body":"plain text error""#),
+            "expected string body, got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn dump_event_utf8_empty_remains_string() {
+        let event = DumpEvent {
+            section: "s".into(),
+            request_id: "1".into(),
+            ts: "2026-01-01T00:00:00Z".into(),
+            stage: "egress".into(),
+            direction: "response".into(),
+            model: "m".into(),
+            headers: vec![],
+            body: DumpBody::Utf8("".into()),
+            status: Some(200),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains(r#""body":""#),
+            "expected empty string body, got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn dump_event_base64_still_has_encoding_field() {
+        let event = DumpEvent {
+            section: "s".into(),
+            request_id: "1".into(),
+            ts: "2026-01-01T00:00:00Z".into(),
+            stage: "egress".into(),
+            direction: "response".into(),
+            model: "m".into(),
+            headers: vec![],
+            body: DumpBody::Base64("AAAA".into()),
+            status: Some(200),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""encoding":"base64""#));
     }
 }

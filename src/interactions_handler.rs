@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
@@ -226,13 +226,10 @@ impl InteractionsHandler {
                 InteractionsInput::ContentList(list) => list.clone(),
                 _ => vec![],
             };
-            let size = serde_json::to_vec(&contents).map(|v| v.len()).unwrap_or(0);
+            let size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(0);
             if size > limit {
-                if interactions_lib::single_element_too_large(&contents, limit) {
-                    return Err(AppError::BadRequest(
-                        "Unable to split ingress message into chunks under proxy limit."
-                            .to_string(),
-                    ));
+                if let Err(msg) = interactions_lib::can_split_under_limit(&params, limit) {
+                    return Err(AppError::BadRequest(msg));
                 }
                 return self
                     .handle_split_send(
@@ -420,13 +417,10 @@ impl InteractionsHandler {
                 InteractionsInput::ContentList(list) => list.clone(),
                 _ => vec![],
             };
-            let size = serde_json::to_vec(&contents).map(|v| v.len()).unwrap_or(0);
+            let size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(0);
             if size > limit {
-                if interactions_lib::single_element_too_large(&contents, limit) {
-                    return Err(AppError::BadRequest(
-                        "Unable to split ingress message into chunks under proxy limit."
-                            .to_string(),
-                    ));
+                if let Err(msg) = interactions_lib::can_split_under_limit(&params, limit) {
+                    return Err(AppError::BadRequest(msg));
                 }
                 return self
                     .handle_split_send(
@@ -487,7 +481,9 @@ impl InteractionsHandler {
             crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, model);
 
         guard.ingress_dump(ingress_body, request_headers);
-        guard.egress_dump(egress_body, request_headers);
+        let egress_headers =
+            build_interactions_headers_map(route.api_key.as_deref(), request_headers);
+        guard.egress_dump(egress_body, &egress_headers);
 
         let builder = build_interactions_headers(
             self.http
@@ -832,6 +828,9 @@ impl InteractionsHandler {
 
         guard.ingress_dump(ingress_body, request_headers);
 
+        let egress_headers =
+            build_interactions_headers_map(route.api_key.as_deref(), request_headers);
+
         let chunks = interactions_lib::split_content_for_limit(contents, limit);
         let mut last_id: Option<String> = None;
         let mut last_interaction: Option<Interaction> = None;
@@ -886,7 +885,7 @@ impl InteractionsHandler {
             let chunk_body =
                 serde_json::to_vec(&chunk_req).map_err(|e| AppError::Internal(e.to_string()))?;
 
-            guard.egress_dump(&chunk_body, request_headers);
+            guard.egress_dump(&chunk_body, &egress_headers);
 
             let builder = build_interactions_headers(
                 self.http
@@ -1047,6 +1046,8 @@ impl InteractionsHandler {
     ) -> Result<Response, AppError> {
         let start = std::time::Instant::now();
         let mut total_response_bytes: usize = 0;
+        let egress_headers =
+            build_interactions_headers_map(route.api_key.as_deref(), request_headers);
         // Split system_instruction on natural boundaries
         let sys_parts = split_text_for_limit(sys, limit).map_err(AppError::BadRequest)?;
         let mut last_id: Option<String> = None;
@@ -1070,7 +1071,7 @@ impl InteractionsHandler {
             let chunk_body =
                 serde_json::to_vec(&chunk_req).map_err(|e| AppError::Internal(e.to_string()))?;
 
-            guard.egress_dump(&chunk_body, request_headers);
+            guard.egress_dump(&chunk_body, &egress_headers);
 
             let builder = build_interactions_headers(
                 self.http
@@ -1132,7 +1133,7 @@ impl InteractionsHandler {
                 let chunk_body = serde_json::to_vec(&chunk_req)
                     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-                guard.egress_dump(&chunk_body, request_headers);
+                guard.egress_dump(&chunk_body, &egress_headers);
 
                 let builder = build_interactions_headers(
                     self.http
@@ -1360,18 +1361,19 @@ impl InteractionsHandler {
     }
 }
 
-/// Build headers for interactions upstream requests.
-fn build_interactions_headers(
-    builder: reqwest::RequestBuilder,
-    api_key: Option<&str>,
-    request_headers: &HeaderMap,
-) -> reqwest::RequestBuilder {
-    let mut b = builder.header("Content-Type", "application/json");
-    b = b.header("Api-Revision", API_REVISION);
-    // Forward non-hop-by-hop headers, but strip incoming auth headers
-    // when we have a configured API key.  Using forward_request_headers
-    // with Some(key) would add Authorization + x-api-key, which conflicts
-    // with x-goog-api-key (Gemini returns OVERLOADED_CREDENTIALS).
+/// Build a `HeaderMap` with the same logic as `build_interactions_headers`
+/// but returns headers directly instead of applying them to a `RequestBuilder`.
+fn build_interactions_headers_map(api_key: Option<&str>, request_headers: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        HeaderName::from_bytes(b"Api-Revision").unwrap(),
+        HeaderValue::from_static(API_REVISION),
+    );
+
     for (name, value) in request_headers.iter() {
         let name_str = name.as_str();
         if !should_forward_request_header(name_str) {
@@ -1380,15 +1382,32 @@ fn build_interactions_headers(
         if api_key.is_some() && is_auth_header(name_str) {
             continue;
         }
+        headers.insert(name.clone(), value.clone());
+    }
+
+    if let Some(key) = api_key {
+        let _ = headers.insert(
+            HeaderName::from_static("x-goog-api-key"),
+            HeaderValue::from_str(key).unwrap_or(HeaderValue::from_static("")),
+        );
+    }
+    headers
+}
+
+/// Build headers for interactions upstream requests.
+fn build_interactions_headers(
+    builder: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+    request_headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    let headers = build_interactions_headers_map(api_key, request_headers);
+    let mut b = builder;
+    for (name, value) in headers.iter() {
         if let Ok(v) = value.to_str() {
-            b = b.header(name_str, v);
+            b = b.header(name.as_str(), v);
         }
     }
-    if let Some(key) = api_key {
-        b.header("x-goog-api-key", key)
-    } else {
-        b
-    }
+    b
 }
 
 /// Build a URL for interactions lifecycle operations.
@@ -1923,6 +1942,74 @@ If you don't know the answer, say so honestly.";
         assert!(single_element_too_large(&[c], size.saturating_sub(1)));
     }
 
+    // --- can_split_under_limit tests (RED) ---
+
+    use crate::interactions_types::{CreateModelInteractionParams, InteractionsInput};
+
+    fn minimal_params(contents: Vec<Content>) -> CreateModelInteractionParams {
+        CreateModelInteractionParams {
+            model: "test-model".into(),
+            input: InteractionsInput::ContentList(contents),
+            stream: Some(false),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn can_split_overhead_alone_exceeds_limit() {
+        // Envelope (model + generation_config + stream, no input, no sys) alone > limit
+        let params = CreateModelInteractionParams {
+            model: "test".into(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            ..Default::default()
+        };
+        let envelope_size = serde_json::to_vec(&params).unwrap().len();
+        // Use a limit just below the envelope size
+        let result = crate::interactions::can_split_under_limit(
+            &params,
+            envelope_size.saturating_sub(1),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn can_split_single_content_too_large() {
+        let c = Content::TextContent(TextContent {
+            text: "x".repeat(1024),
+            ..Default::default()
+        });
+        let params = minimal_params(vec![c]);
+        let result = crate::interactions::can_split_under_limit(&params, 100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn can_split_system_instruction_unsplittable_word() {
+        // system_instruction with one giant word → unsplittable
+        let giant_word = "A".repeat(5000);
+        let params = CreateModelInteractionParams {
+            system_instruction: Some(giant_word),
+            ..minimal_params(vec![])
+        };
+        let result = crate::interactions::can_split_under_limit(&params, 200);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn can_split_all_splittable_ok() {
+        let c = Content::TextContent(TextContent {
+            text: "hello".into(),
+            ..Default::default()
+        });
+        let params = CreateModelInteractionParams {
+            system_instruction: Some("You are a helpful assistant. Each sentence can be split.".into()),
+            ..minimal_params(vec![c])
+        };
+        let result = crate::interactions::can_split_under_limit(&params, 100);
+        assert!(result.is_ok());
+    }
+
     // --- split_text_for_limit: more edge cases ---
 
     #[test]
@@ -2260,6 +2347,58 @@ If you don't know the answer, say so honestly.";
             req2.headers().get("x-request-id").unwrap(),
             "trace-12345",
             "non-auth headers must be forwarded when api_key is None"
+        );
+    }
+
+    // ── build_interactions_headers_map ──────────────────────
+
+    #[test]
+    fn build_interactions_headers_map_with_api_key() {
+        let map =
+            build_interactions_headers_map(Some("gemini-key-123"), &request_headers_with_auth());
+        // API key sets x-goog-api-key
+        assert_eq!(
+            map.get("x-goog-api-key").unwrap().to_str().unwrap(),
+            "gemini-key-123"
+        );
+        // Client auth stripped
+        assert!(map.get("authorization").is_none());
+        assert!(map.get("x-api-key").is_none());
+        // Non-auth forwarded
+        assert_eq!(
+            map.get("x-request-id").unwrap().to_str().unwrap(),
+            "trace-12345"
+        );
+        assert_eq!(
+            map.get("x-custom-trace").unwrap().to_str().unwrap(),
+            "custom-value"
+        );
+        // Standard headers present
+        assert_eq!(
+            map.get("content-type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+        assert!(map.get("Api-Revision").is_some());
+    }
+
+    #[test]
+    fn build_interactions_headers_map_without_api_key() {
+        let map = build_interactions_headers_map(None, &request_headers_with_auth());
+        // Client auth forwarded
+        assert_eq!(
+            map.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer client-sk-ant-key"
+        );
+        assert_eq!(
+            map.get("x-api-key").unwrap().to_str().unwrap(),
+            "client-api-key"
+        );
+        // No x-goog-api-key
+        assert!(map.get("x-goog-api-key").is_none());
+        // Non-auth forwarded
+        assert_eq!(
+            map.get("x-request-id").unwrap().to_str().unwrap(),
+            "trace-12345"
         );
     }
 

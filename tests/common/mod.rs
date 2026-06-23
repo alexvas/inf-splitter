@@ -261,6 +261,29 @@ pub async fn wait_for_file(path: &std::path::Path) -> Vec<String> {
     .await
 }
 
+/// Poll a file until it exists and has non-empty content, with a timeout.
+/// Does NOT remove the file — caller must clean up.
+pub async fn read_file_no_remove(path: &std::path::Path) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let content = loop {
+        if let Ok(c) = std::fs::read_to_string(path) {
+            if !c.trim().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if let Ok(c2) = std::fs::read_to_string(path) {
+                    if c2.len() == c.len() {
+                        break c2;
+                    }
+                }
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("timed out waiting for diagnostics file: {}", path.display());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    content.trim().lines().map(String::from).collect()
+}
+
 /// Poll a diagnostics dump file until it contains at least one ingress
 /// line (stage="ingress"). Removes the file before returning its lines.
 pub async fn wait_for_ingress_dump(path: &std::path::Path) -> Vec<String> {

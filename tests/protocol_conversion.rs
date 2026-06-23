@@ -2115,7 +2115,7 @@ models = "test-model"
 /// the current file exceeds the limit.
 #[tokio::test]
 async fn diagnostics_file_rotates_on_max_file_size() {
-    use common::wait_for_file;
+    use common::read_file_no_remove;
     use std::fs;
 
     let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
@@ -2166,7 +2166,7 @@ max_file_size = "1k"
         let _ = response.text().await;
     }
 
-    let lines = wait_for_file(&tmp).await;
+    let lines = read_file_no_remove(&tmp).await;
 
     // Verify the current file has some content (latest dumps)
     assert!(!lines.is_empty(), "current file should have content");
@@ -2209,7 +2209,7 @@ max_file_size = "1k"
 /// and the original uncompressed file must be removed.
 #[tokio::test]
 async fn diagnostics_rotation_compresses_with_7z() {
-    use common::wait_for_file;
+    use common::read_file_no_remove;
     use std::fs;
 
     let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
@@ -2261,7 +2261,7 @@ compression = "7z"
         let _ = response.text().await;
     }
 
-    let lines = wait_for_file(&tmp).await;
+    let lines = read_file_no_remove(&tmp).await;
     assert!(!lines.is_empty(), "current file should have content");
 
     // Wait a bit for background compression to finish
@@ -2308,7 +2308,7 @@ compression = "7z"
 /// and the original uncompressed file must be removed.
 #[tokio::test]
 async fn diagnostics_rotation_compresses_with_bz2() {
-    use common::wait_for_file;
+    use common::read_file_no_remove;
     use std::fs;
 
     let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
@@ -2359,7 +2359,7 @@ compression = "bz2"
         let _ = response.text().await;
     }
 
-    let lines = wait_for_file(&tmp).await;
+    let lines = read_file_no_remove(&tmp).await;
     assert!(!lines.is_empty(), "current file should have content");
 
     // Wait for background compression

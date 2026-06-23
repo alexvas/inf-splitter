@@ -86,6 +86,10 @@ impl InteractionsHandler {
             .unwrap_or("?")
             .to_string();
 
+        let guard =
+            crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, &model);
+        guard.ingress_dump(body, request_headers);
+
         // Extract session ID
         let session_id = self.resolve_session_id(request_headers, &body_val);
 
@@ -106,7 +110,7 @@ impl InteractionsHandler {
         // Execute control action if any
         if let Some(action) = &control_result.action {
             return self
-                .handle_control_action(action, &session_id, route, Protocol::Anthropic)
+                .handle_control_action(action, &session_id, route, Protocol::Anthropic, guard)
                 .await;
         }
 
@@ -171,7 +175,19 @@ impl InteractionsHandler {
             let size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(0);
             if size > limit {
                 if let Err(msg) = interactions_lib::can_split_under_limit(&params, limit) {
-                    return Err(AppError::BadRequest(msg));
+                    guard.finish_with_error(
+                        400,
+                        0,
+                        body.len(),
+                        None,
+                        "anthropic->interactions",
+                        "anthropic->interactions",
+                        stream,
+                        msg.clone(),
+                    );
+                    return Err(AppError::BadRequest(format!(
+                        "Request cannot be split under proxy limit (see diagnostics for details)"
+                    )));
                 }
                 return self
                     .handle_split_send(
@@ -189,6 +205,7 @@ impl InteractionsHandler {
                         "anthropic->interactions",
                         request_headers,
                         Protocol::Anthropic,
+                        guard,
                     )
                     .await;
             }
@@ -207,6 +224,7 @@ impl InteractionsHandler {
             "anthropic->interactions",
             Protocol::Anthropic,
             request_headers,
+            guard,
         )
         .await
     }
@@ -227,6 +245,10 @@ impl InteractionsHandler {
             .unwrap_or("?")
             .to_string();
 
+        let guard =
+            crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, &model);
+        guard.ingress_dump(body, request_headers);
+
         let session_id = self.resolve_session_id(request_headers, &body_val);
 
         // Process control messages
@@ -245,7 +267,7 @@ impl InteractionsHandler {
 
         if let Some(action) = &control_result.action {
             return self
-                .handle_control_action(action, &session_id, route, Protocol::OpenAi)
+                .handle_control_action(action, &session_id, route, Protocol::OpenAi, guard)
                 .await;
         }
 
@@ -304,7 +326,19 @@ impl InteractionsHandler {
             let size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(0);
             if size > limit {
                 if let Err(msg) = interactions_lib::can_split_under_limit(&params, limit) {
-                    return Err(AppError::BadRequest(msg));
+                    guard.finish_with_error(
+                        400,
+                        0,
+                        body.len(),
+                        None,
+                        "openai->interactions",
+                        "openai->interactions",
+                        stream,
+                        msg.clone(),
+                    );
+                    return Err(AppError::BadRequest(format!(
+                        "Request cannot be split under proxy limit (see diagnostics for details)"
+                    )));
                 }
                 return self
                     .handle_split_send(
@@ -322,6 +356,7 @@ impl InteractionsHandler {
                         "openai->interactions",
                         request_headers,
                         Protocol::OpenAi,
+                        guard,
                     )
                     .await;
             }
@@ -340,6 +375,7 @@ impl InteractionsHandler {
             "openai->interactions",
             Protocol::OpenAi,
             request_headers,
+            guard,
         )
         .await
     }
@@ -360,11 +396,8 @@ impl InteractionsHandler {
         direction: &str,
         ingress: Protocol,
         request_headers: &HeaderMap,
+        guard: crate::diagnostics::RequestDiagnostics,
     ) -> Result<Response, AppError> {
-        let guard =
-            crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, model);
-
-        guard.ingress_dump(ingress_body, request_headers);
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
         guard.egress_dump(egress_body, &egress_headers);
@@ -712,13 +745,10 @@ impl InteractionsHandler {
         direction: &str,
         request_headers: &HeaderMap,
         ingress: Protocol,
+        guard: crate::diagnostics::RequestDiagnostics,
     ) -> Result<Response, AppError> {
-        let guard =
-            crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, model);
         let start = std::time::Instant::now();
         let mut total_response_bytes: usize = 0;
-
-        guard.ingress_dump(ingress_body, request_headers);
 
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
@@ -1091,6 +1121,7 @@ impl InteractionsHandler {
         session_id: &str,
         route: &RouteTarget,
         ingress: Protocol,
+        guard: crate::diagnostics::RequestDiagnostics,
     ) -> Result<Response, AppError> {
         match action {
             ControlAction::CleanAll => {
@@ -1133,6 +1164,15 @@ impl InteractionsHandler {
                         errors.join("; ")
                     )
                 };
+                guard.finish(
+                    200,
+                    0,
+                    0,
+                    None,
+                    "control-action",
+                    "clean-all",
+                    false,
+                );
                 Ok(Self::ok_with_session_header(
                     ingress,
                     session_id,
@@ -1145,6 +1185,15 @@ impl InteractionsHandler {
                     .await
                     .map_err(|e| AppError::Internal(format!("session extend failed: {e}")))?;
                 let msg = format!("Session {} lifetime extended to UTC {}", session_id, until);
+                guard.finish(
+                    200,
+                    0,
+                    0,
+                    None,
+                    "control-action",
+                    "extend-lifetime",
+                    false,
+                );
                 Ok(Self::ok_with_session_header(
                     ingress,
                     session_id,
@@ -1943,6 +1992,53 @@ If you don't know the answer, say so honestly.";
         };
         let result = crate::interactions::can_split_under_limit(&params, 100);
         assert!(result.is_ok());
+    }
+
+    /// Verify that when tools from a real Claude Code dump exceed the limit,
+    /// the error message contains a per-tool size breakdown.
+    #[test]
+    fn can_split_reports_per_tool_breakdown_from_dump() {
+        let tools_json: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../tests/data/tools_from_dump.json")).unwrap();
+
+        let anthropic_body = serde_json::json!({
+            "model": "deepseek-v4-pro",
+            "messages": [{"role": "user", "content": "ping"}],
+            "tools": tools_json,
+        });
+
+        let (tools, _tool_choice) =
+            crate::interactions::extract_anthropic_tools(&anthropic_body);
+        let tools = tools.expect("tools should be extracted from dump");
+
+        let params = CreateModelInteractionParams {
+            model: "deepseek-v4-pro".into(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            tools: Some(tools),
+            ..Default::default()
+        };
+
+        let limit = 100 * 1024; // 100 KiB
+        let result = crate::interactions::can_split_under_limit(&params, limit);
+
+        let err = result.expect_err("envelope with 105 tools must exceed 100 KiB limit");
+        assert!(
+            err.contains("Non-splittable request fields"),
+            "error should mention non-splittable fields: {err}"
+        );
+        assert!(
+            err.contains("Per-tool size breakdown:"),
+            "error should contain per-tool breakdown: {err}"
+        );
+        // Spot-check a few known tools
+        assert!(err.contains("Agent"), "should list Agent tool");
+        assert!(err.contains("Bash"), "should list Bash tool");
+        assert!(err.contains("Read"), "should list Read tool");
+        // Verify human-readable sizes are present
+        assert!(err.contains("KiB"), "should use KiB for large tools");
+        assert!(err.contains("description:"), "should show description size");
+        assert!(err.contains("parameters:"), "should show parameters size");
     }
 
     // --- split_text_for_limit: more edge cases ---

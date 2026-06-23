@@ -211,6 +211,14 @@ pub fn can_split_under_limit(
         _ => vec![],
     };
 
+    let tool_info = || {
+        params
+            .tools
+            .as_deref()
+            .map(|tools| tool_size_breakdown(tools))
+            .unwrap_or_default()
+    };
+
     // 1. Minimal envelope (no input, no system_instruction)
     let envelope = CreateModelInteractionParams {
         model: params.model.clone(),
@@ -224,8 +232,31 @@ pub fn can_split_under_limit(
     };
     let envelope_size = serde_json::to_vec(&envelope).map(|v| v.len()).unwrap_or(0);
     if envelope_size >= limit {
+        let mut parts: Vec<String> = Vec::new();
+
+        let mut measure = |label: &str, val: &serde_json::Value| {
+            let size = serde_json::to_vec(val).map(|v| v.len()).unwrap_or(0);
+            parts.push(format!("  {label}: {} ({})", size, format_bytes(size)));
+        };
+
+        measure("model", &serde_json::json!(params.model));
+        measure("stream", &serde_json::json!(params.stream));
+        if let Some(ref gc) = params.generation_config {
+            measure("generation_config", &serde_json::json!(gc));
+        }
+        if let Some(ref tools) = params.tools {
+            measure("tools", &serde_json::json!(tools));
+        }
+        if let Some(ref prev_id) = params.previous_interaction_id {
+            measure("previous_interaction_id", &serde_json::json!(prev_id));
+        }
+
+        let ti = tool_info();
         return Err(format!(
-            "Non-splittable request fields ({envelope_size} bytes) exceed proxy limit ({limit} bytes)"
+            "Non-splittable request fields ({envelope_size} bytes / {}) exceed proxy limit ({}):\n{}\n{ti}",
+            format_bytes(envelope_size),
+            format_bytes(limit),
+            parts.join("\n"),
         ));
     }
 
@@ -236,8 +267,10 @@ pub fn can_split_under_limit(
             ..envelope.clone()
         };
         if serde_json::to_vec(&single).map(|v| v.len()).unwrap_or(0) > limit {
+            let ti = tool_info();
             return Err(format!(
-                "Single content element too large for proxy limit ({limit} bytes)"
+                "Single content element too large for proxy limit ({}):\n{ti}",
+                format_bytes(limit),
             ));
         }
     }
@@ -258,8 +291,10 @@ pub fn can_split_under_limit(
                     ..envelope.clone()
                 };
                 if serde_json::to_vec(&word_body).map(|v| v.len()).unwrap_or(0) > limit {
+                    let ti = tool_info();
                     return Err(format!(
-                        "System instruction contains unsplittable word exceeding proxy limit ({limit} bytes)"
+                        "System instruction contains unsplittable word exceeding proxy limit ({}):\n{ti}",
+                        format_bytes(limit),
                     ));
                 }
             }
@@ -267,6 +302,60 @@ pub fn can_split_under_limit(
     }
 
     Ok(())
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn tool_size_breakdown(tools: &[Tool]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = vec!["Per-tool size breakdown:".to_string()];
+    for tool in tools {
+        match tool {
+            Tool::Function(f) => {
+                let name = f.name.as_deref().unwrap_or("(unnamed)");
+                let total = serde_json::to_vec(tool).map(|v| v.len()).unwrap_or(0);
+                let desc_bytes = f.description.as_ref().map(|d| d.len()).unwrap_or(0);
+                let params_bytes = f
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| serde_json::to_vec(p).ok())
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                lines.push(format!(
+                    "  {name}: {} (description: {}, parameters: {})",
+                    format_bytes(total),
+                    format_bytes(desc_bytes),
+                    format_bytes(params_bytes),
+                ));
+            }
+            other => {
+                let type_name = match other {
+                    Tool::CodeExecution(_) => "code_execution",
+                    Tool::UrlContext(_) => "url_context",
+                    Tool::ComputerUse(_) => "computer_use",
+                    Tool::McpServer(_) => "mcp_server",
+                    Tool::GoogleSearch(_) => "google_search",
+                    Tool::FileSearch(_) => "file_search",
+                    Tool::GoogleMaps(_) => "google_maps",
+                    Tool::Retrieval(_) => "retrieval",
+                    Tool::Function(_) => unreachable!(),
+                };
+                let total = serde_json::to_vec(other).map(|v| v.len()).unwrap_or(0);
+                lines.push(format!("  ({type_name}): {}", format_bytes(total)));
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 /// Extract function tool calls from an Interaction response.

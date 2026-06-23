@@ -406,7 +406,24 @@ impl InteractionsHandler {
         );
 
         let start = std::time::Instant::now();
-        let upstream = builder.body(egress_body.to_vec()).send().await?;
+        let upstream = match builder.body(egress_body.to_vec()).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let app_err = AppError::from(e);
+                guard.finish_with_error(
+                    502,
+                    duration_ms,
+                    ingress_body.len(),
+                    None,
+                    upstream_label,
+                    direction,
+                    stream,
+                    format!("{app_err}"),
+                );
+                return Err(app_err);
+            }
+        };
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
@@ -450,13 +467,59 @@ impl InteractionsHandler {
         }
 
         let response_headers = response_headers_to_pairs(upstream.headers());
-        let response_body_bytes = upstream.bytes().await?;
-        let validated = crate::validate_upstream_body(response_body_bytes, guard.request_id())?;
+        let response_body_bytes = match upstream.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let err_msg = format!("failed to read upstream response: {e}");
+                guard.finish_with_error(
+                    502,
+                    duration_ms,
+                    ingress_body.len(),
+                    Some(0),
+                    upstream_label,
+                    direction,
+                    stream,
+                    err_msg.clone(),
+                );
+                return Err(AppError::Upstream(err_msg));
+            }
+        };
+        let validated = match crate::validate_upstream_body(response_body_bytes, guard.request_id())
+        {
+            Ok(v) => v,
+            Err(e) => {
+                guard.finish_with_error(
+                    502,
+                    duration_ms,
+                    ingress_body.len(),
+                    Some(0),
+                    upstream_label,
+                    direction,
+                    stream,
+                    format!("{e}"),
+                );
+                return Err(e);
+            }
+        };
         guard.response_dump(validated.dump, 200, false, response_headers);
         let response_body = validated.text;
-        let interaction: Interaction = serde_json::from_str(&response_body).map_err(|e| {
-            AppError::Upstream(format!("failed to parse interaction response: {e}"))
-        })?;
+        let interaction: Interaction = match serde_json::from_str(&response_body) {
+            Ok(inter) => inter,
+            Err(e) => {
+                let err = AppError::Upstream(format!("failed to parse interaction response: {e}"));
+                guard.finish_with_error(
+                    502,
+                    duration_ms,
+                    ingress_body.len(),
+                    Some(response_body.len()),
+                    upstream_label,
+                    direction,
+                    stream,
+                    format!("{err}"),
+                );
+                return Err(err);
+            }
+        };
 
         // Update session
         let interaction_id = interaction.id.clone();
@@ -466,8 +529,23 @@ impl InteractionsHandler {
             .await;
 
         // Translate response back to ingress protocol
-        let resp = interactions_lib::build_response_from_interaction(&interaction, model, ingress)
-            .map_err(AppError::Internal)?;
+        let resp =
+            match interactions_lib::build_response_from_interaction(&interaction, model, ingress) {
+                Ok(r) => r,
+                Err(e) => {
+                    guard.finish_with_error(
+                        500,
+                        duration_ms,
+                        ingress_body.len(),
+                        Some(response_body.len()),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e.clone(),
+                    );
+                    return Err(AppError::Internal(e));
+                }
+            };
 
         guard.finish(
             200,
@@ -768,13 +846,27 @@ impl InteractionsHandler {
         };
 
         // Use the new full-chunk packer
-        let chunks = interactions_lib::pack_content_into_chunks(
+        let chunks = match interactions_lib::pack_content_into_chunks(
             &first_envelope,
             &subsequent_envelope,
             contents,
             limit,
-        )
-        .map_err(AppError::BadRequest)?;
+        ) {
+            Ok(chunks) => chunks,
+            Err(msg) => {
+                guard.finish_with_error(
+                    400,
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    None,
+                    upstream_label,
+                    direction,
+                    stream,
+                    msg.clone(),
+                );
+                return Err(AppError::BadRequest(msg));
+            }
+        };
 
         // If system_instruction + envelope > limit, split system_instruction first
         if let Some(ref sys) = system_instruction {
@@ -954,7 +1046,22 @@ impl InteractionsHandler {
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
         // Split system_instruction on natural boundaries
-        let sys_parts = split_text_for_limit(sys, limit).map_err(AppError::BadRequest)?;
+        let sys_parts = match split_text_for_limit(sys, limit) {
+            Ok(parts) => parts,
+            Err(msg) => {
+                guard.finish_with_error(
+                    400,
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    None,
+                    upstream_label,
+                    direction,
+                    stream,
+                    msg.clone(),
+                );
+                return Err(AppError::BadRequest(msg));
+            }
+        };
         let mut last_id: Option<String> = None;
         let mut last_interaction: Option<Interaction> = None;
         let mut current_prev: Option<String> = None;

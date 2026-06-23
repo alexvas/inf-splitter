@@ -418,12 +418,13 @@ impl InteractionsHandler {
 
         if !upstream.status().is_success() {
             let status = upstream.status();
+            let response_headers = response_headers_to_pairs(upstream.headers());
             let error_body = upstream.text().await.unwrap_or_default();
             guard.response_dump(
                 crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                 status.as_u16(),
                 true,
-                vec![],
+                response_headers,
             );
             guard.finish_with_error(
                 status.as_u16(),
@@ -461,9 +462,10 @@ impl InteractionsHandler {
                 .await;
         }
 
+        let response_headers = response_headers_to_pairs(upstream.headers());
         let response_body_bytes = upstream.bytes().await?;
         let validated = crate::validate_upstream_body(response_body_bytes, guard.request_id())?;
-        guard.response_dump(validated.dump, 200, false, vec![]);
+        guard.response_dump(validated.dump, 200, false, response_headers);
         let response_body = validated.text;
         let interaction: Interaction = serde_json::from_str(&response_body).map_err(|e| {
             AppError::Upstream(format!("failed to parse interaction response: {e}"))
@@ -508,6 +510,7 @@ impl InteractionsHandler {
     ) -> Result<Response, AppError> {
         let request_size = guard.ingress_size();
         let request_id = guard.request_id().to_string();
+        let response_headers = response_headers_to_pairs(upstream.headers());
         let mut byte_stream = upstream.bytes_stream();
         let mut buffer = String::new();
         let mut interaction_id = String::new();
@@ -707,7 +710,7 @@ impl InteractionsHandler {
                     "non-utf8 streaming interactions upstream response"
                 );
             }
-            guard.response_dump_streaming(dump_body, 200);
+            guard.response_dump_streaming(dump_body, 200, response_headers);
 
             let duration_ms = start.elapsed().as_millis() as u64;
             guard.finish(
@@ -821,12 +824,13 @@ impl InteractionsHandler {
             let upstream = builder.body(chunk_body).send().await?;
             if !upstream.status().is_success() {
                 let status = upstream.status();
+                let response_headers = response_headers_to_pairs(upstream.headers());
                 let error_body = upstream.text().await.unwrap_or_default();
                 guard.response_dump(
                     crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                     status.as_u16(),
                     true,
-                    vec![],
+                    response_headers,
                 );
                 guard.finish_with_error(
                     status.as_u16(),
@@ -847,9 +851,10 @@ impl InteractionsHandler {
                     .body(Body::from(body))
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
+            let response_headers = response_headers_to_pairs(upstream.headers());
             let response_bytes = upstream.bytes().await?;
             let validated = crate::validate_upstream_body(response_bytes, guard.request_id())?;
-            guard.response_dump(validated.dump, 200, false, vec![]);
+            guard.response_dump(validated.dump, 200, false, response_headers);
             let response_text = validated.text;
             let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
                 AppError::Upstream(format!("failed to parse split interaction: {e}"))
@@ -941,13 +946,14 @@ impl InteractionsHandler {
             );
             let upstream = builder.body(chunk_body).send().await?;
             let upstream_status = upstream.status();
+            let response_headers = response_headers_to_pairs(upstream.headers());
             if !upstream_status.is_success() {
                 let error_body = upstream.text().await.unwrap_or_default();
                 guard.response_dump(
                     crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                     upstream_status.as_u16(),
                     true,
-                    vec![],
+                    response_headers,
                 );
                 guard.finish_with_error(
                     upstream_status.as_u16(),
@@ -972,7 +978,7 @@ impl InteractionsHandler {
             let response_bytes = upstream.bytes().await?;
             total_response_bytes += response_bytes.len();
             let validated = crate::validate_upstream_body(response_bytes, guard.request_id())?;
-            guard.response_dump(validated.dump, 200, false, vec![]);
+            guard.response_dump(validated.dump, 200, false, response_headers);
             let response_text = validated.text;
             if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
                 current_prev = Some(interaction.id.clone());
@@ -1003,13 +1009,14 @@ impl InteractionsHandler {
                 );
                 let upstream = builder.body(chunk_body).send().await?;
                 let upstream_status = upstream.status();
+                let response_headers = response_headers_to_pairs(upstream.headers());
                 if !upstream_status.is_success() {
                     let error_body = upstream.text().await.unwrap_or_default();
                     guard.response_dump(
                         crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                         upstream_status.as_u16(),
                         true,
-                        vec![],
+                        response_headers,
                     );
                     guard.finish_with_error(
                         upstream_status.as_u16(),
@@ -1035,7 +1042,7 @@ impl InteractionsHandler {
                 let response_bytes = upstream.bytes().await?;
                 total_response_bytes += response_bytes.len();
                 let validated = crate::validate_upstream_body(response_bytes, guard.request_id())?;
-                guard.response_dump(validated.dump, 200, false, vec![]);
+                guard.response_dump(validated.dump, 200, false, response_headers);
                 let response_text = validated.text;
                 if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
                     current_prev = Some(interaction.id.clone());
@@ -1127,10 +1134,23 @@ impl InteractionsHandler {
     ) -> Result<Response, AppError> {
         match action {
             ControlAction::CleanAll => {
-                let all =
-                    self.session_store.remove_all().await.map_err(|e| {
-                        AppError::Internal(format!("session clean-all failed: {e}"))
-                    })?;
+                let all = match self.session_store.remove_all().await {
+                    Ok(all) => all,
+                    Err(e) => {
+                        let error = format!("session clean-all failed: {e}");
+                        guard.finish_with_error(
+                            500,
+                            0,
+                            0,
+                            None,
+                            "control-action",
+                            "clean-all",
+                            false,
+                            error.clone(),
+                        );
+                        return Err(AppError::Internal(error));
+                    }
+                };
                 let mut cancelled = 0usize;
                 let mut deleted = 0usize;
                 let mut errors: Vec<String> = Vec::new();
@@ -1174,10 +1194,23 @@ impl InteractionsHandler {
                 ))
             }
             ControlAction::ExtendLifetime(until) => {
-                self.session_store
-                    .extend_lifetime(session_id, *until)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("session extend failed: {e}")))?;
+                match self.session_store.extend_lifetime(session_id, *until).await {
+                    Ok(()) => (),
+                    Err(e) => {
+                        let error = format!("session extend failed: {e}");
+                        guard.finish_with_error(
+                            500,
+                            0,
+                            0,
+                            None,
+                            "control-action",
+                            "extend-lifetime",
+                            false,
+                            error.clone(),
+                        );
+                        return Err(AppError::Internal(error));
+                    }
+                };
                 let msg = format!("Session {} lifetime extended to UTC {}", session_id, until);
                 guard.finish(200, 0, 0, None, "control-action", "extend-lifetime", false);
                 Ok(Self::ok_with_session_header(
@@ -1333,6 +1366,18 @@ fn build_fallback_response(
 
 /// Build a `HeaderMap` with the same logic as `build_interactions_headers`
 /// but returns headers directly instead of applying them to a `RequestBuilder`.
+fn response_headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(n, v)| {
+            (
+                n.as_str().to_string(),
+                v.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
 fn build_interactions_headers_map(api_key: Option<&str>, request_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(

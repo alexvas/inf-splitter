@@ -721,9 +721,15 @@ impl RequestDiagnostics {
     }
 
     /// Record a streaming response dump. Deferred — flushed in `finish`/`finish_with_error`.
-    pub fn response_dump_streaming(&self, body: impl Into<DumpBody>, status: u16) {
+    pub fn response_dump_streaming(
+        &self,
+        body: impl Into<DumpBody>,
+        status: u16,
+        headers: Vec<(String, String)>,
+    ) {
+        let header_pairs = mask_header_values(headers);
         *self.response_dump_pending.lock().unwrap() =
-            Some((body.into(), vec![], ts_string(), Some(status)));
+            Some((body.into(), header_pairs, ts_string(), Some(status)));
     }
 
     /// Record success stats and mark the guard as finished. Idempotent.

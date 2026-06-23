@@ -30,11 +30,22 @@ The `.deb` package installs:
 - Binary: `/usr/bin/inf-splitter`
 - Config: `/etc/inf-splitter/inf-splitter.toml`
 - Env template: `/etc/inf-splitter/environment`
+- Log directory: `/var/log/inf-splitter` (owned by `inf-splitter:inf-splitter`)
+- Session directory: `/var/lib/inf-splitter` (owned by `inf-splitter:inf-splitter`)
 - systemd unit: enabled and started on install
+
+The systemd unit allows writes to `/var/log/inf-splitter` and `/var/lib/inf-splitter` via `ReadWritePaths` so the service can persist session state at runtime under `ProtectSystem=strict`.
 
 ### Scenario: Fresh install
 - GIVEN `dpkg -i inf-splitter_*.deb` is run
 - THEN the service is installed, enabled, and running
+- AND `/var/lib/inf-splitter/` exists with owner `inf-splitter:inf-splitter`
+
+### Scenario: Session directory survives upgrade
+- GIVEN `dpkg -i inf-splitter_*.deb` is run on a system where `/var/lib/inf-splitter/` already exists
+- WHEN postinst executes
+- THEN `mkdir -p` is a no-op
+- AND existing session data is preserved
 
 ### Scenario: Post-install config
 - GIVEN the service is installed

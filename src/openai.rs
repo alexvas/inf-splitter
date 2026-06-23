@@ -133,12 +133,21 @@ impl OpenAiHandler {
         if is_err {
             let status = upstream.status();
             let response_headers = upstream.headers().clone();
+            let response_header_pairs: Vec<(String, String)> = response_headers
+                .iter()
+                .map(|(n, v)| {
+                    (
+                        n.as_str().to_string(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
             let error_body = upstream.text().await.unwrap_or_default();
             guard.response_dump(
                 crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                 status.as_u16(),
                 true,
-                vec![],
+                response_header_pairs,
             );
             guard.finish_with_error(
                 status.as_u16(),

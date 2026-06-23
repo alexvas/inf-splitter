@@ -134,7 +134,7 @@ This covers Router direct calls, Relay/DiagnosticStream, and all three handlers.
 - WHEN the dump is recorded
 - THEN these headers appear with their original values unchanged
 
-## Requirement: Egress Dump Uses Actual Upstream Headers (All Handlers)
+## Requirement: Egress and Response Dumps Use Actual Upstream Headers (All Handlers)
 
 All `egress_dump` calls in `interactions_handler.rs`, `openai.rs`, and
 `anthropic.rs` receive the actual headers sent to the upstream (after
@@ -143,6 +143,12 @@ not the ingress `request_headers`. Two helpers enable this:
 
 - `auth::forward_request_headers_map(api_key, request_headers) -> HeaderMap`
 - `interactions_handler::build_interactions_headers_map(api_key, request_headers) -> HeaderMap`
+
+All `response_dump` and `response_dump_streaming` calls in all handlers
+receive the actual upstream response headers from `reqwest::Response::headers()`
+instead of `vec![]`. The `response_dump_streaming` signature accepts a `headers:
+Vec<(String, String)>` parameter. A shared helper `response_headers_to_pairs`
+converts `HeaderMap` to `Vec<(String, String)>` in `interactions_handler.rs`.
 
 ### Scenario: Interactions handler with API key
 - GIVEN `api_key = "some-key"` in config
@@ -153,6 +159,36 @@ not the ingress `request_headers`. Two helpers enable this:
 - GIVEN `api_key = "some-key"` in config
 - WHEN a passthrough/conversion request is sent
 - THEN the egress dump shows `x-api-key: ***` and `authorization: ***` (masked)
+
+### Scenario: Non-streaming response dump contains upstream headers
+- GIVEN an interactions request completes successfully
+- AND the upstream returns headers `content-type: application/json` and `x-request-id: abc123`
+- WHEN the response dump is recorded
+- THEN `headers` in the dump entry contains both header pairs (non-empty array)
+- AND sensitive headers are masked per existing masking rules
+
+### Scenario: Streaming response dump contains upstream headers
+- GIVEN an interactions streaming request completes
+- AND the upstream returns response headers
+- WHEN `response_dump_streaming` is called from the spawned task
+- THEN `headers` in the dump entry contains the upstream response headers
+
+### Scenario: Error response dump contains upstream headers
+- GIVEN the upstream returns a 429 with header `retry-after: 30`
+- WHEN the error is handled and a response dump is recorded
+- THEN `headers` in the dump entry contains `retry-after: 30`
+
+### Scenario: Anthropic handler error path includes response headers
+- GIVEN an Anthropic passthrough/conversion request fails with upstream error
+- AND the upstream response has headers
+- WHEN the error path records a response dump
+- THEN `headers` contains the upstream response headers (not `[]`)
+
+### Scenario: OpenAI handler error path includes response headers
+- GIVEN an OpenAI passthrough/conversion request fails with upstream error
+- AND the upstream response has headers
+- WHEN the error path records a response dump
+- THEN `headers` contains the upstream response headers (not `[]`)
 
 ## Requirement: proxy_limit Size Check Uses Full Request Body
 
@@ -390,6 +426,22 @@ pub struct RequestDiagnostics {
 - WHEN the request completes with status 200
 - THEN ingress and egress request dumps have `status: 200`
 
+### Scenario: Control action clean-all fails
+- GIVEN `handle_control_action` is called with `ControlAction::CleanAll`
+- AND `session_store.remove_all()` returns an error
+- WHEN the error propagates
+- THEN `guard.finish_with_error()` is called BEFORE the error return
+- AND a stats entry is recorded with the error message
+- AND no "diagnostics guard dropped without finish" error is logged
+
+### Scenario: Control action extend-lifetime fails
+- GIVEN `handle_control_action` is called with `ControlAction::ExtendLifetime(ts)`
+- AND `session_store.extend_lifetime()` returns an error
+- WHEN the error propagates
+- THEN `guard.finish_with_error()` is called BEFORE the error return
+- AND a stats entry is recorded with the error message
+- AND no "diagnostics guard dropped without finish" error is logged
+
 ### Scenario: Missing detail fields omitted from stats
 - GIVEN a passthrough request body with no `messages` field
 - WHEN stats are recorded
@@ -617,3 +669,31 @@ A helper function in `src/sse.rs` that converts a raw SSE byte buffer into a `Du
 - THEN it waits 20ms and re-reads
 - AND if the size grew, continues polling until stable
 - AND returns only when consecutive reads have the same size
+
+## Requirement: Session Store Creates Parent Directory on Save
+
+`SessionStore::save_to_disk` must ensure the parent directory exists before writing the temporary file. It uses `std::fs::create_dir_all` on the parent of `self.path` before `fs::write`.
+
+### Scenario: First run with missing directory
+- GIVEN the session file path is `/var/lib/inf-splitter/interactions-sessions.toml`
+- AND the directory `/var/lib/inf-splitter/` does not exist
+- WHEN `save_to_disk` is called
+- THEN `create_dir_all("/var/lib/inf-splitter/")` creates the directory
+- AND the TOML file is written successfully
+
+### Scenario: Directory already exists
+- GIVEN the parent directory already exists
+- WHEN `save_to_disk` is called
+- THEN `create_dir_all` is a no-op
+- AND the file is written normally
+
+## Requirement: Session Update Errors Are Logged
+
+`SessionStore::update` logs `save_to_disk` errors internally via `tracing::warn!` instead of silently discarding them. The method signature stays `Result<(), String>` for callers that do inspect the error, but the warning is already logged by the time the `Result` propagates.
+
+### Scenario: update fails to persist
+- GIVEN `session_store.update()` is called
+- AND `save_to_disk` fails (e.g., disk full)
+- WHEN the error occurs
+- THEN `tracing::warn!` logs the session ID and error details inside `update`
+- AND the `Result::Err` is still returned for callers that want to handle it

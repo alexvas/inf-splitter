@@ -70,6 +70,9 @@ impl SessionStore {
             .map_err(|e| format!("failed to serialize sessions: {e}"))?;
         // Atomic write: write to temp file, then rename
         let tmp = self.path.with_extension("tmp");
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         fs::write(&tmp, toml_str).map_err(|e| e.to_string())?;
         fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
         Ok(())
@@ -114,7 +117,9 @@ impl SessionStore {
         state.expires_at_utc = now + DEFAULT_SESSION_TTL_SECS;
         state.pending = pending;
         drop(sessions);
-        self.save_to_disk().await
+        self.save_to_disk().await.inspect_err(|e| {
+            tracing::warn!(session_id = %session_id, error = %e, "session update: save_to_disk failed");
+        })
     }
 
     /// Extend session lifetime to a specific UTC timestamp.
@@ -430,5 +435,27 @@ mod tests {
 
         let expired = store.expired_sessions().await;
         assert_eq!(expired.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn save_to_disk_creates_missing_parent_directory() {
+        let dir = std::env::temp_dir().join(format!("test-sessions-subdir-{}", std::process::id()));
+        let path = dir.join("sub").join("deep").join("sessions.toml");
+        // Clean up after test
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = SessionStore::new(path.clone());
+        store.get_or_create("s1").await;
+        store.update("s1", "int-1".into(), 1, false).await.unwrap();
+
+        assert!(path.exists(), "session file should exist at {:?}", path);
+
+        // Verify content survived
+        let store2 = SessionStore::new(path.clone());
+        let loaded = store2.load_from_disk().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, "s1");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

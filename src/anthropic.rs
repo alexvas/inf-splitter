@@ -93,7 +93,7 @@ impl AnthropicHandler {
                 crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
                 status.as_u16(),
                 true,
-                vec![],
+                response_headers.clone(),
             );
             guard.finish_with_error(
                 status.as_u16(),

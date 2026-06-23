@@ -70,6 +70,7 @@ pub fn should_forward_request_header(name: &str) -> bool {
         "host"
             | "connection"
             | "content-length"
+            | "content-type"
             | "transfer-encoding"
             | "te"
             | "trailers"
@@ -100,9 +101,9 @@ mod tests {
         assert!(!should_forward_request_header("Connection"));
         assert!(!should_forward_request_header("Transfer-Encoding"));
         assert!(!should_forward_request_header("Content-Length"));
+        assert!(!should_forward_request_header("Content-Type"));
         assert!(!should_forward_request_header("Keep-Alive"));
         assert!(should_forward_request_header("x-request-id"));
-        assert!(should_forward_request_header("content-type"));
         assert!(should_forward_request_header("accept"));
     }
 
@@ -181,14 +182,14 @@ mod tests {
         );
         // Client auth is stripped
         assert_eq!(result.get_all("authorization").iter().count(), 1);
-        // Non-auth headers forwarded
+        // Non-auth headers forwarded (but content-type is excluded as hop-by-hop)
         assert_eq!(
             result.get("x-request-id").unwrap().to_str().unwrap(),
             "req-1"
         );
-        assert_eq!(
-            result.get("content-type").unwrap().to_str().unwrap(),
-            "application/json"
+        assert!(
+            result.get("content-type").is_none(),
+            "content-type must be excluded from forwarding"
         );
     }
 

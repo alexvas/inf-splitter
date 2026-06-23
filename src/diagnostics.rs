@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::error::AppError;
 use tokio::sync::mpsc;
 
 /// Parsed from the optional `[diagnostics]` TOML section.
@@ -786,7 +788,7 @@ impl RequestDiagnostics {
     /// Record error stats and mark the guard as finished. Idempotent.
     /// Flushes deferred ingress/egress dumps with `is_error: true`.
     #[allow(clippy::too_many_arguments)]
-    pub fn finish_with_error(
+    fn finish_with_error(
         &self,
         status: u16,
         duration_ms: u64,
@@ -860,6 +862,110 @@ impl RequestDiagnostics {
             streaming,
             error_body,
         );
+    }
+
+    /// Finalize the guard and return an `AppError` for `?` propagation.
+    ///
+    /// Guarantees: the guard is finalized BEFORE the error is returned to the
+    /// caller — the "No Unfinalized Guard on Error Return" invariant.
+    ///
+    /// Use the specific variant that matches the HTTP status:
+    /// - `abort_upstream` → network/upstream errors (BAD_GATEWAY)
+    /// - `abort_internal` → serialization, response construction (INTERNAL_SERVER_ERROR)
+    /// - `abort_bad_request` → validation errors (BAD_REQUEST)
+    #[allow(clippy::too_many_arguments)]
+    fn abort_with(
+        &self,
+        status: u16,
+        duration_ms: u64,
+        request_size: usize,
+        upstream: &str,
+        direction: &str,
+        streaming: bool,
+        error: impl ToString,
+        into_app_error: impl FnOnce(String) -> AppError,
+    ) -> AppError {
+        let msg = error.to_string();
+        self.finish_with_error(
+            status,
+            duration_ms,
+            request_size,
+            None,
+            upstream,
+            direction,
+            streaming,
+            msg.clone(),
+        );
+        into_app_error(msg)
+    }
+
+    /// Network/upstream error → HTTP 502 Bad Gateway.
+    #[allow(clippy::too_many_arguments)]
+    pub fn abort_upstream(
+        &self,
+        duration_ms: u64,
+        request_size: usize,
+        upstream: &str,
+        direction: &str,
+        streaming: bool,
+        error: impl ToString,
+    ) -> AppError {
+        self.abort_with(
+            502,
+            duration_ms,
+            request_size,
+            upstream,
+            direction,
+            streaming,
+            error,
+            AppError::Upstream,
+        )
+    }
+
+    /// Serialization / response construction error → HTTP 500 Internal Server Error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn abort_internal(
+        &self,
+        duration_ms: u64,
+        request_size: usize,
+        upstream: &str,
+        direction: &str,
+        streaming: bool,
+        error: impl ToString,
+    ) -> AppError {
+        self.abort_with(
+            500,
+            duration_ms,
+            request_size,
+            upstream,
+            direction,
+            streaming,
+            error,
+            AppError::Internal,
+        )
+    }
+
+    /// Validation error → HTTP 400 Bad Request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn abort_bad_request(
+        &self,
+        duration_ms: u64,
+        request_size: usize,
+        upstream: &str,
+        direction: &str,
+        streaming: bool,
+        error: impl ToString,
+    ) -> AppError {
+        self.abort_with(
+            400,
+            duration_ms,
+            request_size,
+            upstream,
+            direction,
+            streaming,
+            error,
+            AppError::BadRequest,
+        )
     }
 
     /// Flush pending ingress and egress dumps with the given `is_error` flag
@@ -1993,6 +2099,37 @@ mod tests {
             vec![],
         );
         // Still finished, no panic
+    }
+
+    #[test]
+    fn abort_finalizes_guard_and_returns_app_error() {
+        let diag = Diagnostics::new_noop();
+        let guard = super::RequestDiagnostics::new(&diag, "test-section", "test-model");
+        let err = guard.abort_upstream(
+            100,
+            512,
+            "upstream",
+            "test->up",
+            false,
+            "connection refused",
+        );
+        match err {
+            AppError::Upstream(msg) => assert_eq!(msg, "connection refused"),
+            other => panic!("expected AppError::Upstream, got {other:?}"),
+        }
+        // Guard must be marked finished
+        let finished = *guard.finished.lock().unwrap();
+        assert!(finished, "abort must mark guard as finished");
+    }
+
+    #[test]
+    fn abort_is_idempotent() {
+        let diag = Diagnostics::new_noop();
+        let guard = super::RequestDiagnostics::new(&diag, "test-section", "test-model");
+        let _ = guard.abort_upstream(100, 512, "up1", "dir1", false, "err1");
+        // Second abort must not panic — guard already finished
+        let err2 = guard.abort_internal(200, 1024, "up2", "dir2", true, "err2");
+        assert!(matches!(err2, AppError::Internal(_)));
     }
 
     #[test]

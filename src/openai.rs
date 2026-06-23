@@ -110,7 +110,9 @@ impl OpenAiHandler {
                 guard.set_messages_detail_egress(detail);
             }
         }
-        let body = serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?;
+        let body = serde_json::to_vec(&value).map_err(|e| {
+            guard.abort_internal(0, request_size, endpoint, "openai->openai", false, e)
+        })?;
         let backend_url = format!("{endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
             self.get_client(route.proxy.as_deref())
@@ -131,7 +133,16 @@ impl OpenAiHandler {
             guard.egress_dump(body_bytes, &egress_headers);
         }
         let start = std::time::Instant::now();
-        let upstream = builder.body(body).send().await?;
+        let upstream = builder.body(body).send().await.map_err(|e| {
+            guard.abort_upstream(
+                start.elapsed().as_millis() as u64,
+                request_size,
+                endpoint,
+                "openai->openai",
+                false,
+                e,
+            )
+        })?;
         let duration_ms = start.elapsed().as_millis() as u64;
         let is_err = !upstream.status().is_success() && !sse::is_event_stream(upstream.headers());
         if is_err {
@@ -170,7 +181,18 @@ impl OpenAiHandler {
                 .body(Body::from(error_body))
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
-        let relayed = relay_openai_upstream(upstream, &guard).await?;
+        let relayed = relay_openai_upstream(upstream, &guard, endpoint, "openai->openai")
+            .await
+            .map_err(|e| {
+                guard.abort_upstream(
+                    duration_ms,
+                    request_size,
+                    endpoint,
+                    "openai->openai",
+                    false,
+                    e,
+                )
+            })?;
         let is_streaming = sse::is_event_stream(relayed.headers());
         guard.finish(
             relayed.status().as_u16(),
@@ -252,7 +274,16 @@ impl OpenAiHandler {
         );
 
         let start = std::time::Instant::now();
-        let upstream = builder.body(prepared.bytes).send().await?;
+        let upstream = builder.body(prepared.bytes).send().await.map_err(|e| {
+            guard.abort_upstream(
+                start.elapsed().as_millis() as u64,
+                request_size,
+                openai_endpoint,
+                "anthropic->openai",
+                false,
+                e,
+            )
+        })?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
@@ -290,7 +321,16 @@ impl OpenAiHandler {
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
 
-        let openai_resp: ChatCompletionResponse = upstream.json().await?;
+        let openai_resp: ChatCompletionResponse = upstream.json().await.map_err(|e| {
+            guard.abort_upstream(
+                duration_ms,
+                request_size,
+                openai_endpoint,
+                "anthropic->openai",
+                false,
+                e,
+            )
+        })?;
         let response = translate_response(&openai_resp, &req.model);
 
         guard.finish(
@@ -366,7 +406,16 @@ impl OpenAiHandler {
         );
 
         let start = std::time::Instant::now();
-        let upstream = builder.body(prepared.bytes).send().await?;
+        let upstream = builder.body(prepared.bytes).send().await.map_err(|e| {
+            guard.abort_upstream(
+                start.elapsed().as_millis() as u64,
+                request_size,
+                openai_endpoint,
+                "anthropic->openai",
+                true,
+                e,
+            )
+        })?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
@@ -467,7 +516,16 @@ impl OpenAiHandler {
             },
         );
 
-        let resp = sse::sse_response(request_headers, sse_stream)?;
+        let resp = sse::sse_response(request_headers, sse_stream).map_err(|e| {
+            guard.abort_internal(
+                duration_ms,
+                request_size,
+                openai_endpoint,
+                "anthropic->openai",
+                true,
+                e,
+            )
+        })?;
 
         guard.finish(
             200,
@@ -521,6 +579,8 @@ fn relay_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 async fn relay_openai_upstream(
     upstream: reqwest::Response,
     guard: &RequestDiagnostics,
+    upstream_url: &str,
+    direction: &str,
 ) -> Result<Response, AppError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -568,8 +628,13 @@ async fn relay_openai_upstream(
             .map_err(|err| AppError::Internal(err.to_string()));
     }
 
-    let body = upstream.bytes().await?;
-    let validated = crate::validate_upstream_body(body.clone(), guard.request_id())?;
+    let body = upstream.bytes().await.map_err(|e| {
+        guard.abort_upstream(0, guard.ingress_size(), upstream_url, direction, false, e)
+    })?;
+    let validated =
+        crate::validate_upstream_body(body.clone(), guard.request_id()).map_err(|e| {
+            guard.abort_upstream(0, guard.ingress_size(), upstream_url, direction, false, e)
+        })?;
     guard.response_dump(
         validated.dump,
         status.as_u16(),

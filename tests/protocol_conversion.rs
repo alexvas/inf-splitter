@@ -2044,10 +2044,7 @@ models = "test-model"
     )
     .await;
 
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
-    );
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
     let body: serde_json::Value = response.json().await.expect("json body");
     assert!(
         body.to_string().contains("non-utf8"),
@@ -2100,10 +2097,7 @@ models = "test-model"
     )
     .await;
 
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
-    );
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
     let body: serde_json::Value = response.json().await.expect("json body");
     assert!(
         body.to_string().contains("non-utf8"),

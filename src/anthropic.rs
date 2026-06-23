@@ -78,16 +78,44 @@ impl AnthropicHandler {
                 guard.set_messages_detail_egress(detail);
             }
         }
-        let body =
-            Bytes::from(serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?);
+        let body = Bytes::from(serde_json::to_vec(&value).map_err(|e| {
+            guard.abort_internal(
+                0,
+                request_size,
+                anthropic_endpoint,
+                "anthropic->anthropic",
+                false,
+                e,
+            )
+        })?);
         if self.diagnostics.dump_enabled() {
             let egress_headers =
                 forward_request_headers_map(route.api_key.as_deref(), request_headers);
             guard.egress_dump(&body, &egress_headers);
         }
-        let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
+        let builder = self
+            .build_upstream_request(request_headers, route, anthropic_endpoint)
+            .map_err(|e| {
+                guard.abort_internal(
+                    0,
+                    request_size,
+                    anthropic_endpoint,
+                    "anthropic->anthropic",
+                    false,
+                    e,
+                )
+            })?;
         let start = std::time::Instant::now();
-        let upstream = builder.body(body).send().await?;
+        let upstream = builder.body(body).send().await.map_err(|e| {
+            guard.abort_upstream(
+                start.elapsed().as_millis() as u64,
+                request_size,
+                anthropic_endpoint,
+                "anthropic->anthropic",
+                false,
+                e,
+            )
+        })?;
         let duration_ms = start.elapsed().as_millis() as u64;
         if !upstream.status().is_success() && !sse::is_event_stream(upstream.headers()) {
             let status = upstream.status();
@@ -117,7 +145,19 @@ impl AnthropicHandler {
                 .body(axum::body::Body::from(error_body))
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
-        let relayed = relay_upstream_response(upstream, &guard).await?;
+        let relayed =
+            relay_upstream_response(upstream, &guard, anthropic_endpoint, "anthropic->anthropic")
+                .await
+                .map_err(|e| {
+                    guard.abort_upstream(
+                        duration_ms,
+                        request_size,
+                        anthropic_endpoint,
+                        "anthropic->anthropic",
+                        false,
+                        e,
+                    )
+                })?;
         let is_streaming = sse::is_event_stream(relayed.headers());
         guard.finish(
             relayed.status().as_u16(),
@@ -212,9 +252,29 @@ impl AnthropicHandler {
             guard.ingress_dump(s.as_bytes(), request_headers);
         }
 
-        let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
+        let builder = self
+            .build_upstream_request(request_headers, route, anthropic_endpoint)
+            .map_err(|e| {
+                guard.abort_internal(
+                    0,
+                    request_size,
+                    anthropic_endpoint,
+                    "openai->anthropic",
+                    false,
+                    e,
+                )
+            })?;
         let start = std::time::Instant::now();
-        let upstream = builder.body(prepared.bytes).send().await?;
+        let upstream = builder.body(prepared.bytes).send().await.map_err(|e| {
+            guard.abort_upstream(
+                start.elapsed().as_millis() as u64,
+                request_size,
+                anthropic_endpoint,
+                "openai->anthropic",
+                false,
+                e,
+            )
+        })?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
@@ -237,7 +297,16 @@ impl AnthropicHandler {
             return relay_error_body(status, error_body, &self.error_translation);
         }
 
-        let anthropic_resp: MessageResponse = upstream.json().await?;
+        let anthropic_resp: MessageResponse = upstream.json().await.map_err(|e| {
+            guard.abort_upstream(
+                duration_ms,
+                request_size,
+                anthropic_endpoint,
+                "openai->anthropic",
+                false,
+                e,
+            )
+        })?;
         let openai_resp =
             translate_anthropic_to_openai_response(&anthropic_resp, &openai_req.model);
 
@@ -303,9 +372,29 @@ impl AnthropicHandler {
             guard.ingress_dump(s.as_bytes(), request_headers);
         }
 
-        let builder = self.build_upstream_request(request_headers, route, anthropic_endpoint)?;
+        let builder = self
+            .build_upstream_request(request_headers, route, anthropic_endpoint)
+            .map_err(|e| {
+                guard.abort_internal(
+                    0,
+                    request_size,
+                    anthropic_endpoint,
+                    "openai->anthropic",
+                    true,
+                    e,
+                )
+            })?;
         let start = std::time::Instant::now();
-        let upstream = builder.body(prepared.bytes).send().await?;
+        let upstream = builder.body(prepared.bytes).send().await.map_err(|e| {
+            guard.abort_upstream(
+                start.elapsed().as_millis() as u64,
+                request_size,
+                anthropic_endpoint,
+                "openai->anthropic",
+                true,
+                e,
+            )
+        })?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if !upstream.status().is_success() {
@@ -417,7 +506,16 @@ impl AnthropicHandler {
             },
         );
 
-        let resp = sse::sse_response(request_headers, sse_stream)?;
+        let resp = sse::sse_response(request_headers, sse_stream).map_err(|e| {
+            guard.abort_internal(
+                duration_ms,
+                request_size,
+                anthropic_endpoint,
+                "openai->anthropic",
+                true,
+                e,
+            )
+        })?;
 
         guard.finish(
             200,
@@ -466,6 +564,8 @@ fn relay_error_body(
 async fn relay_upstream_response(
     upstream: reqwest::Response,
     guard: &RequestDiagnostics,
+    upstream_url: &str,
+    direction: &str,
 ) -> Result<Response, AppError> {
     let status = upstream.status();
     let response_headers = copy_response_headers(upstream.headers());
@@ -512,8 +612,13 @@ async fn relay_upstream_response(
             .map_err(|err| AppError::Internal(err.to_string()));
     }
 
-    let body = upstream.bytes().await?;
-    let validated = crate::validate_upstream_body(body.clone(), guard.request_id())?;
+    let body = upstream.bytes().await.map_err(|e| {
+        guard.abort_upstream(0, guard.ingress_size(), upstream_url, direction, false, e)
+    })?;
+    let validated =
+        crate::validate_upstream_body(body.clone(), guard.request_id()).map_err(|e| {
+            guard.abort_upstream(0, guard.ingress_size(), upstream_url, direction, false, e)
+        })?;
     guard.response_dump(
         validated.dump,
         status.as_u16(),

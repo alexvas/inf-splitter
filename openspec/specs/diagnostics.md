@@ -344,8 +344,12 @@ pub struct RequestDiagnostics {
 - `response_dump(body, status, is_error, headers)` — stores response dump for deferred recording (flushed in `finish`/`finish_with_error`)
 - `response_dump_streaming(body, status)` — stores streaming response dump for deferred recording
 - `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, flushes all deferred dumps (ingress, egress, response) with `is_error: false`, idempotent
-- `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, streaming, error)` — records error stats, flushes all deferred dumps with `is_error: true`, idempotent
-- `finish_with_upstream_error(status, duration_ms, request_size, upstream, direction, streaming, error_body, response_headers)` — records a response dump with the upstream error body, then calls `finish_with_error`. Replaces the two-call `response_dump` + `finish_with_error` pattern for upstream HTTP errors, guaranteeing the response dump is never forgotten. Internal errors (no HTTP response body) continue to use `finish_with_error` directly.
+- `finish_with_upstream_error(status, duration_ms, request_size, upstream, direction, streaming, error_body, response_headers)` — records a response dump with the upstream error body, then calls `finish_with_error`. Replaces the two-call `response_dump` + `finish_with_error` pattern for upstream HTTP errors, guaranteeing the response dump is never forgotten.
+- `abort_upstream(duration_ms, request_size, upstream, direction, streaming, error) → AppError::Upstream` — finalizes guard with HTTP 502, returns error for `?` propagation. For network/upstream failures.
+- `abort_internal(duration_ms, request_size, upstream, direction, streaming, error) → AppError::Internal` — finalizes guard with HTTP 500, returns error for `?` propagation. For serialization/response construction failures.
+- `abort_bad_request(duration_ms, request_size, upstream, direction, streaming, error) → AppError::BadRequest` — finalizes guard with HTTP 400, returns error for `?` propagation. For validation failures.
+
+`finish_with_error` is **private** — external code must use one of the `abort_*` methods or `finish_with_upstream_error` to finalize a guard with an error.
 
 **Drop safety net:** If dropped without `finish()`/`finish_with_error()`, logs `tracing::error!` and records a stats event with `error: "diagnostics guard dropped without finish"`.
 
@@ -593,59 +597,43 @@ All four handlers (OpenAI passthrough, Anthropic passthrough, protocol conversio
 
 В любой функции, владеющей `RequestDiagnostics` (guard), каждый `?`-проброс ошибки ДО вызова `guard.finish()` / `guard.finish_with_error()` является нарушением инварианта. `.map_err()?` — частный случай, не менее опасный.
 
-**Правило:** перед `return Err(...)` guard должен быть финализирован через `guard.finish_with_error(status, ..., err_msg)`. Допустимая альтернатива: явный `match` с вызовом `guard.finish_with_error()` перед `return Err(...)`.
+**Правило:** перед `return Err(...)` guard должен быть финализирован через `guard.abort_upstream(...)` / `guard.abort_internal(...)` / `guard.abort_bad_request(...)`. Альтернатива: `guard.finish_with_upstream_error(...)` для HTTP-ошибок upstream с телом ответа.
+
+**Предпочитаемый паттерн:** `.map_err(|e| guard.abort_upstream(dur, size, up, dir, streaming, e))?` — финализирует guard и пробрасывает ошибку в одном выражении.
 
 **Проверка при code review:** если в функции есть `guard: RequestDiagnostics` и встречается `?` до строки с `guard.finish(...)` — это красный флаг.
 
-### Scenario: send_and_translate network send failure
+### Scenario: Network error in handler (abort_upstream)
 
-- GIVEN `send_and_translate` отправляет запрос в upstream
-- AND `upstream.send().await` возвращает `Err(reqwest::Error)`
+- GIVEN handler отправляет запрос в upstream
+- AND `builder.body(bytes).send().await` возвращает `Err(reqwest::Error)`
+- WHEN ошибка обрабатывается через `.map_err(|e| guard.abort_upstream(dur, size, up, dir, streaming, e))?`
+- THEN `guard.finish_with_error(502, ...)` вызывается с сообщением ошибки
+- AND `AppError::Upstream(msg)` возвращается и пробрасывается через `?`
+- AND guard финализирован ДО того, как ошибка покидает функцию
+
+### Scenario: Serialization error in handler (abort_internal)
+
+- GIVEN handler сериализует тело запроса
+- AND `serde_json::to_vec(&value)` возвращает `Err`
+- WHEN ошибка обрабатывается через `.map_err(|e| guard.abort_internal(0, size, up, dir, false, e))?`
+- THEN `guard.finish_with_error(500, ...)` вызывается
+- AND `AppError::Internal(msg)` возвращается
+
+### Scenario: Validation error in split path (abort_bad_request)
+
+- GIVEN `handle_split_send` проверяет `can_split_under_limit`
+- AND функция возвращает `Err`
 - WHEN ошибка обрабатывается
-- THEN `guard.finish_with_error(502, ..., error_message)` вызывается ДО `return Err(...)`
+- THEN `guard.abort_bad_request(0, body_len, up, dir, stream, "request cannot be split under proxy limit")` вызывается
+- AND `AppError::BadRequest(msg)` возвращается
 
-### Scenario: send_and_translate response read failure
+### Scenario: Idempotent abort
 
-- GIVEN `send_and_translate` читает тело ответа
-- AND `upstream.bytes().await` возвращает `Err(reqwest::Error)`
-- WHEN ошибка обрабатывается
-- THEN `guard.finish_with_error(502, ...)` вызывается ДО `return Err(...)`
-
-### Scenario: send_and_translate body validation failure
-
-- GIVEN `send_and_translate` валидирует тело ответа
-- AND `validate_upstream_body()` возвращает `Err(AppError)`
-- WHEN ошибка обрабатывается
-- THEN `guard.finish_with_error(502, ...)` вызывается ДО `return Err(...)`
-
-### Scenario: send_and_translate interaction parse failure
-
-- GIVEN `send_and_translate` парсит JSON ответа как `Interaction`
-- AND `serde_json::from_str()` возвращает `Err`
-- WHEN ошибка обрабатывается
-- THEN `guard.finish_with_error(502, ...)` вызывается ДО `return Err(...)`
-- AND `response_body.len()` передаётся как `response_size` для диагностики
-
-### Scenario: send_and_translate response build failure
-
-- GIVEN `send_and_translate` собирает ingress-ответ через `build_response_from_interaction`
-- AND функция возвращает `Err(String)`
-- WHEN ошибка обрабатывается
-- THEN `guard.finish_with_error(500, ...)` вызывается ДО `return Err(AppError::Internal(...))`
-
-### Scenario: handle_split_send chunk packing failure
-
-- GIVEN `handle_split_send` пакует контент в чанки через `pack_content_into_chunks`
-- AND single content item превышает `proxy_limit`
-- WHEN `pack_content_into_chunks` возвращает `Err("content item too large for proxy_limit: ...")`
-- THEN `guard.finish_with_error(400, ...)` вызывается ДО `return Err(AppError::BadRequest(...))`
-
-### Scenario: send_split_system_instruction split failure
-
-- GIVEN `send_split_system_instruction` разбивает system_instruction через `split_text_for_limit`
-- AND текст не удаётся разбить под лимит
-- WHEN `split_text_for_limit` возвращает `Err`
-- THEN `guard.finish_with_error(400, ...)` вызывается ДО `return Err(AppError::BadRequest(...))`
+- GIVEN `guard.abort_upstream(...)` уже был вызван для предыдущего чанка в split-цикле
+- WHEN последующий чанк падает и `guard.abort_upstream(...)` вызывается снова
+- THEN второй вызов — no-op (guard уже финализирован)
+- AND нет паники или двойной записи
 
 ## Requirement: Envelope Size Breakdown in can_split_under_limit Errors
 
@@ -787,3 +775,15 @@ A helper function in `src/sse.rs` that converts a raw SSE byte buffer into a `Du
 - WHEN the error occurs
 - THEN `tracing::warn!` logs the session ID and error details inside `update`
 - AND the `Result::Err` is still returned for callers that want to handle it
+
+## Requirement: `content-type` Excluded from Request Header Forwarding
+
+`should_forward_request_header()` in `auth.rs` excludes `content-type` alongside other hop-by-hop headers (`connection`, `transfer-encoding`, `content-length`). Each handler sets `Content-Type: application/json` explicitly on the outgoing request builder; forwarding the ingress value would produce duplicate headers, which causes some upstreams (confirmed: OpenAI) to fail parsing the request body.
+
+### Scenario: Content-Type is not forwarded to upstream
+
+- GIVEN an ingress request with `Content-Type: application/json`
+- AND `forward_request_headers_map()` is called to build egress headers
+- WHEN the resulting headers are inspected
+- THEN `content-type` is absent from the output
+- AND the explicit `Content-Type: application/json` set by each handler is the sole Content-Type header on the wire

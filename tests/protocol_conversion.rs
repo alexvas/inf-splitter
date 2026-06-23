@@ -2171,18 +2171,26 @@ max_file_size = "1k"
     // Verify the current file has some content (latest dumps)
     assert!(!lines.is_empty(), "current file should have content");
 
-    // Verify a rotated file exists in the same directory
+    // Verify a rotated file exists in the same directory.
+    // Rotation happens asynchronously — poll with a timeout.
     let dir = tmp.parent().unwrap();
-    let rotated: Vec<_> = fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(&format!("inf-splitter-rot-"))
-                && e.file_name().to_string_lossy() != tmp.file_name().unwrap().to_string_lossy()
-        })
-        .collect();
+    let mut rotated: Vec<std::fs::DirEntry> = Vec::new();
+    for _ in 0..30 {
+        rotated = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("inf-splitter-rot-"))
+                    && e.file_name().to_string_lossy() != tmp.file_name().unwrap().to_string_lossy()
+            })
+            .collect();
+        if !rotated.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     assert!(
         !rotated.is_empty(),

@@ -285,6 +285,7 @@ pub struct RequestDiagnostics {
     messages_detail_egress: Mutex<Option<serde_json::Value>>,
     ingress_dump_pending: Mutex<Option<StoredDump>>,
     egress_dumps_pending: Mutex<Vec<StoredDump>>,
+    response_dump_pending: Mutex<Option<StoredDump>>,
 }
 ```
 
@@ -297,10 +298,10 @@ pub struct RequestDiagnostics {
 - `set_input_messages(n)`, `set_max_tokens(n)`, `set_messages_detail_ingress(v)`, `set_messages_detail_egress(v)` — optional stats detail setters
 - `ingress_dump(body, headers)` — stores ingress dump with capture-time timestamp for deferred recording
 - `egress_dump(body, headers)` — stores egress dump with capture-time timestamp for deferred recording
-- `response_dump(body, status, is_error, headers)` — records non-streaming response dump with headers
-- `response_dump_streaming(body, status)` — records streaming response dump
-- `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, flushes deferred dumps with `is_error: false` and `status` applied to request dumps, idempotent
-- `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, streaming, error)` — records error stats, flushes deferred dumps with `is_error: true` and `status` applied to request dumps, idempotent
+- `response_dump(body, status, is_error, headers)` — stores response dump for deferred recording (flushed in `finish`/`finish_with_error`)
+- `response_dump_streaming(body, status)` — stores streaming response dump for deferred recording
+- `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, flushes all deferred dumps (ingress, egress, response) with `is_error: false`, idempotent
+- `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, streaming, error)` — records error stats, flushes all deferred dumps with `is_error: true`, idempotent
 
 **Drop safety net:** If dropped without `finish()`/`finish_with_error()`, logs `tracing::error!` and records a stats event with `error: "diagnostics guard dropped without finish"`.
 
@@ -445,6 +446,8 @@ All diagnostic recording uses `try_send` on bounded MPSC channels. When the chan
 - THEN new events are dropped without affecting request latency
 
 ## Requirement: File Rotation
+
+`RotatingWriter::flush()` calls `BufWriter::flush()` followed by `File::sync_data()` (Linux `fdatasync`), ensuring data reaches the storage device.
 
 When `max_file_size` is set, the current output file is rotated when it exceeds the limit. Rotated files are named with a date-sequence suffix. When `compression` is set, rotated files are compressed in a background thread. When `max_rotated_size` is set, oldest rotated files are deleted when total exceeds the limit.
 
@@ -602,3 +605,15 @@ A helper function in `src/sse.rs` that converts a raw SSE byte buffer into a `Du
 - GIVEN buffer = `\xff\xfe\xfd` (invalid UTF-8)
 - WHEN `parse_sse_buffer_to_json_array(&buffer)` is called
 - THEN returns `DumpBody::Base64(...)` (fallback to base64)
+
+## Requirement: Poll Diagnostics File Stabilization (Tests)
+
+`poll_diagnostics_file` must wait for file content to stabilize before returning.
+
+### Scenario: Writer still appending
+- GIVEN the writer thread has written 1 of 3 pending dump lines
+- AND the predicate is already satisfied
+- WHEN `poll_diagnostics_file` checks the file
+- THEN it waits 20ms and re-reads
+- AND if the size grew, continues polling until stable
+- AND returns only when consecutive reads have the same size

@@ -607,6 +607,8 @@ pub struct RequestDiagnostics {
     ingress_dump_pending: std::sync::Mutex<Option<StoredDump>>,
     /// Deferred egress dumps — stored by `egress_dump`, flushed in `finish`/`finish_with_error`.
     egress_dumps_pending: std::sync::Mutex<Vec<StoredDump>>,
+    /// Deferred response dump — stored by `response_dump`/`response_dump_streaming`, flushed in `finish`/`finish_with_error`.
+    response_dump_pending: std::sync::Mutex<Option<StoredDump>>,
 }
 
 impl RequestDiagnostics {
@@ -625,6 +627,7 @@ impl RequestDiagnostics {
             messages_detail_egress: std::sync::Mutex::new(None),
             ingress_dump_pending: std::sync::Mutex::new(None),
             egress_dumps_pending: std::sync::Mutex::new(Vec::new()),
+            response_dump_pending: std::sync::Mutex::new(None),
         }
     }
 
@@ -704,36 +707,23 @@ impl RequestDiagnostics {
         ));
     }
 
-    /// Record a response dump (non-streaming).
+    /// Record a response dump (non-streaming). Deferred — flushed in `finish`/`finish_with_error`.
     pub fn response_dump(
         &self,
         body: impl Into<DumpBody>,
         status: u16,
-        is_error: bool,
+        _is_error: bool,
         headers: Vec<(String, String)>,
     ) {
-        self.diagnostics.record_response_dump(
-            &self.request_id,
-            &self.section,
-            &self.model,
-            headers,
-            body,
-            status,
-            is_error,
-        );
+        let header_pairs = mask_header_values(headers);
+        *self.response_dump_pending.lock().unwrap() =
+            Some((body.into(), header_pairs, ts_string(), Some(status)));
     }
 
-    /// Record a streaming response dump.
+    /// Record a streaming response dump. Deferred — flushed in `finish`/`finish_with_error`.
     pub fn response_dump_streaming(&self, body: impl Into<DumpBody>, status: u16) {
-        self.diagnostics.record_response_dump(
-            &self.request_id,
-            &self.section,
-            &self.model,
-            vec![],
-            body,
-            status,
-            false,
-        );
+        *self.response_dump_pending.lock().unwrap() =
+            Some((body.into(), vec![], ts_string(), Some(status)));
     }
 
     /// Record success stats and mark the guard as finished. Idempotent.
@@ -853,6 +843,24 @@ impl RequestDiagnostics {
                     headers,
                     body,
                     status,
+                },
+                is_error,
+            );
+        }
+        if let Some((body, headers, ts, stored_status)) =
+            self.response_dump_pending.lock().unwrap().take()
+        {
+            self.diagnostics.record_dump(
+                &DumpEvent {
+                    section: self.section.clone(),
+                    request_id: self.request_id.clone(),
+                    ts,
+                    stage: "egress".into(),
+                    direction: "response".into(),
+                    model: self.model.clone(),
+                    headers,
+                    body,
+                    status: stored_status,
                 },
                 is_error,
             );
@@ -1160,7 +1168,8 @@ impl RotatingWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush()
+        self.writer.flush()?;
+        self.writer.get_mut().sync_data()
     }
 
     fn rotate(&mut self) -> std::io::Result<()> {

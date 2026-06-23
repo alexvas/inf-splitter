@@ -205,7 +205,14 @@ pub async fn poll_diagnostics_file(
     let content = loop {
         if let Ok(c) = std::fs::read_to_string(path) {
             if pred(&c) {
-                break c;
+                // Content satisfies predicate — wait a bit for the writer
+                // to flush any remaining deferred dumps, then re-read.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if let Ok(c2) = std::fs::read_to_string(path) {
+                    if c2.len() == c.len() {
+                        break c2;
+                    }
+                }
             }
         }
         if tokio::time::Instant::now() > deadline {

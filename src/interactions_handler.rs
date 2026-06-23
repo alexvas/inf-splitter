@@ -698,7 +698,7 @@ impl InteractionsHandler {
             }
 
             // Response dump for streaming
-            let dump_body = crate::diagnostics::dump_body_from_bytes(&dump_buffer);
+            let dump_body = crate::sse::parse_sse_buffer_to_json_array(&dump_buffer);
             if dump_body.is_base64() {
                 tracing::warn!(
                     request_id = %request_id,

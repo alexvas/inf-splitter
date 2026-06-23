@@ -11,6 +11,52 @@ use crate::error::AppError;
 /// Protects against unbounded buffer growth from a misbehaving upstream.
 pub const MAX_SSE_LINE_LENGTH: usize = 1024 * 1024; // 1 MB
 
+/// Parse an accumulated SSE byte buffer into a `DumpBody` containing a JSON array
+/// of each event's `data:` field. Non-JSON data lines (e.g. `[DONE]`) are skipped.
+/// If the last event is incomplete (no trailing `\n\n`), it is discarded.
+/// Falls back to raw text if the buffer contains no parseable SSE events.
+pub fn parse_sse_buffer_to_json_array(buf: &[u8]) -> crate::diagnostics::DumpBody {
+    let text = match std::str::from_utf8(buf) {
+        Ok(s) => s,
+        Err(_) => return crate::diagnostics::dump_body_from_bytes(buf),
+    };
+
+    if text.is_empty() {
+        return crate::diagnostics::DumpBody::Utf8("[]".to_string());
+    }
+
+    // Drop incomplete trailing event (no closing \n\n)
+    let complete = match text.rfind("\n\n") {
+        Some(pos) => &text[..=pos + 1],
+        None => {
+            // No complete events found — fall back to raw text
+            return crate::diagnostics::dump_body_from_bytes(buf);
+        }
+    };
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for chunk in complete.split("\n\n") {
+        for line in chunk.lines() {
+            let data = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"));
+            let data = match data {
+                Some(d) => d.trim(),
+                None => continue,
+            };
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                events.push(json);
+            }
+        }
+    }
+
+    let json = serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string());
+    crate::diagnostics::DumpBody::Utf8(json)
+}
+
 pub fn is_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -211,6 +257,82 @@ mod tests {
             response.headers().get(header::ACCEPT).is_none(),
             "Accept header must not be echoed on SSE response"
         );
+    }
+
+    #[test]
+    fn parse_sse_buffer_two_events() {
+        let buf = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n";
+        let body = parse_sse_buffer_to_json_array(buf);
+        match body {
+            crate::diagnostics::DumpBody::Utf8(s) => {
+                let arr: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap();
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], serde_json::json!({"a": 1}));
+                assert_eq!(arr[1], serde_json::json!({"b": 2}));
+            }
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_buffer_skips_done() {
+        let buf = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
+        let body = parse_sse_buffer_to_json_array(buf);
+        match body {
+            crate::diagnostics::DumpBody::Utf8(s) => {
+                let arr: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap();
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], serde_json::json!({"a": 1}));
+            }
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_buffer_discards_incomplete_trailing_event() {
+        // Last event has only "data: {"b":2}\n" — no trailing \n\n
+        let buf = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n";
+        let body = parse_sse_buffer_to_json_array(buf);
+        match body {
+            crate::diagnostics::DumpBody::Utf8(s) => {
+                let arr: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap();
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], serde_json::json!({"a": 1}));
+            }
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_buffer_empty() {
+        let body = parse_sse_buffer_to_json_array(b"");
+        match body {
+            crate::diagnostics::DumpBody::Utf8(s) => {
+                let arr: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap();
+                assert!(arr.is_empty());
+            }
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_buffer_non_utf8_fallback() {
+        let buf = b"\xff\xfe\xfd";
+        let body = parse_sse_buffer_to_json_array(buf);
+        assert!(body.is_base64());
+    }
+
+    #[test]
+    fn parse_sse_buffer_no_events_fallback() {
+        let body = parse_sse_buffer_to_json_array(b"just some text\nno sse here\n");
+        match body {
+            crate::diagnostics::DumpBody::Utf8(s) => {
+                // Falls back to raw text — no \n\n means no complete events,
+                // so the function returns the original buffer as dump_body_from_bytes
+                assert!(!s.is_empty());
+            }
+            _ => panic!("expected Utf8"),
+        }
     }
 }
 

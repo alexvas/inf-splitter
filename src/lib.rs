@@ -13,6 +13,7 @@ pub mod router;
 pub mod session;
 pub mod sse;
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,7 @@ use axum::http::header;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::Router;
+use reqwest::Client as HttpClient;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -34,6 +36,42 @@ use crate::interactions_handler::InteractionsHandler;
 use crate::openai::OpenAiHandler;
 use crate::router::{router, AppState};
 use crate::session::SessionStore;
+
+/// Build a single reqwest HTTP client with the given timeout and optional proxy URL.
+pub(crate) fn build_http_client(
+    timeout: Duration,
+    proxy_url: Option<&str>,
+) -> Result<HttpClient, AppError> {
+    let mut builder = HttpClient::builder().timeout(timeout);
+    if let Some(url) = proxy_url {
+        let proxy = reqwest::Proxy::all(url).map_err(|err| AppError::Internal(err.to_string()))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|err| AppError::Internal(err.to_string()))
+}
+
+/// Build a HashMap of HTTP clients keyed by proxy URL (empty key = default, no proxy).
+/// Iterates all config sections and creates one client per unique `proxy` value.
+pub(crate) fn build_client_map(config: &Config) -> Result<HashMap<String, HttpClient>, AppError> {
+    let mut clients = HashMap::new();
+    clients.insert(
+        String::new(),
+        build_http_client(config.upstream_timeout, None)?,
+    );
+    for section in config.sections.values() {
+        if let Some(ref proxy_url) = section.proxy {
+            if !clients.contains_key(proxy_url) {
+                clients.insert(
+                    proxy_url.clone(),
+                    build_http_client(config.upstream_timeout, Some(proxy_url))?,
+                );
+            }
+        }
+    }
+    Ok(clients)
+}
 
 /// Apply error translation rules to an upstream error body.
 /// Rules are evaluated in order; first match wins.

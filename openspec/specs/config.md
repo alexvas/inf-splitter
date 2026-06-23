@@ -264,7 +264,7 @@ models = "gemini-3.1-flash-lite"
 - WHEN Anthropic ingress arrives → passthrough to `endpoint_anthropic`
 - WHEN OpenAI ingress arrives → translates to interactions
 
-## Requirement: Per-Endpoint Proxy
+## Requirement: Per-Section Proxy
 
 Provider sections can specify an explicit proxy for outgoing requests:
 
@@ -274,10 +274,20 @@ proxy = "http://127.0.0.1:8081"
 proxy = "socks5://172.17.0.1:3823"
 ```
 
-If set, the reqwest `Client` for that section is built with `Proxy::all(url)`. If absent, reqwest falls back to environment variables.
+If set, all outgoing upstream requests for that section go through the configured proxy, regardless of which endpoint type is used (`endpoint_openai`, `endpoint_anthropic`, or `endpoint_interactions`). If absent, reqwest falls back to environment proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`).
 
-### Scenario: Explicit proxy configured
-- GIVEN `proxy = "http://127.0.0.1:8081"` in provider section
+### Scenario: Proxy with OpenAI endpoint
+- GIVEN `proxy = "http://127.0.0.1:8081"` and `endpoint_openai = "https://api.openai.com"` in provider section
+- WHEN an outgoing request is sent for that section
+- THEN reqwest routes through `http://127.0.0.1:8081`
+
+### Scenario: Proxy with Anthropic endpoint
+- GIVEN `proxy = "socks5://172.17.0.1:3823"` and `endpoint_anthropic = "https://api.anthropic.com"` in provider section
+- WHEN an outgoing request is sent for that section
+- THEN reqwest routes through `socks5://172.17.0.1:3823`
+
+### Scenario: Proxy with Interactions endpoint
+- GIVEN `proxy = "http://127.0.0.1:8081"` and `endpoint_interactions = "https://generativelanguage.googleapis.com/v1beta/interactions"`
 - WHEN outgoing requests are sent for that section
 - THEN reqwest routes through `http://127.0.0.1:8081`
 
@@ -285,6 +295,11 @@ If set, the reqwest `Client` for that section is built with `Proxy::all(url)`. I
 - GIVEN no `proxy` in provider section
 - WHEN outgoing requests are sent
 - THEN reqwest uses environment proxy variables (if any)
+
+### Scenario: Different proxies per section
+- GIVEN section A has `proxy = "http://proxy-a:8080"` and section B has `proxy = "http://proxy-b:8081"`
+- WHEN requests are routed to section A and section B
+- THEN section A requests go through `proxy-a` and section B requests go through `proxy-b`
 
 ## Requirement: Interactions Auth
 

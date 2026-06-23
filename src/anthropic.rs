@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyllm_translate::anthropic::{MessageResponse, StreamEvent};
@@ -25,7 +26,7 @@ use crate::sse;
 
 #[derive(Clone)]
 pub struct AnthropicHandler {
-    client: Client,
+    clients: HashMap<String, Client>,
     diagnostics: Diagnostics,
     error_translation: Arc<[crate::config::ErrorTranslationRule]>,
 }
@@ -33,13 +34,16 @@ pub struct AnthropicHandler {
 impl AnthropicHandler {
     pub fn new(config: &crate::config::Config, diagnostics: Diagnostics) -> Result<Self, AppError> {
         Ok(Self {
-            client: Client::builder()
-                .timeout(config.upstream_timeout)
-                .build()
-                .map_err(|err| AppError::Internal(err.to_string()))?,
+            clients: crate::build_client_map(config)?,
             diagnostics,
             error_translation: config.error_translation.clone().into(),
         })
+    }
+
+    fn get_client(&self, proxy: Option<&str>) -> &Client {
+        proxy
+            .and_then(|url| self.clients.get(url))
+            .unwrap_or_else(|| self.clients.get("").expect("default client must exist"))
     }
 
     /// Anthropic ingress → Anthropic upstream (passthrough).
@@ -440,7 +444,7 @@ impl AnthropicHandler {
     ) -> Result<RequestBuilder, AppError> {
         let url = format!("{anthropic_endpoint}/v1/messages");
         Ok(forward_request_headers(
-            self.client
+            self.get_client(route.proxy.as_deref())
                 .post(url)
                 .header(header::CONTENT_TYPE, "application/json"),
             request_headers,

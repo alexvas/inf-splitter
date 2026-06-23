@@ -6,6 +6,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ pub const API_REVISION: &str = "2026-05-20";
 
 #[derive(Clone)]
 pub struct InteractionsHandler {
-    http: HttpClient,
+    clients: HashMap<String, HttpClient>,
     diagnostics: Diagnostics,
     session_store: Arc<SessionStore>,
     error_translation: Arc<[crate::config::ErrorTranslationRule]>,
@@ -48,26 +49,18 @@ impl InteractionsHandler {
         diagnostics: Diagnostics,
         session_store: Arc<SessionStore>,
     ) -> Result<Self, AppError> {
-        let mut client_builder = HttpClient::builder().timeout(config.upstream_timeout);
-        // Apply per-section proxy if configured (use first interactions section's proxy)
-        for section in config.sections.values() {
-            if section.endpoint_interactions.is_some() {
-                if let Some(ref proxy_url) = section.proxy {
-                    if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
-                        client_builder = client_builder.proxy(proxy);
-                    }
-                }
-                break;
-            }
-        }
         Ok(Self {
-            http: client_builder
-                .build()
-                .map_err(|err| AppError::Internal(err.to_string()))?,
+            clients: crate::build_client_map(config)?,
             diagnostics,
             session_store,
             error_translation: config.error_translation.clone().into(),
         })
+    }
+
+    fn get_client(&self, proxy: Option<&str>) -> &HttpClient {
+        proxy
+            .and_then(|url| self.clients.get(url))
+            .unwrap_or_else(|| self.clients.get("").expect("default client must exist"))
     }
 
     /// Anthropic ingress → Interactions upstream.
@@ -405,7 +398,7 @@ impl InteractionsHandler {
         guard.egress_dump(egress_body, &egress_headers);
 
         let builder = build_interactions_headers(
-            self.http
+            self.get_client(route.proxy.as_deref())
                 .post(url)
                 .header(header::CONTENT_TYPE, "application/json"),
             route.api_key.as_deref(),
@@ -845,7 +838,7 @@ impl InteractionsHandler {
             guard.egress_dump(&chunk_body, &egress_headers);
 
             let builder = build_interactions_headers(
-                self.http
+                self.get_client(route.proxy.as_deref())
                     .post(url)
                     .header(header::CONTENT_TYPE, "application/json"),
                 route.api_key.as_deref(),
@@ -1003,7 +996,7 @@ impl InteractionsHandler {
             guard.egress_dump(&chunk_body, &egress_headers);
 
             let builder = build_interactions_headers(
-                self.http
+                self.get_client(route.proxy.as_deref())
                     .post(url)
                     .header(header::CONTENT_TYPE, "application/json"),
                 route.api_key.as_deref(),
@@ -1066,7 +1059,7 @@ impl InteractionsHandler {
                 guard.egress_dump(&chunk_body, &egress_headers);
 
                 let builder = build_interactions_headers(
-                    self.http
+                    self.get_client(route.proxy.as_deref())
                         .post(url)
                         .header(header::CONTENT_TYPE, "application/json"),
                     route.api_key.as_deref(),
@@ -1177,7 +1170,7 @@ impl InteractionsHandler {
     ) -> Result<(), AppError> {
         let url = build_interaction_url(route, &format!("/{interaction_id}/cancel"));
         let builder = build_interactions_headers(
-            self.http.post(&url),
+            self.get_client(route.proxy.as_deref()).post(&url),
             route.api_key.as_deref(),
             &HeaderMap::new(),
         );
@@ -1199,7 +1192,7 @@ impl InteractionsHandler {
     ) -> Result<(), AppError> {
         let url = build_interaction_url(route, &format!("/{interaction_id}"));
         let builder = build_interactions_headers(
-            self.http.delete(&url),
+            self.get_client(route.proxy.as_deref()).delete(&url),
             route.api_key.as_deref(),
             &HeaderMap::new(),
         );
@@ -1321,7 +1314,7 @@ impl InteractionsHandler {
     ) -> Result<bool, String> {
         let url = build_interaction_url(route, &format!("/{interaction_id}"));
         let builder = build_interactions_headers(
-            self.http.get(&url),
+            self.get_client(route.proxy.as_deref()).get(&url),
             route.api_key.as_deref(),
             &HeaderMap::new(),
         );

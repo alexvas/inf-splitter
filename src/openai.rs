@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyllm_translate::anthropic::MessageCreateRequest;
@@ -20,7 +21,7 @@ use crate::sse;
 
 #[derive(Clone)]
 pub struct OpenAiHandler {
-    http: HttpClient,
+    clients: HashMap<String, HttpClient>,
     diagnostics: Diagnostics,
     error_translation: Arc<[ErrorTranslationRule]>,
 }
@@ -28,13 +29,16 @@ pub struct OpenAiHandler {
 impl OpenAiHandler {
     pub fn new(config: &Config, diagnostics: Diagnostics) -> Result<Self, AppError> {
         Ok(Self {
-            http: HttpClient::builder()
-                .timeout(config.upstream_timeout)
-                .build()
-                .map_err(|err| AppError::Internal(err.to_string()))?,
+            clients: crate::build_client_map(config)?,
             diagnostics,
             error_translation: config.error_translation.clone().into(),
         })
+    }
+
+    fn get_client(&self, proxy: Option<&str>) -> &HttpClient {
+        proxy
+            .and_then(|url| self.clients.get(url))
+            .unwrap_or_else(|| self.clients.get("").expect("default client must exist"))
     }
 
     pub async fn handle_from_anthropic(
@@ -109,7 +113,7 @@ impl OpenAiHandler {
         let body = serde_json::to_vec(&value).map_err(|e| AppError::Internal(e.to_string()))?;
         let backend_url = format!("{endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
-            self.http
+            self.get_client(route.proxy.as_deref())
                 .post(&backend_url)
                 .header(header::CONTENT_TYPE, "application/json"),
             request_headers,
@@ -236,7 +240,7 @@ impl OpenAiHandler {
         let request_size = serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0);
         let backend_url = format!("{openai_endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
-            self.http
+            self.get_client(route.proxy.as_deref())
                 .post(&backend_url)
                 .header(header::CONTENT_TYPE, "application/json"),
             request_headers,
@@ -330,7 +334,7 @@ impl OpenAiHandler {
         let request_size = serde_json::to_vec(req).map(|v| v.len()).unwrap_or(0);
         let backend_url = format!("{openai_endpoint}/v1/chat/completions");
         let builder = forward_request_headers(
-            self.http
+            self.get_client(route.proxy.as_deref())
                 .post(&backend_url)
                 .header(header::CONTENT_TYPE, "application/json"),
             request_headers,

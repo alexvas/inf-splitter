@@ -23,10 +23,18 @@ When OpenAI-format ingress must reach an Anthropic-compatible upstream, `Anthrop
 
 When Anthropic-format ingress must reach an OpenAI-compatible upstream, `OpenAiHandler` converts:
 - `MessageCreateRequest` → `ChatCompletionRequest` via `anyllm_translate`
-- Request body is parsed, translated, serialized, and sent upstream
+- Request body is parsed, translated, sanitized, serialized, and sent upstream
 - Response is translated back from OpenAI to Anthropic format
 
 Before translation, `strip_adaptive_thinking()` removes the `thinking` field when its type is `"adaptive"` — unsupported by `anyllm_translate` 0.9.x `ThinkingConfig`. Since the translation doesn't propagate thinking blocks anyway, removal is safe.
+
+After translation and token capping, `sanitize_openai_egress()` cleans the request:
+- `max_tokens` is set to `None` when `max_completion_tokens` is present (always true for Anthropic→OpenAI translation). Newer OpenAI models (gpt-5.*, o-series) reject `max_tokens` and require `max_completion_tokens`.
+- Known Anthropic `extra` fields (`context_management`, `output_config`) leaked through `req.extra.clone()` are removed.
+
+When `route.max_tokens` is configured but `route.max_completion_tokens` is not, the limit is transferred to `max_completion_tokens` before `max_tokens` is removed, preserving route-level token caps.
+
+Both streaming (`handle_stream_manual`) and non-streaming (`handle_sync_manual`) paths are updated.
 
 ### Scenario: Non-streaming conversion
 - GIVEN `POST /v1/messages` with `"stream": false`
@@ -45,6 +53,8 @@ Token limits (`max_tokens`, `max_output_tokens`, `max_completion_tokens`) are in
 - **Conversion paths:** typed request structs are mutated before serialization
 - `max_output_tokens` only applies via JSON passthrough (Anthropic struct has only `max_tokens`)
 
+For Anthropic→OpenAI translation, `max_tokens` is removed from the outgoing request in favor of `max_completion_tokens`. If `route.max_tokens` is set but `route.max_completion_tokens` is not, the route-level limit is transferred to `max_completion_tokens` before `max_tokens` is removed.
+
 ### Scenario: Passthrough token cap
 - GIVEN config has `max_tokens = 100` and client sends `max_tokens: 500`
 - WHEN request is sent upstream via passthrough
@@ -55,6 +65,21 @@ Token limits (`max_tokens`, `max_output_tokens`, `max_completion_tokens`) are in
 - WHEN request is translated and sent upstream
 - THEN the outgoing `MessageCreateRequest.max_tokens` is `100`
 
+### Scenario: max_tokens removed for modern models
+- GIVEN Anthropic→OpenAI translation produces `max_tokens: 32000, max_completion_tokens: 32000`
+- WHEN `sanitize_openai_egress` is called
+- THEN `max_tokens` is set to `None`
+- AND `max_completion_tokens` is preserved as `Some(32000)`
+
+### Scenario: route.max_tokens limit preserved
+- GIVEN `route.max_tokens = Some(1024)` and `route.max_completion_tokens = None`
+- AND translation produces `max_tokens: 32000, max_completion_tokens: 32000`
+- AFTER `cap_openai_max_tokens`: `max_tokens = Some(1024)`, `max_completion_tokens = Some(32000)`
+- WHEN the limit transfer logic runs before `sanitize_openai_egress`
+- THEN `max_completion_tokens` is clamped to `Some(1024)` (respecting `route.max_tokens`)
+- AND `sanitize_openai_egress` sets `max_tokens = None`
+- AND the outgoing request has `max_completion_tokens: 1024`, no `max_tokens`
+
 ## Requirement: stream_options Handling
 
 `stream_options` is always dropped from OpenAI requests before forwarding upstream. This is hardcoded.
@@ -63,6 +88,27 @@ Token limits (`max_tokens`, `max_output_tokens`, `max_completion_tokens`) are in
 - GIVEN a request body includes `"stream_options": {...}`
 - WHEN the body is forwarded to an OpenAI upstream
 - THEN `stream_options` is removed from the outgoing body
+
+## Requirement: Anthropic `extra` Field Sanitization
+
+After Anthropic→OpenAI translation (`MessageCreateRequest` → `ChatCompletionRequest`), known Anthropic-specific fields that leak through `req.extra.clone()` are stripped from the outgoing request:
+
+- `context_management` — Claude Code context management extension
+- `output_config` — Claude Code output configuration (e.g., `effort`)
+
+This happens in `sanitize_openai_egress()`, called before serialization (after `cap_openai_max_tokens`).
+
+### Scenario: context_management stripped from OpenAI egress
+- GIVEN an Anthropic ingress body with `"context_management": {"edits": [...]}`
+- WHEN `sanitize_openai_egress` processes the translated `ChatCompletionRequest`
+- THEN `extra.remove("context_management")` is called
+- AND the outgoing JSON body does not contain `context_management`
+
+### Scenario: output_config stripped from OpenAI egress
+- GIVEN an Anthropic ingress body with `"output_config": {"effort": "max"}`
+- WHEN `sanitize_openai_egress` processes the translated `ChatCompletionRequest`
+- THEN `extra.remove("output_config")` is called
+- AND the outgoing JSON body does not contain `output_config`
 
 ## Requirement: SSE Utilities
 

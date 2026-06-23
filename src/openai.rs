@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyllm_translate::anthropic::MessageCreateRequest;
 use anyllm_translate::mapping::streaming_map::StreamingTranslator;
-use anyllm_translate::openai::ChatCompletionResponse;
+use anyllm_translate::openai::{ChatCompletionRequest, ChatCompletionResponse};
 use anyllm_translate::{translate_request, translate_response, TranslationConfig};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -203,6 +203,16 @@ impl OpenAiHandler {
         let mut openai_req = translate_request(req, &translation)
             .map_err(|err| AppError::Upstream(err.to_string()))?;
         cap_openai_max_tokens(&mut openai_req, route);
+        if route.max_tokens.is_some() && route.max_completion_tokens.is_none() {
+            if let Some(limit) = route.max_tokens {
+                if let Some(existing) = openai_req.max_completion_tokens {
+                    if existing > limit {
+                        openai_req.max_completion_tokens = Some(limit);
+                    }
+                }
+            }
+        }
+        sanitize_openai_egress(&mut openai_req);
         openai_req.stream_options = None;
 
         let prepared =
@@ -306,6 +316,16 @@ impl OpenAiHandler {
         let mut openai_req = translate_request(req, &translation)
             .map_err(|err| AppError::Upstream(err.to_string()))?;
         cap_openai_max_tokens(&mut openai_req, route);
+        if route.max_tokens.is_some() && route.max_completion_tokens.is_none() {
+            if let Some(limit) = route.max_tokens {
+                if let Some(existing) = openai_req.max_completion_tokens {
+                    if existing > limit {
+                        openai_req.max_completion_tokens = Some(limit);
+                    }
+                }
+            }
+        }
+        sanitize_openai_egress(&mut openai_req);
         openai_req.stream = Some(true);
         openai_req.stream_options = None;
 
@@ -590,6 +610,17 @@ fn cap_anthropic_max_tokens(req: &mut MessageCreateRequest, limit: Option<u32>) 
     }
 }
 
+/// Strip Anthropic-specific fields that leak into OpenAI requests through
+/// `anyllm_translate`'s `req.extra.clone()`, and replace `max_tokens` with
+/// `max_completion_tokens` for newer OpenAI models that reject the legacy field.
+fn sanitize_openai_egress(req: &mut ChatCompletionRequest) {
+    req.extra.remove("context_management");
+    req.extra.remove("output_config");
+    if req.max_completion_tokens.is_some() {
+        req.max_tokens = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +668,93 @@ mod tests {
         let mut req = make_req(4096);
         cap_anthropic_max_tokens(&mut req, None);
         assert_eq!(req.max_tokens, 4096);
+    }
+
+    // ── sanitize_openai_egress ──────────────────────────────
+
+    fn make_chat_completion_req() -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 32000,
+            "max_completion_tokens": 32000
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sanitize_openai_egress_removes_context_management_from_extra() {
+        let mut req = make_chat_completion_req();
+        req.extra.insert(
+            "context_management".into(),
+            serde_json::json!({"edits": [{"keep": "all", "type": "clear_thinking_20251015"}]}),
+        );
+        sanitize_openai_egress(&mut req);
+        assert!(
+            req.extra.get("context_management").is_none(),
+            "context_management must be removed"
+        );
+    }
+
+    #[test]
+    fn sanitize_openai_egress_removes_output_config_from_extra() {
+        let mut req = make_chat_completion_req();
+        req.extra
+            .insert("output_config".into(), serde_json::json!({"effort": "max"}));
+        sanitize_openai_egress(&mut req);
+        assert!(
+            req.extra.get("output_config").is_none(),
+            "output_config must be removed"
+        );
+    }
+
+    #[test]
+    fn sanitize_openai_egress_does_not_remove_unrelated_extra_fields() {
+        let mut req = make_chat_completion_req();
+        req.extra.insert("seed".into(), serde_json::json!(42));
+        sanitize_openai_egress(&mut req);
+        assert_eq!(req.extra.get("seed").and_then(|v| v.as_u64()), Some(42));
+    }
+
+    #[test]
+    fn sanitize_openai_egress_nulls_max_tokens_when_completion_tokens_present() {
+        let mut req = make_chat_completion_req();
+        req.max_tokens = Some(32000);
+        req.max_completion_tokens = Some(32000);
+        sanitize_openai_egress(&mut req);
+        assert_eq!(req.max_tokens, None);
+        assert_eq!(req.max_completion_tokens, Some(32000));
+    }
+
+    #[test]
+    fn sanitize_openai_egress_preserves_max_tokens_when_completion_tokens_absent() {
+        let mut req = make_chat_completion_req();
+        req.max_tokens = Some(1024);
+        req.max_completion_tokens = None;
+        sanitize_openai_egress(&mut req);
+        assert_eq!(req.max_tokens, Some(1024));
+        assert_eq!(req.max_completion_tokens, None);
+    }
+
+    #[test]
+    fn sanitize_openai_egress_is_idempotent() {
+        let mut req = make_chat_completion_req();
+        req.extra.insert(
+            "context_management".into(),
+            serde_json::json!({"edits": []}),
+        );
+        req.extra
+            .insert("output_config".into(), serde_json::json!({"effort": "max"}));
+        req.max_tokens = Some(32000);
+        req.max_completion_tokens = Some(32000);
+
+        sanitize_openai_egress(&mut req);
+        sanitize_openai_egress(&mut req); // second call must not panic
+
+        assert!(req.extra.get("context_management").is_none());
+        assert!(req.extra.get("output_config").is_none());
+        assert_eq!(req.max_tokens, None);
+        assert_eq!(req.max_completion_tokens, Some(32000));
     }
 
     // ── relay_response_headers ────────────────────────────────

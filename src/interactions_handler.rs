@@ -413,21 +413,15 @@ impl InteractionsHandler {
             let status = upstream.status();
             let response_headers = response_headers_to_pairs(upstream.headers());
             let error_body = upstream.text().await.unwrap_or_default();
-            guard.response_dump(
-                crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
-                status.as_u16(),
-                true,
-                response_headers,
-            );
-            guard.finish_with_error(
+            guard.finish_with_upstream_error(
                 status.as_u16(),
                 duration_ms,
                 ingress_body.len(),
-                Some(error_body.len()),
                 upstream_label,
                 direction,
                 stream,
                 error_body.clone(),
+                response_headers,
             );
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
@@ -849,21 +843,15 @@ impl InteractionsHandler {
                 let status = upstream.status();
                 let response_headers = response_headers_to_pairs(upstream.headers());
                 let error_body = upstream.text().await.unwrap_or_default();
-                guard.response_dump(
-                    crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
-                    status.as_u16(),
-                    true,
-                    response_headers,
-                );
-                guard.finish_with_error(
+                guard.finish_with_upstream_error(
                     status.as_u16(),
                     start.elapsed().as_millis() as u64,
                     ingress_body.len(),
-                    Some(error_body.len()),
                     upstream_label,
                     direction,
                     false,
                     error_body.clone(),
+                    response_headers,
                 );
                 let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
@@ -1007,21 +995,15 @@ impl InteractionsHandler {
             let response_headers = response_headers_to_pairs(upstream.headers());
             if !upstream_status.is_success() {
                 let error_body = upstream.text().await.unwrap_or_default();
-                guard.response_dump(
-                    crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
-                    upstream_status.as_u16(),
-                    true,
-                    response_headers,
-                );
-                guard.finish_with_error(
+                guard.finish_with_upstream_error(
                     upstream_status.as_u16(),
                     start.elapsed().as_millis() as u64,
                     ingress_body.len(),
-                    Some(error_body.len()),
                     upstream_label,
                     direction,
                     false,
                     error_body.clone(),
+                    response_headers,
                 );
                 let sc = StatusCode::from_u16(upstream_status.as_u16())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1070,21 +1052,15 @@ impl InteractionsHandler {
                 let response_headers = response_headers_to_pairs(upstream.headers());
                 if !upstream_status.is_success() {
                     let error_body = upstream.text().await.unwrap_or_default();
-                    guard.response_dump(
-                        crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
-                        upstream_status.as_u16(),
-                        true,
-                        response_headers,
-                    );
-                    guard.finish_with_error(
+                    guard.finish_with_upstream_error(
                         upstream_status.as_u16(),
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
-                        Some(error_body.len()),
                         upstream_label,
                         direction,
                         false,
                         error_body.clone(),
+                        response_headers,
                     );
                     let sc = StatusCode::from_u16(upstream_status.as_u16())
                         .unwrap_or(StatusCode::BAD_GATEWAY);

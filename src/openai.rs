@@ -147,21 +147,15 @@ impl OpenAiHandler {
                 })
                 .collect();
             let error_body = upstream.text().await.unwrap_or_default();
-            guard.response_dump(
-                crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
-                status.as_u16(),
-                true,
-                response_header_pairs,
-            );
-            guard.finish_with_error(
+            guard.finish_with_upstream_error(
                 status.as_u16(),
                 duration_ms,
                 request_size,
-                Some(error_body.len()),
                 endpoint,
                 "openai->openai",
                 false,
                 error_body.clone(),
+                response_header_pairs,
             );
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let error_body =
@@ -253,19 +247,29 @@ impl OpenAiHandler {
 
         if !upstream.status().is_success() {
             let status = upstream.status();
+            let response_headers = upstream.headers().clone();
+            let response_header_pairs: Vec<(String, String)> = response_headers
+                .iter()
+                .map(|(n, v)| {
+                    (
+                        n.as_str().to_string(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
             let error_body = upstream
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-            guard.finish_with_error(
+            guard.finish_with_upstream_error(
                 status.as_u16(),
                 duration_ms,
                 request_size,
-                Some(error_body.len()),
                 openai_endpoint,
                 "anthropic->openai",
                 false,
                 error_body.clone(),
+                response_header_pairs,
             );
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = crate::apply_error_translation(sc, error_body, &self.error_translation);
@@ -347,19 +351,29 @@ impl OpenAiHandler {
 
         if !upstream.status().is_success() {
             let status = upstream.status();
+            let response_headers = upstream.headers().clone();
+            let response_header_pairs: Vec<(String, String)> = response_headers
+                .iter()
+                .map(|(n, v)| {
+                    (
+                        n.as_str().to_string(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
             let error_body = upstream
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-            guard.finish_with_error(
+            guard.finish_with_upstream_error(
                 status.as_u16(),
                 duration_ms,
                 request_size,
-                Some(error_body.len()),
                 openai_endpoint,
                 "anthropic->openai",
                 true,
                 error_body.clone(),
+                response_header_pairs,
             );
             let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = crate::apply_error_translation(sc, error_body, &self.error_translation);

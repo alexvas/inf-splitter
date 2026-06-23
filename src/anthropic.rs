@@ -93,21 +93,15 @@ impl AnthropicHandler {
             let status = upstream.status();
             let response_headers = copy_response_headers(upstream.headers());
             let error_body = upstream.text().await.unwrap_or_default();
-            guard.response_dump(
-                crate::diagnostics::dump_body_from_bytes(error_body.as_bytes()),
-                status.as_u16(),
-                true,
-                response_headers.clone(),
-            );
-            guard.finish_with_error(
+            guard.finish_with_upstream_error(
                 status.as_u16(),
                 duration_ms,
                 request_size,
-                Some(error_body.len()),
                 anthropic_endpoint,
                 "anthropic->anthropic",
                 false,
                 error_body.clone(),
+                response_headers.clone(),
             );
             let sc = axum::http::StatusCode::from_u16(status.as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
@@ -225,19 +219,20 @@ impl AnthropicHandler {
 
         if !upstream.status().is_success() {
             let status = upstream.status();
+            let response_headers = copy_response_headers(upstream.headers());
             let error_body = upstream
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-            guard.finish_with_error(
+            guard.finish_with_upstream_error(
                 status.as_u16(),
                 duration_ms,
                 request_size,
-                Some(error_body.len()),
                 anthropic_endpoint,
                 "openai->anthropic",
                 false,
                 error_body.clone(),
+                response_headers,
             );
             return relay_error_body(status, error_body, &self.error_translation);
         }
@@ -315,19 +310,20 @@ impl AnthropicHandler {
 
         if !upstream.status().is_success() {
             let status = upstream.status();
+            let response_headers = copy_response_headers(upstream.headers());
             let error_body = upstream
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
-            guard.finish_with_error(
+            guard.finish_with_upstream_error(
                 status.as_u16(),
                 duration_ms,
                 request_size,
-                Some(error_body.len()),
                 anthropic_endpoint,
                 "openai->anthropic",
                 true,
                 error_body.clone(),
+                response_headers,
             );
             return relay_error_body(status, error_body, &self.error_translation);
         }

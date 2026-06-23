@@ -228,9 +228,16 @@ All dump events for a single request share the same `request_id` as the correspo
 ### Scenario: Error response produces dump
 - GIVEN `dump_mode = "all"` (or `"error"`) and `dump_output` is set to a file path
 - AND the upstream returns a non-2xx status
-- WHEN the error is handled
+- WHEN the error is handled via `finish_with_upstream_error`
 - THEN ingress and egress request dump lines are written
 - AND a response dump line is written containing the error body
+- AND the response dump includes the upstream response headers
+
+### Scenario: finish_with_upstream_error guarantees response dump
+- GIVEN any handler receiving an upstream HTTP error
+- WHEN the handler calls `finish_with_upstream_error` (not bare `finish_with_error`)
+- THEN a response dump is guaranteed by the method itself — the two-call pattern is eliminated
+- AND the invariant holds for all handlers (passthrough, conversion, interactions, split-send)
 
 ### Scenario: No dump when dump_mode is off
 - GIVEN `dump_mode = "off"`
@@ -338,6 +345,7 @@ pub struct RequestDiagnostics {
 - `response_dump_streaming(body, status)` — stores streaming response dump for deferred recording
 - `finish(status, duration_ms, request_size, response_size, upstream, direction, streaming)` — records success stats, flushes all deferred dumps (ingress, egress, response) with `is_error: false`, idempotent
 - `finish_with_error(status, duration_ms, request_size, response_size, upstream, direction, streaming, error)` — records error stats, flushes all deferred dumps with `is_error: true`, idempotent
+- `finish_with_upstream_error(status, duration_ms, request_size, upstream, direction, streaming, error_body, response_headers)` — records a response dump with the upstream error body, then calls `finish_with_error`. Replaces the two-call `response_dump` + `finish_with_error` pattern for upstream HTTP errors, guaranteeing the response dump is never forgotten. Internal errors (no HTTP response body) continue to use `finish_with_error` directly.
 
 **Drop safety net:** If dropped without `finish()`/`finish_with_error()`, logs `tracing::error!` and records a stats event with `error: "diagnostics guard dropped without finish"`.
 
@@ -414,6 +422,27 @@ pub struct RequestDiagnostics {
 - GIVEN `finish()` was already called
 - WHEN `finish()` or `finish_with_error()` is called again
 - THEN the call is a no-op (returns immediately)
+
+### Scenario: Upstream HTTP error recorded with finish_with_upstream_error
+- GIVEN an upstream returns a non-success HTTP status with an error body
+- AND response headers are collected from the upstream response
+- WHEN `finish_with_upstream_error(status, duration, size, upstream, dir, stream, error_body, headers)` is called
+- THEN a response dump is recorded with `stage: "egress"`, `direction: "response"`, the error status, and the error body
+- AND `finish_with_error` is called with the same status, error body, and `response_size = Some(error_body.len())`
+- AND the guard is marked finished (idempotent)
+
+### Scenario: finish_with_upstream_error includes response headers
+- GIVEN upstream error response headers contain diagnostic information
+- WHEN `finish_with_upstream_error` is called with those headers
+- THEN the response dump includes the headers (with sensitive values masked)
+- AND the headers are preserved for debugging the upstream error
+
+### Scenario: Internal errors continue using finish_with_error directly
+- GIVEN an error originates internally (validation, session, stream infrastructure — no HTTP response body exists)
+- WHEN `finish_with_error` is called directly
+- THEN a stats event is recorded with the error
+- AND no response dump is recorded (there is no HTTP response to dump)
+- AND behavior is identical to before `finish_with_upstream_error` was introduced
 
 ### Scenario: Per-dump capture-time timestamps
 - GIVEN a split-send with 2 chunks sent seconds apart

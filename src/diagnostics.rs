@@ -825,6 +825,43 @@ impl RequestDiagnostics {
         });
     }
 
+    /// Record an upstream HTTP error: dumps the error response body, then
+    /// finishes with error stats.  Replaces the two-call `response_dump` +
+    /// `finish_with_error` pattern and guarantees the response dump is never
+    /// forgotten.
+    ///
+    /// Internal errors (no HTTP response body) should continue to use
+    /// `finish_with_error` directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_with_upstream_error(
+        &self,
+        status: u16,
+        duration_ms: u64,
+        request_size: usize,
+        upstream: &str,
+        direction: &str,
+        streaming: bool,
+        error_body: String,
+        response_headers: Vec<(String, String)>,
+    ) {
+        self.response_dump(
+            dump_body_from_bytes(error_body.as_bytes()),
+            status,
+            true,
+            response_headers,
+        );
+        self.finish_with_error(
+            status,
+            duration_ms,
+            request_size,
+            Some(error_body.len()),
+            upstream,
+            direction,
+            streaming,
+            error_body,
+        );
+    }
+
     /// Flush pending ingress and egress dumps with the given `is_error` flag
     /// and overall response `status` applied to request dumps.
     fn flush_deferred_dumps(&self, is_error: bool, status: Option<u16>) {
@@ -1912,6 +1949,50 @@ mod tests {
         guard.finish(200, 42, 100, Some(50), "up", "dir", false);
         guard.finish(500, 99, 200, Some(100), "other", "x", true); // no-op
         drop(guard);
+    }
+
+    #[test]
+    fn finish_with_upstream_error_dumps_response_and_finishes() {
+        let diag = Diagnostics::new_noop();
+        let guard = super::RequestDiagnostics::new(&diag, "test-section", "test-model");
+        guard.finish_with_upstream_error(
+            502,
+            100,
+            512,
+            "https://upstream",
+            "test->upstream",
+            false,
+            r#"{"error":{"message":"bad gateway"}}"#.into(),
+            vec![("content-type".into(), "application/json".into())],
+        );
+        // Guard must be marked finished
+        let finished = *guard.finished.lock().unwrap();
+        assert!(
+            finished,
+            "finish_with_upstream_error must mark guard as finished"
+        );
+        // Response dump must have been consumed by flush_deferred_dumps
+        let pending = guard.response_dump_pending.lock().unwrap().is_none();
+        assert!(pending, "response_dump_pending must be consumed");
+    }
+
+    #[test]
+    fn finish_with_upstream_error_is_idempotent() {
+        let diag = Diagnostics::new_noop();
+        let guard = super::RequestDiagnostics::new(&diag, "test-section", "test-model");
+        guard.finish_with_upstream_error(502, 100, 512, "up", "dir", false, "error".into(), vec![]);
+        // Second call is no-op
+        guard.finish_with_upstream_error(
+            503,
+            200,
+            1024,
+            "up2",
+            "dir2",
+            true,
+            "error2".into(),
+            vec![],
+        );
+        // Still finished, no panic
     }
 
     #[test]

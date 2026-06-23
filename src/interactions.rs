@@ -100,30 +100,44 @@ fn build_request_body(
     tools: Option<Vec<Tool>>,
     tool_choice: Option<ToolChoice>,
 ) -> CreateModelInteractionParams {
+    let is_first = previous_interaction_id.is_none();
+
+    // tools and system_instruction are set only on the first interaction.
+    // Follow-ups reuse the interaction's existing configuration.
     let mut params = CreateModelInteractionParams {
         model: model.to_string(),
         input: InteractionsInput::ContentList(contents.to_vec()),
         stream: Some(stream),
-        tools: tools.filter(|t| !t.is_empty()),
+        tools: if is_first {
+            tools.filter(|t| !t.is_empty())
+        } else {
+            None
+        },
         ..Default::default()
     };
 
-    let max_tokens = route.max_tokens.or(ingress_max_tokens);
-    let has_tool_choice = tool_choice.is_some();
-    if max_tokens.is_some() || temperature.is_some() || has_tool_choice {
-        let mut gen_config = GenerationConfig {
-            temperature,
-            max_output_tokens: max_tokens.map(|v| v as i64),
-            ..Default::default()
-        };
-        if has_tool_choice {
-            gen_config.tool_choice = tool_choice.and_then(|tc| serde_json::to_value(tc).ok());
+    // generation_config is set only on the first interaction.
+    // Follow-ups reuse the interaction's existing configuration.
+    if is_first {
+        let max_tokens = route.max_tokens.or(ingress_max_tokens);
+        let has_tool_choice = tool_choice.is_some();
+        if max_tokens.is_some() || temperature.is_some() || has_tool_choice {
+            let mut gen_config = GenerationConfig {
+                temperature,
+                max_output_tokens: max_tokens.map(|v| v as i64),
+                ..Default::default()
+            };
+            if has_tool_choice {
+                gen_config.tool_choice = tool_choice.and_then(|tc| serde_json::to_value(tc).ok());
+            }
+            params.generation_config = Some(gen_config);
         }
-        params.generation_config = Some(gen_config);
     }
 
-    if let Some(sys) = system_instruction {
-        params.system_instruction = Some(sys);
+    if is_first {
+        if let Some(sys) = system_instruction {
+            params.system_instruction = Some(sys);
+        }
     }
 
     if let Some(prev) = previous_interaction_id {
@@ -1020,6 +1034,85 @@ mod tests {
             req.tools.is_none(),
             "tools should be absent when not provided"
         );
+    }
+
+    #[test]
+    fn build_anthropic_followup_omits_first_only_fields() {
+        let tools = vec![Tool::Function(crate::interactions_types::Function {
+            name: Some("get_weather".into()),
+            description: Some("Get weather".into()),
+            parameters: Some(serde_json::json!({"type": "object"})),
+            ..Default::default()
+        })];
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &test_route(),
+            Some("prev-123"),
+            "gemini-3.1-flash-lite",
+            false,
+            Some(0.7),
+            Some(200),
+            anthropic_system(),
+            Some(tools),
+            Some(ToolChoice::Simple("auto".into())),
+        );
+        // On follow-up: no tools, no system_instruction, no generation_config
+        assert!(req.tools.is_none(), "tools must be absent on follow-up");
+        assert!(
+            req.system_instruction.is_none(),
+            "system_instruction must be absent on follow-up"
+        );
+        assert!(
+            req.generation_config.is_none(),
+            "generation_config must be absent on follow-up"
+        );
+        assert_eq!(
+            req.previous_interaction_id.as_deref(),
+            Some("prev-123"),
+            "previous_interaction_id must be set"
+        );
+    }
+
+    #[test]
+    fn build_anthropic_first_includes_all_fields() {
+        let tools = vec![Tool::Function(crate::interactions_types::Function {
+            name: Some("get_weather".into()),
+            description: Some("Get weather".into()),
+            parameters: Some(serde_json::json!({"type": "object"})),
+            ..Default::default()
+        })];
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &test_route(),
+            None,
+            "gemini-3.1-flash-lite",
+            false,
+            Some(0.7),
+            Some(200),
+            anthropic_system(),
+            Some(tools),
+            Some(ToolChoice::Simple("auto".into())),
+        );
+        // First interaction: everything must be present
+        assert!(
+            req.tools.is_some(),
+            "tools must be present on first interaction"
+        );
+        assert!(
+            req.system_instruction.is_some(),
+            "system_instruction must be present on first interaction"
+        );
+        assert!(
+            req.generation_config.is_some(),
+            "generation_config must be present on first interaction"
+        );
+        let gc = req.generation_config.unwrap();
+        assert!(gc.temperature.is_some());
+        assert!(gc.max_output_tokens.is_some());
+        assert!(gc.tool_choice.is_some());
+        assert!(req.previous_interaction_id.is_none());
     }
 
     // --- Tool call extraction tests (RED — not yet implemented) ---

@@ -210,9 +210,14 @@ impl SessionStore {
 /// `delivered` is the count already successfully sent.
 /// `incoming` is the total count in the current request.
 pub fn compute_delta(delivered: usize, incoming: usize) -> (usize, usize) {
-    if incoming <= delivered {
-        // Client may have reset context — re-send all current messages
+    if incoming < delivered {
+        // Client reset context — re-send all current messages
         (0, incoming)
+    } else if incoming == delivered {
+        // No new messages to send — produce an empty slice.
+        // In a stateful protocol (Interactions), we must not re-send
+        // content the upstream already has.
+        (incoming, incoming)
     } else {
         (delivered, incoming)
     }
@@ -249,10 +254,10 @@ mod tests {
 
     #[test]
     fn compute_delta_returns_same_when_no_new_messages() {
-        // Same count as delivered — re-send all since we can't distinguish
-        // replay of old messages from a fresh set of the same size
+        // Same count as delivered — no new messages, send nothing.
+        // In a stateful protocol we must not re-send content the upstream already has.
         let (start, new_count) = compute_delta(5, 5);
-        assert_eq!(start, 0);
+        assert_eq!(start, 5);
         assert_eq!(new_count, 5);
     }
 
@@ -313,9 +318,9 @@ mod tests {
     #[test]
     fn delta_no_new_messages_after_split() {
         // 7 messages delivered across 3 chunks (3+2+2)
-        // Next request: same 7 messages (can't distinguish replay from new set of same size)
+        // Next request: same 7 messages — no new messages
         let (start, new_count) = compute_delta(7, 7);
-        assert_eq!(start, 0); // re-send all — can't tell if replay or fresh
+        assert_eq!(start, 7); // no new messages
         assert_eq!(new_count, 7);
     }
 

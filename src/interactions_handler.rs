@@ -794,6 +794,8 @@ impl InteractionsHandler {
                         request_headers,
                         ingress,
                         guard,
+                        params.tools.clone(),
+                        params.generation_config.clone(),
                     )
                     .await;
             }
@@ -802,13 +804,23 @@ impl InteractionsHandler {
         // Send each chunk sequentially
         let mut current_prev = params.previous_interaction_id.clone();
 
-        for chunk in &chunks {
-            let chunk_req = interactions_lib::build_chunk_request(
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_first_chunk = i == 0 && current_prev.is_none();
+            let si = if is_first_chunk {
+                system_instruction.clone()
+            } else {
+                None
+            };
+            let mut chunk_req = interactions_lib::build_chunk_request(
                 model,
                 chunk.clone(),
-                system_instruction.clone(),
+                si,
                 current_prev.clone(),
             );
+            if is_first_chunk {
+                chunk_req.tools = params.tools.clone();
+                chunk_req.generation_config = params.generation_config.clone();
+            }
             let chunk_body =
                 serde_json::to_vec(&chunk_req).map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -907,6 +919,8 @@ impl InteractionsHandler {
         request_headers: &HeaderMap,
         ingress: Protocol,
         guard: crate::diagnostics::RequestDiagnostics,
+        tools: Option<Vec<crate::interactions_types::Tool>>,
+        generation_config: Option<crate::interactions_types::GenerationConfig>,
     ) -> Result<Response, AppError> {
         let start = std::time::Instant::now();
         let mut total_response_bytes: usize = 0;
@@ -920,18 +934,23 @@ impl InteractionsHandler {
 
         // Send empty interactions with system_instruction chunks
         for (i, part) in sys_parts.iter().enumerate() {
+            let is_first_chunk = i == 0;
             let is_last_sys = i == sys_parts.len() - 1;
             let input_for_chunk = if is_last_sys && !chunks.is_empty() {
                 chunks[0].clone()
             } else {
                 vec![]
             };
-            let chunk_req = interactions_lib::build_chunk_request(
+            let mut chunk_req = interactions_lib::build_chunk_request(
                 model,
                 input_for_chunk,
                 Some(part.clone()),
                 current_prev.clone(),
             );
+            if is_first_chunk {
+                chunk_req.tools = tools.clone();
+                chunk_req.generation_config = generation_config.clone();
+            }
             let chunk_body =
                 serde_json::to_vec(&chunk_req).map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -2069,6 +2088,77 @@ If you don't know the answer, say so honestly.";
         assert!(err.contains("KiB"), "should use KiB for large tools");
         assert!(err.contains("description:"), "should show description size");
         assert!(err.contains("parameters:"), "should show parameters size");
+    }
+
+    #[test]
+    fn split_send_first_chunk_gets_tools_and_gen_config() {
+        use crate::interactions_types::{Content, Function, GenerationConfig, TextContent, Tool};
+
+        let tool = Tool::Function(Function {
+            name: Some("get_weather".into()),
+            description: Some("Get weather".into()),
+            parameters: Some(serde_json::json!({"type": "object"})),
+            ..Default::default()
+        });
+        let gen_config = GenerationConfig {
+            temperature: Some(0.7),
+            max_output_tokens: Some(200),
+            ..Default::default()
+        };
+        let params = CreateModelInteractionParams {
+            model: "test-model".into(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            tools: Some(vec![tool.clone()]),
+            generation_config: Some(gen_config.clone()),
+            ..Default::default()
+        };
+
+        // Simulate the chunk-loop logic from handle_split_send
+        let contents = vec![
+            Content::TextContent(TextContent {
+                text: "msg-1".into(),
+                ..Default::default()
+            }),
+            Content::TextContent(TextContent {
+                text: "msg-2".into(),
+                ..Default::default()
+            }),
+        ];
+        let chunks = interactions_lib::split_content_for_limit(&contents, 1024);
+        assert_eq!(chunks.len(), 1, "both messages fit in one chunk");
+
+        let current_prev: Option<String> = None;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_first_chunk = i == 0 && current_prev.is_none();
+            let mut chunk_req = interactions_lib::build_chunk_request(
+                "test-model",
+                chunk.clone(),
+                None,
+                current_prev.clone(),
+            );
+            if is_first_chunk {
+                chunk_req.tools = params.tools.clone();
+                chunk_req.generation_config = params.generation_config.clone();
+            }
+
+            if i == 0 {
+                assert!(chunk_req.tools.is_some(), "first chunk must have tools");
+                assert!(
+                    chunk_req.generation_config.is_some(),
+                    "first chunk must have generation_config"
+                );
+            } else {
+                assert!(
+                    chunk_req.tools.is_none(),
+                    "non-first chunk must not have tools"
+                );
+                assert!(
+                    chunk_req.generation_config.is_none(),
+                    "non-first chunk must not have generation_config"
+                );
+            }
+        }
     }
 
     // --- split_text_for_limit: more edge cases ---

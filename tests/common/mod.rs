@@ -94,6 +94,32 @@ pub async fn spawn_upstream(
     bind_and_serve(app).await.0
 }
 
+/// Like `spawn_upstream` but captures ALL request bodies (not just the last).
+/// Useful for split-send tests where multiple chunks are sent.
+pub async fn spawn_upstream_capture_all(
+    path: &'static str,
+    captured: Arc<Mutex<Vec<serde_json::Value>>>,
+    response: serde_json::Value,
+) -> SocketAddr {
+    #[derive(Clone)]
+    struct AllCaptureState {
+        captured: Arc<Mutex<Vec<serde_json::Value>>>,
+        response: serde_json::Value,
+    }
+    async fn capture_all(
+        State(state): State<AllCaptureState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        state.captured.lock().expect("lock captured").push(body);
+        Json(state.response.clone())
+    }
+    let state = AllCaptureState { captured, response };
+    let app = Router::new()
+        .route(path, post(capture_all))
+        .with_state(state);
+    bind_and_serve(app).await.0
+}
+
 pub async fn spawn_router(config_toml: &str) -> SocketAddr {
     let mut config = Config::load_from_str(config_toml).expect("test config");
     config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral listen addr");

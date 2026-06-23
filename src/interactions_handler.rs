@@ -743,7 +743,7 @@ impl InteractionsHandler {
         route: &RouteTarget,
         session_id: &str,
         total_message_count: usize,
-        _stream: bool,
+        stream: bool,
         model: &str,
         upstream_label: &str,
         ingress_body: &[u8],
@@ -758,23 +758,40 @@ impl InteractionsHandler {
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
 
-        let chunks = interactions_lib::split_content_for_limit(contents, limit);
         let mut last_id: Option<String> = None;
         let mut last_interaction: Option<Interaction> = None;
 
-        // Check if there's a system_instruction that needs splitting
         let system_instruction = params.system_instruction.clone();
 
-        // If system_instruction + empty content exceeds limit, split system_instruction first
+        // Build first-chunk envelope (with all first-interaction fields) for size checks
+        let first_envelope = CreateModelInteractionParams {
+            model: model.to_string(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            system_instruction: system_instruction.clone(),
+            tools: params.tools.clone(),
+            generation_config: params.generation_config.clone(),
+            ..Default::default()
+        };
+        let subsequent_envelope = CreateModelInteractionParams {
+            model: model.to_string(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            ..Default::default()
+        };
+
+        // Use the new full-chunk packer
+        let chunks = interactions_lib::pack_content_into_chunks(
+            &first_envelope,
+            &subsequent_envelope,
+            contents,
+            limit,
+        )
+        .map_err(AppError::BadRequest)?;
+
+        // If system_instruction + envelope > limit, split system_instruction first
         if let Some(ref sys) = system_instruction {
-            let empty_body = CreateModelInteractionParams {
-                model: model.to_string(),
-                input: InteractionsInput::ContentList(vec![]),
-                stream: Some(false),
-                system_instruction: Some(sys.clone()),
-                ..Default::default()
-            };
-            let empty_size = serde_json::to_vec(&empty_body)
+            let empty_size = serde_json::to_vec(&first_envelope)
                 .map(|v| v.len())
                 .unwrap_or(0);
             if empty_size > limit {
@@ -796,6 +813,7 @@ impl InteractionsHandler {
                         guard,
                         params.tools.clone(),
                         params.generation_config.clone(),
+                        stream,
                     )
                     .await;
             }
@@ -884,12 +902,39 @@ impl InteractionsHandler {
                 .await;
         }
 
+        if stream {
+            if let Some(ref inter) = last_interaction {
+                let resp = interactions_lib::build_response_from_interaction(inter, model, ingress)
+                    .map_err(AppError::Internal)?;
+                let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
+                guard.ingress_response_dump(
+                    crate::diagnostics::dump_body_from_bytes(&resp_bytes),
+                    200,
+                );
+                guard.finish(
+                    200,
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    Some(total_response_bytes),
+                    upstream_label,
+                    direction,
+                    true,
+                );
+                return Self::streaming_response_from_interaction(
+                    ingress, session_id, model, inter,
+                );
+            }
+        }
+
         let resp = if let Some(ref inter) = last_interaction {
             interactions_lib::build_response_from_interaction(inter, model, ingress)
                 .map_err(AppError::Internal)?
         } else {
             build_fallback_response(last_interaction.as_ref(), last_id.clone(), model, ingress)?
         };
+        // Dump the final ingress response before finishing
+        let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
+        guard.ingress_response_dump(crate::diagnostics::dump_body_from_bytes(&resp_bytes), 200);
         guard.finish(
             200,
             start.elapsed().as_millis() as u64,
@@ -921,6 +966,7 @@ impl InteractionsHandler {
         guard: crate::diagnostics::RequestDiagnostics,
         tools: Option<Vec<crate::interactions_types::Tool>>,
         generation_config: Option<crate::interactions_types::GenerationConfig>,
+        stream: bool,
     ) -> Result<Response, AppError> {
         let start = std::time::Instant::now();
         let mut total_response_bytes: usize = 0;
@@ -1078,6 +1124,30 @@ impl InteractionsHandler {
                 .await;
         }
 
+        if stream {
+            if let Some(ref inter) = last_interaction {
+                let resp = interactions_lib::build_response_from_interaction(inter, model, ingress)
+                    .map_err(AppError::Internal)?;
+                let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
+                guard.ingress_response_dump(
+                    crate::diagnostics::dump_body_from_bytes(&resp_bytes),
+                    200,
+                );
+                guard.finish(
+                    200,
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    Some(total_response_bytes),
+                    upstream_label,
+                    direction,
+                    true,
+                );
+                return Self::streaming_response_from_interaction(
+                    ingress, session_id, model, inter,
+                );
+            }
+        }
+
         // Translate last response to ingress protocol
         let resp = if let Some(ref inter) = last_interaction {
             interactions_lib::build_response_from_interaction(inter, model, ingress)
@@ -1085,6 +1155,8 @@ impl InteractionsHandler {
         } else {
             build_fallback_response(last_interaction.as_ref(), last_id.clone(), model, ingress)?
         };
+        let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
+        guard.ingress_response_dump(crate::diagnostics::dump_body_from_bytes(&resp_bytes), 200);
         guard.finish(
             200,
             start.elapsed().as_millis() as u64,
@@ -1308,6 +1380,225 @@ impl InteractionsHandler {
             .insert(HeaderName::from_static(hdr_name), hdr_value);
         response
     }
+
+    /// Build a streaming SSE response from the split-send final interaction.
+    fn streaming_response_from_interaction(
+        ingress: Protocol,
+        session_id: &str,
+        model: &str,
+        interaction: &Interaction,
+    ) -> Result<Response, AppError> {
+        let resp = interactions_lib::build_response_from_interaction(interaction, model, ingress)
+            .map_err(AppError::Internal)?;
+
+        match ingress {
+            Protocol::Anthropic => {
+                let events = synthesize_anthropic_events(model, &resp);
+                let body = sse::format_sse_events(&events);
+                let hdr_name = Self::session_header_name(ingress);
+                let hdr_value =
+                    HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(HeaderName::from_static(hdr_name), hdr_value)
+                    .body(Body::from(body))
+                    .map_err(|err| AppError::Internal(err.to_string()))
+            }
+            Protocol::OpenAi => {
+                let chunks = synthesize_openai_chunks(model, &resp);
+                let body = chunks.join("");
+                let hdr_name = Self::session_header_name(ingress);
+                let hdr_value =
+                    HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(HeaderName::from_static(hdr_name), hdr_value)
+                    .body(Body::from(body))
+                    .map_err(|err| AppError::Internal(err.to_string()))
+            }
+        }
+    }
+}
+
+/// Synthesize Anthropic SSE events from a translated interaction response.
+fn synthesize_anthropic_events(
+    model: &str,
+    resp: &serde_json::Value,
+) -> Vec<anyllm_translate::anthropic::StreamEvent> {
+    use anyllm_translate::anthropic::StreamEvent;
+
+    let msg_id = resp.get("id").and_then(|v| v.as_str()).unwrap_or("msg_1");
+    let content = resp.get("content").and_then(|v| v.as_array());
+    let stop_reason = resp
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("end_turn");
+    let input_tokens = resp
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = resp
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut events: Vec<StreamEvent> = Vec::new();
+
+    events.push(stream_event_message_start(
+        msg_id,
+        model,
+        input_tokens,
+        output_tokens,
+    ));
+
+    if let Some(blocks) = content {
+        for (idx, block) in blocks.iter().enumerate() {
+            let idx_u32 = idx as u32;
+            let block_type = block.get("type").and_then(|v| v.as_str());
+
+            match block_type {
+                Some("text") => {
+                    let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    events.push(stream_event_content_block_start_text(idx_u32));
+                    events.push(stream_event_content_block_delta_text(idx_u32, text));
+                }
+                Some("tool_use") => {
+                    let tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
+                    let partial_json = serde_json::to_string(&tool_input).unwrap_or_default();
+
+                    events.push(stream_event_content_block_start_tool_use(
+                        idx_u32, tool_id, tool_name,
+                    ));
+                    events.push(stream_event_content_block_delta_json(
+                        idx_u32,
+                        &partial_json,
+                    ));
+                }
+                _ => {}
+            }
+
+            events.push(StreamEvent::ContentBlockStop { index: idx_u32 });
+        }
+    }
+
+    events.push(stream_event_message_delta(
+        stop_reason,
+        input_tokens,
+        output_tokens,
+    ));
+    events.push(StreamEvent::MessageStop {});
+
+    events
+}
+
+// ── OpenAI SSE chunk constructors ────────────────────────────────────
+//
+// These helpers build OpenAI-compatible ChatCompletionChunk SSE lines.
+// They use serde_json::json!({...}) because ChatCompletionChunk's inner
+// types are not publicly exported by anyllm_translate. The functions
+// return pre-formatted "data: {...}\n\n" strings ready for the SSE stream.
+
+fn openai_sse_role_chunk(msg_id: &str, model: &str, index: u32) -> String {
+    let chunk = serde_json::json!({
+        "id": msg_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": model,
+        "choices": [{
+            "index": index,
+            "delta": {"role": "assistant"},
+            "finish_reason": null
+        }]
+    });
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&chunk).unwrap_or_default()
+    )
+}
+
+fn openai_sse_content_chunk(msg_id: &str, model: &str, index: u32, content: &str) -> String {
+    let chunk = serde_json::json!({
+        "id": msg_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": model,
+        "choices": [{
+            "index": index,
+            "delta": {"content": content},
+            "finish_reason": null
+        }]
+    });
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&chunk).unwrap_or_default()
+    )
+}
+
+fn openai_sse_finish_chunk(msg_id: &str, model: &str, index: u32, finish_reason: &str) -> String {
+    let chunk = serde_json::json!({
+        "id": msg_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": model,
+        "choices": [{
+            "index": index,
+            "delta": {},
+            "finish_reason": finish_reason
+        }]
+    });
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&chunk).unwrap_or_default()
+    )
+}
+
+/// Synthesize OpenAI SSE chunks from a translated interaction response.
+fn synthesize_openai_chunks(model: &str, resp: &serde_json::Value) -> Vec<String> {
+    let msg_id = resp
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("chatcmpl-1");
+    let choices = resp.get("choices").and_then(|v| v.as_array());
+
+    let mut chunks = Vec::new();
+
+    if let Some(choices) = choices {
+        for choice in choices {
+            let index = choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let finish_reason = choice
+                .get("finish_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stop");
+            let delta_content = choice
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            chunks.push(openai_sse_role_chunk(msg_id, model, index));
+
+            if !delta_content.is_empty() {
+                chunks.push(openai_sse_content_chunk(
+                    msg_id,
+                    model,
+                    index,
+                    delta_content,
+                ));
+            }
+
+            chunks.push(openai_sse_finish_chunk(msg_id, model, index, finish_reason));
+        }
+    }
+
+    chunks.push("data: [DONE]\n\n".to_string());
+
+    chunks
 }
 
 /// Build a protocol-appropriate response body from the last interaction
@@ -1557,14 +1848,130 @@ fn split_by_best_delimiter(text: &str, limit: usize, delimiters: &[&str]) -> Vec
     }
 }
 
+// ── StreamEvent constructors ─────────────────────────────────────────
+//
+// The inner types of these StreamEvent variants (MessageStartMessage,
+// ContentBlockStartContent, Delta, MessageDeltaData, StreamError) are not
+// publicly exported by anyllm_translate. Constructing them requires serde
+// deserialization from a JSON value. These helpers isolate that pattern.
+//
+// All constructors use .expect("...") because the JSON shapes are
+// statically correct — a panic here indicates a serde schema mismatch
+// that must fail fast.
+
+fn stream_event_message_start(
+    id: &str,
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> anyllm_translate::anthropic::StreamEvent {
+    serde_json::from_value(serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+        }
+    }))
+    .expect("message_start serde schema mismatch")
+}
+
+fn stream_event_content_block_start_text(index: u32) -> anyllm_translate::anthropic::StreamEvent {
+    serde_json::from_value(serde_json::json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "text", "text": ""}
+    }))
+    .expect("content_block_start text serde schema mismatch")
+}
+
+fn stream_event_content_block_start_tool_use(
+    index: u32,
+    tool_id: &str,
+    tool_name: &str,
+) -> anyllm_translate::anthropic::StreamEvent {
+    serde_json::from_value(serde_json::json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {
+            "type": "tool_use",
+            "id": tool_id,
+            "name": tool_name,
+            "input": {}
+        }
+    }))
+    .expect("content_block_start tool_use serde schema mismatch")
+}
+
+fn stream_event_content_block_delta_text(
+    index: u32,
+    text: &str,
+) -> anyllm_translate::anthropic::StreamEvent {
+    serde_json::from_value(serde_json::json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "text_delta", "text": text}
+    }))
+    .expect("content_block_delta text_delta serde schema mismatch")
+}
+
+fn stream_event_content_block_delta_signature(
+    index: u32,
+    signature: &str,
+) -> anyllm_translate::anthropic::StreamEvent {
+    serde_json::from_value(serde_json::json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "signature_delta", "signature": signature}
+    }))
+    .expect("content_block_delta signature_delta serde schema mismatch")
+}
+
+fn stream_event_content_block_delta_json(
+    index: u32,
+    partial_json: &str,
+) -> anyllm_translate::anthropic::StreamEvent {
+    serde_json::from_value(serde_json::json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json}
+    }))
+    .expect("content_block_delta input_json_delta serde schema mismatch")
+}
+
+fn stream_event_message_delta(
+    stop_reason: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> anyllm_translate::anthropic::StreamEvent {
+    serde_json::from_value(serde_json::json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    }))
+    .expect("message_delta serde schema mismatch")
+}
+
+fn stream_event_error(code: &str, message: &str) -> anyllm_translate::anthropic::StreamEvent {
+    serde_json::from_value(serde_json::json!({
+        "type": "error",
+        "error": {"type": code, "message": message}
+    }))
+    .expect("error event serde schema mismatch")
+}
+
+// ── SSE event translation ────────────────────────────────────────────
+
 /// Translate a single Interactions stream event (JSON data line) into
 /// one or more Anthropic `StreamEvent` objects.
 ///
 /// Deserializes into the generated `InteractionSseEvent` enum for type-safe
-/// dispatch.  Construction of `StreamEvent` variants with complex inner types
-/// (MessageStart, ContentBlockStart, ContentBlockDelta, MessageDelta, Error)
-/// uses `serde_json::from_value(serde_json::json!({...}))` because the inner
-/// types are not publicly exported by `anyllm_translate`.
+/// dispatch.
 ///
 /// Returns `None` for events that are intentionally skipped (status updates)
 /// or malformed (logged via `tracing::info!`).
@@ -1586,84 +1993,37 @@ fn translate_stream_event(
 
     match event {
         InteractionSseEvent::InteractionCreatedEvent(ev) => {
-            let msg_start: StreamEvent = serde_json::from_value(serde_json::json!({
-                "type": "message_start",
-                "message": {
-                    "id": ev.interaction.id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model,
-                    "content": [],
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
-                }
-            }))
-            .ok()?;
-            let block_start: StreamEvent = serde_json::from_value(serde_json::json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""}
-            }))
-            .ok()?;
+            let msg_start = stream_event_message_start(&ev.interaction.id, model, 0, 0);
+            let block_start = stream_event_content_block_start_text(0);
             Some(vec![msg_start, block_start])
         }
         InteractionSseEvent::StepStart(ev) => match &ev.step {
             Step::FunctionCallStep(fcs) => {
-                let block_start: StreamEvent = serde_json::from_value(serde_json::json!({
-                    "type": "content_block_start",
-                    "index": ev.index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": fcs.id,
-                        "name": fcs.name,
-                        "input": {}
-                    }
-                }))
-                .ok()?;
+                let block_start = stream_event_content_block_start_tool_use(
+                    ev.index as u32,
+                    &fcs.id,
+                    fcs.name.as_str(),
+                );
                 Some(vec![block_start])
             }
             _ => {
-                let block_start: StreamEvent = serde_json::from_value(serde_json::json!({
-                    "type": "content_block_start",
-                    "index": ev.index,
-                    "content_block": {"type": "text", "text": ""}
-                }))
-                .ok()?;
+                let block_start = stream_event_content_block_start_text(ev.index as u32);
                 Some(vec![block_start])
             }
         },
         InteractionSseEvent::StepDelta(ev) => match ev.delta {
             StepDeltaData::TextDelta(td) => {
-                let delta: StreamEvent = serde_json::from_value(serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": ev.index,
-                    "delta": {"type": "text_delta", "text": td.text}
-                }))
-                .ok()?;
+                let delta = stream_event_content_block_delta_text(ev.index as u32, &td.text);
                 Some(vec![delta])
             }
             StepDeltaData::ThoughtSignatureDelta(tsd) => {
                 let signature = tsd.signature.unwrap_or_default();
-                let delta: StreamEvent = serde_json::from_value(serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": ev.index,
-                    "delta": {"type": "signature_delta", "signature": signature}
-                }))
-                .ok()?;
+                let delta = stream_event_content_block_delta_signature(ev.index as u32, &signature);
                 Some(vec![delta])
             }
             StepDeltaData::ArgumentsDelta(ad) => {
                 let partial_json = ad.arguments.unwrap_or_default();
-                let delta: StreamEvent = serde_json::from_value(serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": ev.index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": partial_json
-                    }
-                }))
-                .ok()?;
+                let delta = stream_event_content_block_delta_json(ev.index as u32, &partial_json);
                 Some(vec![delta])
             }
             other => {
@@ -1685,19 +2045,14 @@ fn translate_stream_event(
                 .usage
                 .as_ref()
                 .and_then(|u| u.total_input_tokens)
-                .unwrap_or(0);
+                .unwrap_or(0) as u64;
             let output_tokens = ev
                 .interaction
                 .usage
                 .as_ref()
                 .and_then(|u| u.total_output_tokens)
-                .unwrap_or(0);
-            let msg_delta: StreamEvent = serde_json::from_value(serde_json::json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
-            }))
-            .ok()?;
+                .unwrap_or(0) as u64;
+            let msg_delta = stream_event_message_delta("end_turn", input_tokens, output_tokens);
             Some(vec![
                 StreamEvent::ContentBlockStop { index: 0 },
                 msg_delta,
@@ -1715,11 +2070,7 @@ fn translate_stream_event(
                 .as_ref()
                 .and_then(|e| e.code.as_deref())
                 .unwrap_or("api_error");
-            let err: StreamEvent = serde_json::from_value(serde_json::json!({
-                "type": "error",
-                "error": {"type": code, "message": msg}
-            }))
-            .ok()?;
+            let err = stream_event_error(code, msg);
             Some(vec![err])
         }
     }

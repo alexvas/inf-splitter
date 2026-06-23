@@ -111,6 +111,11 @@ pub fn format_sse_event(event: &StreamEvent) -> bytes::Bytes {
     bytes::Bytes::from(format_sse_event_str(event))
 }
 
+/// Format multiple `StreamEvent` items into a single SSE byte string.
+pub fn format_sse_events(events: &[StreamEvent]) -> String {
+    events.iter().map(format_sse_event_str).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

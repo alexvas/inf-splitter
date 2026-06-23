@@ -200,6 +200,86 @@ pub fn split_content_for_limit(contents: &[Content], limit: usize) -> Vec<Vec<Co
     chunks
 }
 
+/// Pack content into chunks greedily, measuring full serialized chunk body size.
+///
+/// `first_envelope` is the template for the first chunk (with tools, generation_config,
+/// system_instruction). `subsequent_envelope` is the template for all following chunks
+/// (with `previous_interaction_id`, without first-only fields).
+///
+/// Each content item is added only if `serialize(envelope + current_items + item) ≤ limit`.
+/// Returns `Err` if any single item exceeds the limit in an otherwise-empty chunk.
+pub fn pack_content_into_chunks(
+    first_envelope: &CreateModelInteractionParams,
+    subsequent_envelope: &CreateModelInteractionParams,
+    contents: &[Content],
+    limit: usize,
+) -> Result<Vec<Vec<Content>>, String> {
+    let mut chunks: Vec<Vec<Content>> = Vec::new();
+    let mut current: Vec<Content> = Vec::new();
+
+    for content in contents.iter().cloned() {
+        let is_first_chunk = chunks.is_empty();
+        let envelope = if is_first_chunk {
+            first_envelope
+        } else {
+            subsequent_envelope
+        };
+
+        let test_input = {
+            let mut test = current.clone();
+            test.push(content.clone());
+            test
+        };
+        let test_body = build_pack_body(envelope, &test_input);
+        let test_size = serde_json::to_vec(&test_body).map(|v| v.len()).unwrap_or(0);
+
+        if current.is_empty() && test_size > limit {
+            return Err(format!(
+                "content item too large for proxy_limit: {test_size} > {limit}"
+            ));
+        }
+
+        if test_size <= limit {
+            current.push(content);
+        } else {
+            chunks.push(std::mem::take(&mut current));
+            // Re-test with appropriate envelope for the new chunk
+            let new_envelope = if chunks.is_empty() {
+                first_envelope
+            } else {
+                subsequent_envelope
+            };
+            let single_body = build_pack_body(new_envelope, std::slice::from_ref(&content));
+            let single_size = serde_json::to_vec(&single_body)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if single_size > limit {
+                return Err(format!(
+                    "content item too large for proxy_limit: {single_size} > {limit}"
+                ));
+            }
+            current.push(content);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    Ok(chunks)
+}
+
+/// Build a `CreateModelInteractionParams` body for size measurement during packing.
+fn build_pack_body(
+    envelope: &CreateModelInteractionParams,
+    input: &[Content],
+) -> CreateModelInteractionParams {
+    CreateModelInteractionParams {
+        input: InteractionsInput::ContentList(input.to_vec()),
+        ..envelope.clone()
+    }
+}
+
 /// Check if any single Content element exceeds the limit (unsplittable).
 pub fn single_element_too_large(contents: &[Content], limit: usize) -> bool {
     contents
@@ -865,6 +945,120 @@ mod tests {
         });
         let chunks = split_content_for_limit(&[c], 1024 * 1024);
         assert_eq!(chunks.len(), 1);
+    }
+
+    // --- pack_content_into_chunks tests (RED) ---
+
+    fn pack_envelope(model: &str) -> CreateModelInteractionParams {
+        CreateModelInteractionParams {
+            model: model.to_string(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            ..Default::default()
+        }
+    }
+
+    fn text_content(text: &str) -> Content {
+        Content::TextContent(TextContent {
+            text: text.to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn content_of_approx_size(target_bytes: usize) -> Content {
+        let payload_len = target_bytes.saturating_sub(50);
+        let text = "x".repeat(payload_len.max(1));
+        Content::TextContent(TextContent {
+            text,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn pack_greedy_splits_at_limit() {
+        let envelope = pack_envelope("test-model");
+        let envelope_size = serde_json::to_vec(&envelope).unwrap().len();
+        let limit = envelope_size + 200;
+
+        let item1 = content_of_approx_size(50);
+        let item2 = content_of_approx_size(50);
+        let item3 = content_of_approx_size(50);
+
+        let items = vec![item1.clone(), item2.clone(), item3.clone()];
+        let result = pack_content_into_chunks(&envelope, &envelope, &items, limit).unwrap();
+
+        for chunk in &result {
+            let body = build_pack_body(&envelope, chunk);
+            let size = serde_json::to_vec(&body).unwrap().len();
+            assert!(size <= limit, "chunk size {size} exceeds limit {limit}");
+        }
+
+        let total: usize = result.iter().map(|c| c.len()).sum();
+        assert_eq!(total, 3, "all items must be packed");
+    }
+
+    #[test]
+    fn pack_single_item_too_large_rejected() {
+        let envelope = pack_envelope("test-model");
+        let envelope_size = serde_json::to_vec(&envelope).unwrap().len();
+        let limit = envelope_size + 5; // tiny limit — only ~5 bytes for content
+
+        // Create an item that's definitely > 5 bytes when serialized
+        let item = content_of_approx_size(100);
+        let result = pack_content_into_chunks(&envelope, &envelope, &[item], limit);
+        assert!(result.is_err(), "single item > limit must error");
+    }
+
+    #[test]
+    fn pack_all_items_fit_in_one_chunk() {
+        let envelope = pack_envelope("test-model");
+        let limit = 10 * 1024 * 1024;
+
+        let items = vec![
+            text_content("one"),
+            text_content("two"),
+            text_content("three"),
+        ];
+        let result = pack_content_into_chunks(&envelope, &envelope, &items, limit).unwrap();
+        assert_eq!(result.len(), 1, "all items should fit in one chunk");
+        assert_eq!(result[0].len(), 3);
+    }
+
+    #[test]
+    fn pack_greedy_each_chunk_maximally_full() {
+        let envelope = pack_envelope("test-model");
+        let envelope_size = serde_json::to_vec(&envelope).unwrap().len();
+        let limit = envelope_size + 300;
+
+        let items = vec![
+            content_of_approx_size(100),
+            content_of_approx_size(100),
+            content_of_approx_size(100),
+            content_of_approx_size(150),
+            content_of_approx_size(100),
+        ];
+        let result = pack_content_into_chunks(&envelope, &envelope, &items, limit).unwrap();
+
+        for chunk in &result {
+            let body = build_pack_body(&envelope, chunk);
+            let size = serde_json::to_vec(&body).unwrap().len();
+            assert!(size <= limit, "chunk size {size} exceeds limit {limit}");
+        }
+
+        // Greedy: adding first item of chunk 1 to chunk 0 would exceed limit
+        if result.len() > 1 {
+            let mut test_chunk1 = result[0].clone();
+            test_chunk1.push(result[1][0].clone());
+            let body = build_pack_body(&envelope, &test_chunk1);
+            let size = serde_json::to_vec(&body).unwrap().len();
+            assert!(
+                size > limit,
+                "greedy invariant broken: could have added more to chunk 0"
+            );
+        }
+
+        let total: usize = result.iter().map(|c| c.len()).sum();
+        assert_eq!(total, 5, "all items must be packed");
     }
 
     #[test]

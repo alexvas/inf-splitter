@@ -255,11 +255,31 @@ OpenAI ingress → `CreateModelInteractionParams`:
 
 ## Requirement: Proxy-Limit Split-Send Chunk Forwarding
 
-When a request exceeds `proxy_limit`, content is split into chunks and sent sequentially via `handle_split_send`. Each chunk is a separate `CreateModelInteractionParams` request chained via `previous_interaction_id`.
+When a request exceeds `proxy_limit`, content is split into chunks and sent sequentially via `handle_split_send`. Chunks are packed greedily by **full serialized body size** — not content-only measurement.
 
-**First-chunk-only fields** (`tools`, `generation_config`, `system_instruction`) are set on the first chunk (when `current_prev` is `None`, meaning the chunk creates a new interaction). Subsequent chunks omit these fields — they reuse the interaction's existing configuration.
+**Envelope** — per-chunk overhead from non-content fields:
+- First chunk: `{model, stream: false, tools?, generation_config?, system_instruction?}`
+- Subsequent chunks: `{model, stream: false, previous_interaction_id}`
 
-The `send_split_system_instruction` path (when system_instruction itself needs splitting) follows the same rule: `tools` and `generation_config` are attached to the first system-instruction chunk only.
+**Two-phase greedy algorithm:**
+
+**Phase 1 — System instruction:**
+If `serialize(envelope_first + system_instruction + empty_input) > limit`, split `system_instruction` text via `split_text_for_limit`. Each part is sent as a separate chunk (with empty input), chained via `previous_interaction_id`. The first system-instruction chunk carries `tools` and `generation_config`.
+
+**Phase 2 — Content packing:**
+After system_instruction is delivered (or if it fit without splitting), pack remaining content items greedily:
+1. Start a new chunk with the current envelope
+2. For each content item, compute `serialize(chunk + item)`
+3. If ≤ limit — add the item to the chunk
+4. If > limit — finalize current chunk (send it), start a new chunk with the item
+5. If a single item alone exceeds the limit → error (`can_split_under_limit` pre-check)
+
+**Invariants:**
+- Every serialized chunk body ≤ `proxy_limit`
+- Each chunk is as full as possible (greedy)
+- System instruction consumed first (empty input), then user content
+
+**Streaming response:** When the original ingress was streaming (`stream: true`), the final response is SSE events with `Content-Type: text/event-stream`. The final `Interaction` is translated to synthetic `StreamEvent` items via `build_response_from_interaction`.
 
 ### Scenario: First chunk carries tools and generation_config
 - GIVEN a request with `tools` and `generation_config` that exceeds `proxy_limit`
@@ -277,6 +297,79 @@ The `send_split_system_instruction` path (when system_instruction itself needs s
 - GIVEN a request where both content and system_instruction need splitting
 - WHEN `send_split_system_instruction` builds the first system-instruction chunk
 - THEN the chunk includes `tools` and `generation_config`
+
+### Scenario: Greedy chunk packing — all items fit in one chunk
+- GIVEN envelope = 2KB, limit = 100KB, content items = [1KB, 2KB, 3KB]
+- WHEN greedy packing runs
+- THEN all items fit in one chunk (2KB + 1KB + 2KB + 3KB = 8KB ≤ 100KB)
+- AND only one egress request is made
+
+### Scenario: Greedy chunk packing — splits at boundary
+- GIVEN envelope = 2KB, limit = 10KB, content items = [4KB, 5KB, 3KB]
+- WHEN greedy packing runs (measurement = serialized chunk size, not raw content size)
+- THEN chunk 0 contains [4KB] (2KB + 4KB = 6KB ≤ 10KB; adding 5KB → 11KB > 10KB)
+- AND chunk 1 contains [5KB, 3KB] (2KB + 5KB + 3KB = 10KB ≤ 10KB)
+
+### Scenario: System instruction split triggered by full-chunk measurement
+- GIVEN envelope_first = 86KB (tools + gen_config), system_instruction = 27KB, limit = 100KB
+- WHEN Phase 1 measures `serialize(envelope_first + system_instruction + empty_input)` = 113KB > 100KB
+- THEN `split_text_for_limit` splits system_instruction into parts ≤ (100KB - 86KB - overhead)
+- AND each part is sent as a separate chunk with empty input
+
+### Scenario: Streaming response from split-send (Anthropic)
+- GIVEN `stream: true` and request exceeding proxy_limit
+- WHEN `handle_split_send` completes all chunks
+- THEN response is `Content-Type: text/event-stream` with SSE events synthesized from final `Interaction`
+
+### Scenario: Non-streaming split-send unchanged
+- GIVEN `stream: false` and request exceeding proxy_limit
+- WHEN `handle_split_send` completes all chunks
+- THEN response is `Content-Type: application/json` (unchanged behavior)
+
+## Requirement: Greedy Chunk Packer
+
+`pack_content_into_chunks(first_envelope, subsequent_envelope, contents, limit) -> Result<Vec<Vec<Content>>, String>` packs content items greedily by full serialized chunk body size:
+
+- `first_envelope` is a `CreateModelInteractionParams` template for the first chunk (with tools, generation_config, system_instruction)
+- `subsequent_envelope` is the template for all following chunks (with `previous_interaction_id`, without first-only fields)
+- Each content item is added while `serialize(envelope + current_items + item) ≤ limit`
+- Returns error if any single item alone exceeds the limit in an otherwise-empty chunk
+
+### Scenario: Greedy packing fills to limit
+- GIVEN envelope = 2KB, limit = 10KB, items = [3KB, 5KB, 4KB]
+- WHEN packed greedily
+- THEN chunk 0 = [3KB, 5KB] (total 10KB), chunk 1 = [4KB]
+
+### Scenario: Single item too large rejected
+- GIVEN envelope = 2KB, limit = 10KB, items = [12KB]
+- WHEN packed greedily
+- THEN error returned (single item > limit even in empty chunk)
+
+## Requirement: Synthetic SSE Events from Interaction
+
+When a non-streaming `Interaction` response must be delivered as SSE (split-send path with `stream: true`), the proxy synthesizes `StreamEvent` items from the typed response struct returned by `build_response_from_interaction`:
+
+**Anthropic protocol:**
+1. `MessageStart { message: { id, model, role: "assistant" } }`
+2. For each `ContentBlock`:
+   - `ContentBlockStart { index, content_block }`
+   - `ContentBlockDelta { index, delta }` (text_delta or input_json_delta)
+   - `ContentBlockStop { index }`
+3. `MessageDelta { delta: { stop_reason }, usage }`
+4. `MessageStop`
+
+**OpenAI protocol:**
+Constructed via `openai_sse_role_chunk`, `openai_sse_content_chunk`, `openai_sse_finish_chunk` factory functions → `ChatCompletionChunk` SSE + `data: [DONE]`.
+
+### Scenario: Text response synthesized to SSE
+- GIVEN `Interaction` with `ModelOutputStep` text "Hello"
+- WHEN synthesized to Anthropic SSE
+- THEN stream: `message_start` → `content_block_start(text)` → `content_block_delta(text_delta: "Hello")` → `content_block_stop` → `message_delta(end_turn)` → `message_stop`
+
+### Scenario: Tool use response synthesized to SSE
+- GIVEN `Interaction` with `FunctionCallStep`
+- WHEN synthesized to Anthropic SSE
+- THEN stream includes `content_block_start(tool_use)` → `content_block_delta(input_json_delta)` → `content_block_stop` → `message_delta(tool_use)`
 
 ## Requirement: Interactions → OpenAI Translation
 
@@ -441,14 +534,30 @@ When a oneOf discriminator schema has no explicit `mapping`, `build.rs` must ins
 - THEN it deserializes as `InteractionSseEvent::StepDelta(StepDelta { ... })`
 - AND the match arm receives typed data without manual string comparison
 
-## Requirement: Document JSON Roundtrip Usage
+## Requirement: Isolate JSON Roundtrip Construction
 
-When `StreamEvent` variants are constructed via `serde_json::from_value(serde_json::json!({...}))` because their inner types are not publicly exported by `anyllm_translate`, the code must include a comment on the same line block explaining **why** a direct constructor cannot be used.
+When `serde_json::json!({...})` is needed to construct a value (because the target type's inner types are not publicly exported by `anyllm_translate`), the `json!` call must be isolated in a dedicated factory function with minimal scope. Callers receive a strongly-typed value and never interact with `serde_json::json!` directly.
 
-### Scenario: All JSON roundtrip sites are annotated
-- GIVEN any `serde_json::from_value(serde_json::json!({...}))` call that constructs a `StreamEvent`
-- WHEN reading the code
-- THEN a nearby comment explains that the inner type is not public in `anyllm_translate`
+**Rules:**
+- Each factory function constructs exactly one type variant (e.g. `stream_event_message_start`, `openai_sse_role_chunk`)
+- The factory body contains the `serde_json::json!({...})` + serialization/deserialization
+- A section comment above the factory block explains **why** the roundtrip is necessary (inner types not public)
+- Callers use the factory function name, not inline `json!` — resulting in readable, type-checked code
+
+### Scenario: StreamEvent constructed via factory
+- GIVEN a `StreamEvent::MessageStart` is needed
+- WHEN reading the call site
+- THEN the code reads `stream_event_message_start(id, model, 0, 0)` — no `serde_json::from_value(serde_json::json!({...}))` inline
+
+### Scenario: OpenAI SSE chunk constructed via factory
+- GIVEN an OpenAI `chat.completion.chunk` SSE line is needed
+- WHEN reading the call site
+- THEN the code reads `openai_sse_role_chunk(msg_id, model, index)` — the `serde_json::json!` call is hidden inside the factory
+
+### Scenario: New variant added
+- GIVEN a new event variant requires `serde_json::json!` construction
+- WHEN adding support
+- THEN a new factory function is added to the same isolated block, following the existing naming and comment conventions
 
 ## Requirement: Handling Policy for Unsupported-but-Valid Events
 

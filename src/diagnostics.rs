@@ -609,6 +609,8 @@ pub struct RequestDiagnostics {
     egress_dumps_pending: std::sync::Mutex<Vec<StoredDump>>,
     /// Deferred response dump — stored by `response_dump`/`response_dump_streaming`, flushed in `finish`/`finish_with_error`.
     response_dump_pending: std::sync::Mutex<Option<StoredDump>>,
+    /// Deferred ingress response dump — stored by `ingress_response_dump`, flushed in `finish`/`finish_with_error`.
+    ingress_response_dump_pending: std::sync::Mutex<Option<StoredDump>>,
 }
 
 impl RequestDiagnostics {
@@ -628,6 +630,7 @@ impl RequestDiagnostics {
             ingress_dump_pending: std::sync::Mutex::new(None),
             egress_dumps_pending: std::sync::Mutex::new(Vec::new()),
             response_dump_pending: std::sync::Mutex::new(None),
+            ingress_response_dump_pending: std::sync::Mutex::new(None),
         }
     }
 
@@ -730,6 +733,13 @@ impl RequestDiagnostics {
         let header_pairs = mask_header_values(headers);
         *self.response_dump_pending.lock().unwrap() =
             Some((body.into(), header_pairs, ts_string(), Some(status)));
+    }
+
+    /// Record the final ingress response dump (proxy → client).
+    /// Deferred — flushed in `finish`/`finish_with_error`.
+    pub fn ingress_response_dump(&self, body: impl Into<DumpBody>, status: u16) {
+        *self.ingress_response_dump_pending.lock().unwrap() =
+            Some((body.into(), Vec::new(), ts_string(), Some(status)));
     }
 
     /// Record success stats and mark the guard as finished. Idempotent.
@@ -865,6 +875,24 @@ impl RequestDiagnostics {
                     direction: "response".into(),
                     model: self.model.clone(),
                     headers,
+                    body,
+                    status: stored_status,
+                },
+                is_error,
+            );
+        }
+        if let Some((body, _headers, ts, stored_status)) =
+            self.ingress_response_dump_pending.lock().unwrap().take()
+        {
+            self.diagnostics.record_dump(
+                &DumpEvent {
+                    section: self.section.clone(),
+                    request_id: self.request_id.clone(),
+                    ts,
+                    stage: "ingress".into(),
+                    direction: "response".into(),
+                    model: self.model.clone(),
+                    headers: Vec::new(),
                     body,
                     status: stored_status,
                 },

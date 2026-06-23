@@ -185,9 +185,10 @@ impl InteractionsHandler {
                         stream,
                         msg.clone(),
                     );
-                    return Err(AppError::BadRequest(format!(
+                    return Err(AppError::BadRequest(
                         "Request cannot be split under proxy limit (see diagnostics for details)"
-                    )));
+                            .to_string(),
+                    ));
                 }
                 return self
                     .handle_split_send(
@@ -336,9 +337,10 @@ impl InteractionsHandler {
                         stream,
                         msg.clone(),
                     );
-                    return Err(AppError::BadRequest(format!(
+                    return Err(AppError::BadRequest(
                         "Request cannot be split under proxy limit (see diagnostics for details)"
-                    )));
+                            .to_string(),
+                    ));
                 }
                 return self
                     .handle_split_send(
@@ -1164,15 +1166,7 @@ impl InteractionsHandler {
                         errors.join("; ")
                     )
                 };
-                guard.finish(
-                    200,
-                    0,
-                    0,
-                    None,
-                    "control-action",
-                    "clean-all",
-                    false,
-                );
+                guard.finish(200, 0, 0, None, "control-action", "clean-all", false);
                 Ok(Self::ok_with_session_header(
                     ingress,
                     session_id,
@@ -1185,15 +1179,7 @@ impl InteractionsHandler {
                     .await
                     .map_err(|e| AppError::Internal(format!("session extend failed: {e}")))?;
                 let msg = format!("Session {} lifetime extended to UTC {}", session_id, until);
-                guard.finish(
-                    200,
-                    0,
-                    0,
-                    None,
-                    "control-action",
-                    "extend-lifetime",
-                    false,
-                );
+                guard.finish(200, 0, 0, None, "control-action", "extend-lifetime", false);
                 Ok(Self::ok_with_session_header(
                     ingress,
                     session_id,
@@ -2007,8 +1993,7 @@ If you don't know the answer, say so honestly.";
             "tools": tools_json,
         });
 
-        let (tools, _tool_choice) =
-            crate::interactions::extract_anthropic_tools(&anthropic_body);
+        let (tools, _tool_choice) = crate::interactions::extract_anthropic_tools(&anthropic_body);
         let tools = tools.expect("tools should be extracted from dump");
 
         let params = CreateModelInteractionParams {
@@ -2028,7 +2013,7 @@ If you don't know the answer, say so honestly.";
             "error should mention non-splittable fields: {err}"
         );
         assert!(
-            err.contains("Per-tool size breakdown:"),
+            err.contains("Per-tool size breakdown (sorted by size):"),
             "error should contain per-tool breakdown: {err}"
         );
         // Spot-check a few known tools

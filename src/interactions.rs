@@ -215,7 +215,7 @@ pub fn can_split_under_limit(
         params
             .tools
             .as_deref()
-            .map(|tools| tool_size_breakdown(tools))
+            .map(tool_size_breakdown)
             .unwrap_or_default()
     };
 
@@ -318,7 +318,7 @@ fn tool_size_breakdown(tools: &[Tool]) -> String {
     if tools.is_empty() {
         return String::new();
     }
-    let mut lines: Vec<String> = vec!["Per-tool size breakdown:".to_string()];
+    let mut entries: Vec<(usize, String)> = Vec::with_capacity(tools.len());
     for tool in tools {
         match tool {
             Tool::Function(f) => {
@@ -331,11 +331,14 @@ fn tool_size_breakdown(tools: &[Tool]) -> String {
                     .and_then(|p| serde_json::to_vec(p).ok())
                     .map(|v| v.len())
                     .unwrap_or(0);
-                lines.push(format!(
-                    "  {name}: {} (description: {}, parameters: {})",
-                    format_bytes(total),
-                    format_bytes(desc_bytes),
-                    format_bytes(params_bytes),
+                entries.push((
+                    total,
+                    format!(
+                        "  {name}: {} (description: {}, parameters: {})",
+                        format_bytes(total),
+                        format_bytes(desc_bytes),
+                        format_bytes(params_bytes),
+                    ),
                 ));
             }
             other => {
@@ -351,9 +354,14 @@ fn tool_size_breakdown(tools: &[Tool]) -> String {
                     Tool::Function(_) => unreachable!(),
                 };
                 let total = serde_json::to_vec(other).map(|v| v.len()).unwrap_or(0);
-                lines.push(format!("  ({type_name}): {}", format_bytes(total)));
+                entries.push((total, format!("  ({type_name}): {}", format_bytes(total))));
             }
         }
+    }
+    entries.sort_by_key(|b| std::cmp::Reverse(b.0));
+    let mut lines: Vec<String> = vec!["Per-tool size breakdown (sorted by size):".to_string()];
+    for (_size, line) in entries {
+        lines.push(line);
     }
     lines.join("\n")
 }

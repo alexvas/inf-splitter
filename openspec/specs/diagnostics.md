@@ -134,6 +134,53 @@ This covers Router direct calls, Relay/DiagnosticStream, and all three handlers.
 - WHEN the dump is recorded
 - THEN these headers appear with their original values unchanged
 
+## Requirement: Protocol Conversion Success Paths Record Upstream Response Dumps
+
+Successful protocol-conversion requests must record an `egress` `response` dump containing the raw upstream response body and upstream response headers before translating that response back to the ingress protocol. This applies to all four conversion paths:
+
+- Non-streaming Anthropic→OpenAI (`OpenAiHandler::handle_sync_manual`)
+- Streaming Anthropic→OpenAI (`OpenAiHandler::handle_stream_manual`)
+- Non-streaming OpenAI→Anthropic (`AnthropicHandler::handle_from_openai`)
+- Streaming OpenAI→Anthropic (`AnthropicHandler::handle_from_openai_stream`)
+
+Non-streaming conversion reads upstream response bytes once, records the dump via `guard.response_dump()`, then deserializes and translates from the same bytes. Streaming conversion accumulates raw upstream SSE bytes up to `MAX_STREAMING_DUMP_BYTES` (1 MiB) while translating, then records via `guard.response_dump_streaming()` and finalizes the guard when the stream completes.
+
+### Scenario: Non-streaming Anthropic→OpenAI success produces response dump
+- GIVEN a route has only `endpoint_openai` configured
+- AND an Anthropic `/v1/messages` request is routed to that section
+- AND diagnostics `dump_mode = "all"`
+- WHEN the OpenAI upstream returns a successful JSON chat completion response
+- THEN the dump output contains three entries for the same `request_id`: `ingress/request`, `egress/request`, and `egress/response`
+- AND the `egress/response` body is the raw OpenAI upstream response body
+- AND the `egress/response` headers contain the upstream response headers
+
+### Scenario: Non-streaming OpenAI→Anthropic success produces response dump
+- GIVEN a route has only `endpoint_anthropic` configured
+- AND an OpenAI `/v1/chat/completions` request is routed to that section
+- AND diagnostics `dump_mode = "all"`
+- WHEN the Anthropic upstream returns a successful JSON message response
+- THEN the dump output contains three entries for the same `request_id`: `ingress/request`, `egress/request`, and `egress/response`
+- AND the `egress/response` body is the raw Anthropic upstream response body
+- AND the `egress/response` headers contain the upstream response headers
+
+### Scenario: Streaming Anthropic→OpenAI success produces response dump
+- GIVEN a route has only `endpoint_openai` configured
+- AND an Anthropic streaming `/v1/messages` request is routed to that section
+- AND diagnostics `dump_mode = "all"`
+- WHEN the OpenAI upstream SSE stream completes successfully
+- THEN the dump output contains an `egress/response` entry for the same `request_id` as the request dumps and stats event
+- AND the response dump body contains the captured raw OpenAI SSE response up to the configured streaming dump limit
+- AND the response dump headers contain the upstream response headers
+
+### Scenario: Streaming OpenAI→Anthropic success produces response dump
+- GIVEN a route has only `endpoint_anthropic` configured
+- AND an OpenAI streaming `/v1/chat/completions` request is routed to that section
+- AND diagnostics `dump_mode = "all"`
+- WHEN the Anthropic upstream SSE stream completes successfully
+- THEN the dump output contains an `egress/response` entry for the same `request_id` as the request dumps and stats event
+- AND the response dump body contains the captured raw Anthropic SSE response up to the configured streaming dump limit
+- AND the response dump headers contain the upstream response headers
+
 ## Requirement: Egress and Response Dumps Use Actual Upstream Headers (All Handlers)
 
 All `egress_dump` calls in `interactions_handler.rs`, `openai.rs`, and
@@ -239,6 +286,13 @@ All dump events for a single request share the same `request_id` as the correspo
 - THEN a response dump is guaranteed by the method itself — the two-call pattern is eliminated
 - AND the invariant holds for all handlers (passthrough, conversion, interactions, split-send)
 
+### Scenario: Protocol conversion success produces full dump set
+- GIVEN `dump_mode = "all"`
+- AND a request completes successfully through any protocol conversion direction (Anthropic→OpenAI or OpenAI→Anthropic, streaming or non-streaming)
+- WHEN dump events are flushed
+- THEN the output includes `ingress/request`, `egress/request`, and `egress/response` entries
+- AND all entries share the same `request_id`
+
 ### Scenario: No dump when dump_mode is off
 - GIVEN `dump_mode = "off"`
 - WHEN a request completes (any handler)
@@ -281,6 +335,14 @@ This includes all code paths:
 - WHEN the stream completes
 - THEN a stats line is written with `"streaming": true` and `response_size_bytes` set to the accumulated byte count
 - AND the stats line is written from within the spawned stream-processing task
+
+### Scenario: Streaming conversion stats are finalized on stream completion
+- GIVEN `stats_mode = "all"`
+- AND a streaming protocol-conversion request completes successfully
+- WHEN the translated client stream reaches EOF (upstream byte stream returns None, or translator signals completion)
+- THEN a stats line is written with `streaming: true` and `response_size_bytes` set to the accumulated raw upstream byte count
+- AND the stats line shares `request_id` with the response dump
+- AND the guard is finalized from within the stream-processing task, not eagerly before the stream is consumed
 
 ### Scenario: Error request produces stats
 - GIVEN `stats_mode = "error"` (or `"all"`) and the upstream returns a non-2xx status
@@ -787,3 +849,13 @@ A helper function in `src/sse.rs` that converts a raw SSE byte buffer into a `Du
 - WHEN the resulting headers are inspected
 - THEN `content-type` is absent from the output
 - AND the explicit `Content-Type: application/json` set by each handler is the sole Content-Type header on the wire
+
+## Requirement: Interactions Client Disconnect Response Dump Exception Is Documented
+
+Interactions streaming handlers may finalize the guard with status 499 without recording an `egress/response` dump when the downstream client disconnects before the upstream stream completes. The code path contains a short comment explaining that no response dump is recorded because there is no complete upstream response to dump.
+
+### Scenario: Interactions stream client disconnect is documented
+- GIVEN an interactions stream is forwarding upstream events to the client
+- WHEN sending to the client fails before upstream EOF
+- THEN the guard is finalized with status 499
+- AND the implementation comment explains why no response dump is recorded on that early-return path

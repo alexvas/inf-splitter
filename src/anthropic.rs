@@ -297,7 +297,8 @@ impl AnthropicHandler {
             return relay_error_body(status, error_body, &self.error_translation);
         }
 
-        let anthropic_resp: MessageResponse = upstream.json().await.map_err(|e| {
+        let response_headers = copy_response_headers(upstream.headers());
+        let upstream_bytes = upstream.bytes().await.map_err(|e| {
             guard.abort_upstream(
                 duration_ms,
                 request_size,
@@ -307,6 +308,24 @@ impl AnthropicHandler {
                 e,
             )
         })?;
+        let response_size = upstream_bytes.len();
+        let anthropic_resp: MessageResponse =
+            serde_json::from_slice(&upstream_bytes).map_err(|e| {
+                guard.abort_upstream(
+                    duration_ms,
+                    request_size,
+                    anthropic_endpoint,
+                    "openai->anthropic",
+                    false,
+                    format!("failed to deserialize upstream response: {e}"),
+                )
+            })?;
+        guard.response_dump(
+            crate::diagnostics::dump_body_from_bytes(&upstream_bytes),
+            200,
+            false,
+            response_headers.clone(),
+        );
         let openai_resp =
             translate_anthropic_to_openai_response(&anthropic_resp, &openai_req.model);
 
@@ -314,7 +333,7 @@ impl AnthropicHandler {
             200,
             duration_ms,
             request_size,
-            None,
+            Some(response_size),
             anthropic_endpoint,
             "openai->anthropic",
             false,
@@ -417,10 +436,26 @@ impl AnthropicHandler {
             return relay_error_body(status, error_body, &self.error_translation);
         }
 
+        // Extract upstream headers for response dump before consuming the stream body.
+        let upstream_header_pairs: Vec<(String, String)> = upstream
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    v.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+
+        let guard = std::sync::Arc::new(guard);
+        let guard_stream = std::sync::Arc::clone(&guard);
+
         let model = openai_req.model.clone();
         let byte_stream = upstream
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
+        let upstream_url = anthropic_endpoint.to_string();
 
         let sse_stream = futures::stream::unfold(
             (
@@ -429,8 +464,28 @@ impl AnthropicHandler {
                 String::new(),
                 model,
                 false,
+                Vec::<u8>::new(),
+                guard_stream,
+                upstream_header_pairs,
+                duration_ms,
+                request_size,
+                upstream_url,
+                false,
             ),
-            |(mut byte_stream, mut translator, mut buffer, model, sent_done)| async move {
+            |(
+                mut byte_stream,
+                mut translator,
+                mut buffer,
+                model,
+                sent_done,
+                mut raw_capture,
+                guard,
+                upstream_headers,
+                duration_ms,
+                request_size,
+                upstream_url,
+                mut guard_finalized,
+            )| async move {
                 if sent_done {
                     return None;
                 }
@@ -456,13 +511,56 @@ impl AnthropicHandler {
                                     let payload = sse::format_openai_sse_chunk(&chunk);
                                     return Some((
                                         Ok(bytes::Bytes::from(payload)),
-                                        (byte_stream, translator, buffer, model, sent_done),
+                                        (
+                                            byte_stream,
+                                            translator,
+                                            buffer,
+                                            model,
+                                            sent_done,
+                                            raw_capture,
+                                            guard,
+                                            upstream_headers,
+                                            duration_ms,
+                                            request_size,
+                                            upstream_url,
+                                            guard_finalized,
+                                        ),
                                     ));
                                 }
                                 if active.is_done() {
+                                    if !guard_finalized {
+                                        guard.response_dump_streaming(
+                                            crate::diagnostics::dump_body_from_bytes(&raw_capture),
+                                            200,
+                                            upstream_headers.clone(),
+                                        );
+                                        guard.finish(
+                                            200,
+                                            duration_ms,
+                                            request_size,
+                                            Some(raw_capture.len()),
+                                            &upstream_url,
+                                            "openai->anthropic",
+                                            true,
+                                        );
+                                        guard_finalized = true;
+                                    }
                                     return Some((
                                         Ok(bytes::Bytes::from("data: [DONE]\n\n")),
-                                        (byte_stream, translator, buffer, model, true),
+                                        (
+                                            byte_stream,
+                                            translator,
+                                            buffer,
+                                            model,
+                                            true,
+                                            raw_capture,
+                                            guard,
+                                            upstream_headers,
+                                            duration_ms,
+                                            request_size,
+                                            upstream_url,
+                                            guard_finalized,
+                                        ),
                                     ));
                                 }
                             }
@@ -472,6 +570,12 @@ impl AnthropicHandler {
 
                     match byte_stream.next().await {
                         Some(Ok(chunk)) => {
+                            if raw_capture.len() < crate::relay::MAX_STREAMING_DUMP_BYTES {
+                                let remaining =
+                                    crate::relay::MAX_STREAMING_DUMP_BYTES - raw_capture.len();
+                                let to_take = std::cmp::min(chunk.len(), remaining);
+                                raw_capture.extend_from_slice(&chunk[..to_take]);
+                            }
                             match String::from_utf8(chunk.to_vec()) {
                                 Ok(s) => buffer.push_str(&s),
                                 Err(e) => {
@@ -480,25 +584,114 @@ impl AnthropicHandler {
                                 }
                             }
                             if buffer.len() > sse::MAX_SSE_LINE_LENGTH {
+                                if !guard_finalized {
+                                    guard.response_dump_streaming(
+                                        crate::diagnostics::dump_body_from_bytes(&raw_capture),
+                                        200,
+                                        upstream_headers.clone(),
+                                    );
+                                    guard.finish(
+                                        200,
+                                        duration_ms,
+                                        request_size,
+                                        Some(raw_capture.len()),
+                                        &upstream_url,
+                                        "openai->anthropic",
+                                        true,
+                                    );
+                                }
                                 return Some((
                                     Err(std::io::Error::other("SSE line too long")),
-                                    (byte_stream, translator, buffer, model, sent_done),
+                                    (
+                                        byte_stream,
+                                        translator,
+                                        buffer,
+                                        model,
+                                        sent_done,
+                                        raw_capture,
+                                        guard,
+                                        upstream_headers,
+                                        duration_ms,
+                                        request_size,
+                                        upstream_url,
+                                        guard_finalized,
+                                    ),
                                 ));
                             }
                         }
                         Some(Err(err)) => {
+                            if !guard_finalized {
+                                guard.response_dump_streaming(
+                                    crate::diagnostics::dump_body_from_bytes(&raw_capture),
+                                    200,
+                                    upstream_headers.clone(),
+                                );
+                                guard.finish_with_error(
+                                    200,
+                                    duration_ms,
+                                    request_size,
+                                    Some(raw_capture.len()),
+                                    &upstream_url,
+                                    "openai->anthropic",
+                                    true,
+                                    format!("stream error: {err}"),
+                                );
+                            }
                             return Some((
                                 Err(err),
-                                (byte_stream, translator, buffer, model, sent_done),
+                                (
+                                    byte_stream,
+                                    translator,
+                                    buffer,
+                                    model,
+                                    sent_done,
+                                    raw_capture,
+                                    guard,
+                                    upstream_headers,
+                                    duration_ms,
+                                    request_size,
+                                    upstream_url,
+                                    guard_finalized,
+                                ),
                             ));
                         }
                         None => {
+                            if !guard_finalized {
+                                guard.response_dump_streaming(
+                                    crate::diagnostics::dump_body_from_bytes(&raw_capture),
+                                    200,
+                                    upstream_headers.clone(),
+                                );
+                                guard.finish(
+                                    200,
+                                    duration_ms,
+                                    request_size,
+                                    Some(raw_capture.len()),
+                                    &upstream_url,
+                                    "openai->anthropic",
+                                    true,
+                                );
+                                guard_finalized = true;
+                            }
                             if sent_done {
                                 return None;
                             }
                             return Some((
                                 Ok(bytes::Bytes::from("data: [DONE]\n\n")),
-                                (byte_stream, translator, buffer, model, true),
+                                (
+                                    byte_stream,
+                                    translator,
+                                    buffer,
+                                    model,
+                                    true,
+                                    raw_capture,
+                                    guard,
+                                    upstream_headers,
+                                    duration_ms,
+                                    request_size,
+                                    upstream_url,
+                                    guard_finalized,
+                                ),
                             ));
                         }
                     }
@@ -516,16 +709,6 @@ impl AnthropicHandler {
                 e,
             )
         })?;
-
-        guard.finish(
-            200,
-            duration_ms,
-            request_size,
-            None,
-            anthropic_endpoint,
-            "openai->anthropic",
-            true,
-        );
 
         Ok(resp)
     }

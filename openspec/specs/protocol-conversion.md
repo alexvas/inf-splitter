@@ -46,6 +46,36 @@ Both streaming (`handle_stream_manual`) and non-streaming (`handle_sync_manual`)
 - WHEN routing to an OpenAI-only section
 - THEN each SSE event from the upstream is translated to Anthropic streaming format and streamed back
 
+## Requirement: Conversion Handlers Preserve Raw Upstream Responses for Diagnostics
+
+Conversion handlers must preserve raw upstream response bytes long enough to record diagnostics before translating the response back to the ingress protocol. For non-streaming paths, upstream bytes are read once, the dump is recorded from those bytes, then deserialization and translation proceed from the same buffer. For streaming paths, raw upstream SSE bytes are accumulated into a capture buffer up to `MAX_STREAMING_DUMP_BYTES` while the translation stream runs, and the dump is recorded when the upstream stream completes (returns `None`) or the translator signals completion.
+
+### Scenario: Successful OpenAI JSON response is dumped before Anthropic translation
+- GIVEN an Anthropic request is converted and sent to an OpenAI upstream
+- AND the upstream returns a successful JSON chat completion response
+- WHEN the handler translates the response back to Anthropic format
+- THEN diagnostics record the raw OpenAI JSON response body before translation
+- AND the client still receives the translated Anthropic response
+
+### Scenario: Successful Anthropic JSON response is dumped before OpenAI translation
+- GIVEN an OpenAI request is converted and sent to an Anthropic upstream
+- AND the upstream returns a successful JSON message response
+- WHEN the handler translates the response back to OpenAI format
+- THEN diagnostics record the raw Anthropic JSON response body before translation
+- AND the client still receives the translated OpenAI response
+
+### Scenario: Successful OpenAI SSE response is dumped while Anthropic streaming translation continues
+- GIVEN an Anthropic streaming request is converted and sent to an OpenAI upstream
+- AND the upstream returns an OpenAI SSE stream
+- WHEN the handler translates SSE chunks back to Anthropic SSE events
+- THEN diagnostics capture the raw OpenAI SSE bytes without changing the client-visible translated stream
+
+### Scenario: Successful Anthropic SSE response is dumped while OpenAI streaming translation continues
+- GIVEN an OpenAI streaming request is converted and sent to an Anthropic upstream
+- AND the upstream returns an Anthropic SSE stream
+- WHEN the handler translates SSE chunks back to OpenAI SSE events
+- THEN diagnostics capture the raw Anthropic SSE bytes without changing the client-visible translated stream
+
 ## Requirement: Token Limit Injection
 
 Token limits (`max_tokens`, `max_output_tokens`, `max_completion_tokens`) are injected into outgoing requests:

@@ -321,7 +321,8 @@ impl OpenAiHandler {
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
 
-        let openai_resp: ChatCompletionResponse = upstream.json().await.map_err(|e| {
+        let response_headers = upstream.headers().clone();
+        let upstream_bytes = upstream.bytes().await.map_err(|e| {
             guard.abort_upstream(
                 duration_ms,
                 request_size,
@@ -331,13 +332,40 @@ impl OpenAiHandler {
                 e,
             )
         })?;
+        let response_size = upstream_bytes.len();
+        let openai_resp: ChatCompletionResponse =
+            serde_json::from_slice(&upstream_bytes).map_err(|e| {
+                guard.abort_upstream(
+                    duration_ms,
+                    request_size,
+                    openai_endpoint,
+                    "anthropic->openai",
+                    false,
+                    format!("failed to deserialize upstream response: {e}"),
+                )
+            })?;
+        let response_header_pairs: Vec<(String, String)> = response_headers
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    v.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        guard.response_dump(
+            crate::diagnostics::dump_body_from_bytes(&upstream_bytes),
+            200,
+            false,
+            response_header_pairs,
+        );
         let response = translate_response(&openai_resp, &req.model);
 
         guard.finish(
             200,
             duration_ms,
             request_size,
-            None,
+            Some(response_size),
             openai_endpoint,
             "anthropic->openai",
             false,
@@ -453,14 +481,50 @@ impl OpenAiHandler {
                 .map_err(|err| AppError::Internal(err.to_string()));
         }
 
+        // Extract upstream headers for response dump before consuming the stream body.
+        let upstream_header_pairs: Vec<(String, String)> = upstream
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    v.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+
+        let guard = std::sync::Arc::new(guard);
+        let guard_stream = std::sync::Arc::clone(&guard);
+
         let model = req.model.clone();
         let byte_stream = upstream
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
+        let upstream_url = openai_endpoint.to_string();
 
         let sse_stream = futures::stream::unfold(
-            (byte_stream, StreamingTranslator::new(model), String::new()),
-            |(mut byte_stream, mut translator, mut buffer)| async move {
+            (
+                byte_stream,
+                StreamingTranslator::new(model),
+                String::new(),
+                Vec::<u8>::new(),
+                guard_stream,
+                upstream_header_pairs,
+                duration_ms,
+                request_size,
+                upstream_url,
+            ),
+            |(
+                mut byte_stream,
+                mut translator,
+                mut buffer,
+                mut raw_capture,
+                guard,
+                upstream_headers,
+                duration_ms,
+                request_size,
+                upstream_url,
+            )| async move {
                 loop {
                     if let Some(line_end) = buffer.find('\n') {
                         let line = buffer[..line_end].trim_end_matches('\r').to_string();
@@ -472,7 +536,17 @@ impl OpenAiHandler {
                                 .collect::<String>();
                             return Some((
                                 Ok(bytes::Bytes::from(payload)),
-                                (byte_stream, translator, buffer),
+                                (
+                                    byte_stream,
+                                    translator,
+                                    buffer,
+                                    raw_capture,
+                                    guard,
+                                    upstream_headers,
+                                    duration_ms,
+                                    request_size,
+                                    upstream_url,
+                                ),
                             ));
                         }
                         continue;
@@ -480,6 +554,12 @@ impl OpenAiHandler {
 
                     match byte_stream.next().await {
                         Some(Ok(chunk)) => {
+                            if raw_capture.len() < crate::relay::MAX_STREAMING_DUMP_BYTES {
+                                let remaining =
+                                    crate::relay::MAX_STREAMING_DUMP_BYTES - raw_capture.len();
+                                let to_take = std::cmp::min(chunk.len(), remaining);
+                                raw_capture.extend_from_slice(&chunk[..to_take]);
+                            }
                             match String::from_utf8(chunk.to_vec()) {
                                 Ok(s) => buffer.push_str(&s),
                                 Err(e) => {
@@ -488,16 +568,84 @@ impl OpenAiHandler {
                                 }
                             }
                             if buffer.len() > sse::MAX_SSE_LINE_LENGTH {
+                                guard.response_dump_streaming(
+                                    crate::diagnostics::dump_body_from_bytes(&raw_capture),
+                                    200,
+                                    upstream_headers.clone(),
+                                );
+                                guard.finish(
+                                    200,
+                                    duration_ms,
+                                    request_size,
+                                    Some(raw_capture.len()),
+                                    &upstream_url,
+                                    "anthropic->openai",
+                                    true,
+                                );
                                 return Some((
                                     Err(std::io::Error::other("SSE line too long")),
-                                    (byte_stream, translator, buffer),
+                                    (
+                                        byte_stream,
+                                        translator,
+                                        buffer,
+                                        raw_capture,
+                                        guard,
+                                        upstream_headers,
+                                        duration_ms,
+                                        request_size,
+                                        upstream_url,
+                                    ),
                                 ));
                             }
                         }
                         Some(Err(err)) => {
-                            return Some((Err(err), (byte_stream, translator, buffer)));
+                            guard.response_dump_streaming(
+                                crate::diagnostics::dump_body_from_bytes(&raw_capture),
+                                200,
+                                upstream_headers.clone(),
+                            );
+                            guard.finish_with_error(
+                                200,
+                                duration_ms,
+                                request_size,
+                                Some(raw_capture.len()),
+                                &upstream_url,
+                                "anthropic->openai",
+                                true,
+                                format!("stream error: {err}"),
+                            );
+                            return Some((
+                                Err(err),
+                                (
+                                    byte_stream,
+                                    translator,
+                                    buffer,
+                                    raw_capture,
+                                    guard,
+                                    upstream_headers,
+                                    duration_ms,
+                                    request_size,
+                                    upstream_url,
+                                ),
+                            ));
                         }
                         None => {
+                            // Stream completed — record response dump and finalize guard before
+                            // flushing final translated events to the client.
+                            guard.response_dump_streaming(
+                                crate::diagnostics::dump_body_from_bytes(&raw_capture),
+                                200,
+                                upstream_headers.clone(),
+                            );
+                            guard.finish(
+                                200,
+                                duration_ms,
+                                request_size,
+                                Some(raw_capture.len()),
+                                &upstream_url,
+                                "anthropic->openai",
+                                true,
+                            );
                             let payload = translator
                                 .finish()
                                 .iter()
@@ -508,7 +656,17 @@ impl OpenAiHandler {
                             }
                             return Some((
                                 Ok(bytes::Bytes::from(payload)),
-                                (byte_stream, translator, buffer),
+                                (
+                                    byte_stream,
+                                    translator,
+                                    buffer,
+                                    raw_capture,
+                                    guard,
+                                    upstream_headers,
+                                    duration_ms,
+                                    request_size,
+                                    upstream_url,
+                                ),
                             ));
                         }
                     }
@@ -526,16 +684,6 @@ impl OpenAiHandler {
                 e,
             )
         })?;
-
-        guard.finish(
-            200,
-            duration_ms,
-            request_size,
-            None,
-            openai_endpoint,
-            "anthropic->openai",
-            true,
-        );
 
         Ok(resp)
     }

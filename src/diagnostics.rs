@@ -788,7 +788,7 @@ impl RequestDiagnostics {
     /// Record error stats and mark the guard as finished. Idempotent.
     /// Flushes deferred ingress/egress dumps with `is_error: true`.
     #[allow(clippy::too_many_arguments)]
-    fn finish_with_error(
+    pub(crate) fn finish_with_error(
         &self,
         status: u16,
         duration_ms: u64,

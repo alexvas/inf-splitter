@@ -1309,6 +1309,399 @@ models = "ao-model"
     assert!(has_egress, "translation dump must have egress stage");
 }
 
+// ── Regression: conversion success paths missing egress/response dumps ──
+
+/// Non-streaming Anthropic→OpenAI conversion success with `dump_mode = "all"`
+/// must write an `egress/response` dump with the raw OpenAI upstream body and headers.
+#[tokio::test]
+async fn anthropic_to_openai_non_streaming_success_egress_response_dump() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/chat/completions",
+        captured,
+        openai_upstream_response("ao-er-model", "ao-upstream-reply"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-ao-er-ns-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_openai = "http://{upstream_addr}"
+models = "ao-er-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "ao-er-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _ = response.text().await.expect("response body");
+
+    let lines = wait_for_egress_response_dump(&tmp).await;
+
+    assert!(
+        !lines.is_empty(),
+        "must have at least one egress response dump, got: {lines:?}"
+    );
+
+    assert_unique_requests(&lines);
+
+    // Find the egress/response dump line
+    let egress_resp: serde_json::Value = lines
+        .iter()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            if v["stage"] == "egress" && v["direction"] == "response" {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .next()
+        .expect("must have egress/response dump");
+
+    assert_eq!(egress_resp["model"], "ao-er-model");
+    assert_eq!(egress_resp["status"], 200);
+
+    // Body must be raw OpenAI upstream response (not translated Anthropic)
+    let body_contains = |v: &serde_json::Value| -> bool {
+        v.as_str()
+            .map(|s| s.contains("ao-upstream-reply"))
+            .unwrap_or_else(|| {
+                v.as_object()
+                    .and_then(|o| o.get("choices"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|ch| ch.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s == "ao-upstream-reply")
+                    .unwrap_or(false)
+            })
+    };
+    assert!(
+        body_contains(&egress_resp["body"]),
+        "response dump body must be raw OpenAI upstream response, got: {}",
+        egress_resp["body"]
+    );
+
+    // Headers must include upstream content-type
+    assert!(
+        egress_resp["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h[0] == "content-type" && h[1].as_str().unwrap().contains("application/json")),
+        "response dump must include upstream content-type header"
+    );
+
+    // Dump must have all three: ingress/request, egress/request, egress/response
+    let request_id = egress_resp["request_id"].as_str().unwrap();
+    let has_ingress_req = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"] == "ingress" && v["direction"] == "request" && v["request_id"] == request_id
+    });
+    let has_egress_req = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"] == "egress" && v["direction"] == "request" && v["request_id"] == request_id
+    });
+    assert!(has_ingress_req, "must have ingress/request dump");
+    assert!(has_egress_req, "must have egress/request dump");
+}
+
+/// Non-streaming OpenAI→Anthropic conversion success with `dump_mode = "all"`
+/// must write an `egress/response` dump with the raw Anthropic upstream body and headers.
+#[tokio::test]
+async fn openai_to_anthropic_non_streaming_success_egress_response_dump() {
+    let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+    let upstream_addr = spawn_upstream(
+        "/v1/messages",
+        captured,
+        anthropic_upstream_response("oa-er-model", "oa-upstream-reply"),
+    )
+    .await;
+
+    let tmp = std::env::temp_dir().join(format!("inf-splitter-oa-er-ns-{}.ndjson", uuid_suffix()));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "oa-er-model"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "oa-er-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _ = response.text().await.expect("response body");
+
+    let lines = wait_for_egress_response_dump(&tmp).await;
+
+    assert!(
+        !lines.is_empty(),
+        "must have at least one egress response dump, got: {lines:?}"
+    );
+
+    assert_unique_requests(&lines);
+
+    // Find the egress/response dump line
+    let egress_resp: serde_json::Value = lines
+        .iter()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            if v["stage"] == "egress" && v["direction"] == "response" {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .next()
+        .expect("must have egress/response dump");
+
+    assert_eq!(egress_resp["model"], "oa-er-model");
+    assert_eq!(egress_resp["status"], 200);
+
+    // Body must be raw Anthropic upstream response (not translated OpenAI)
+    let body_contains = |v: &serde_json::Value| -> bool {
+        v.as_str()
+            .map(|s| s.contains("oa-upstream-reply"))
+            .unwrap_or_else(|| {
+                v.as_object()
+                    .and_then(|o| o.get("content"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|b| b.get("text"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s == "oa-upstream-reply")
+                    .unwrap_or(false)
+            })
+    };
+    assert!(
+        body_contains(&egress_resp["body"]),
+        "response dump body must be raw Anthropic upstream response, got: {}",
+        egress_resp["body"]
+    );
+
+    // Headers must include upstream content-type
+    assert!(
+        egress_resp["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h[0] == "content-type" && h[1].as_str().unwrap().contains("application/json")),
+        "response dump must include upstream content-type header"
+    );
+
+    // Dump must have all three: ingress/request, egress/request, egress/response
+    let request_id = egress_resp["request_id"].as_str().unwrap();
+    let has_ingress_req = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"] == "ingress" && v["direction"] == "request" && v["request_id"] == request_id
+    });
+    let has_egress_req = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["stage"] == "egress" && v["direction"] == "request" && v["request_id"] == request_id
+    });
+    assert!(has_ingress_req, "must have ingress/request dump");
+    assert!(has_egress_req, "must have egress/request dump");
+}
+
+// ── Streaming conversion success egress/response dumps ──
+
+/// Streaming Anthropic→OpenAI conversion success with `dump_mode = "all"`
+/// must write an `egress/response` dump when the stream completes.
+#[tokio::test]
+async fn anthropic_to_openai_streaming_success_egress_response_dump() {
+    let sse_body = "\
+data: {\"id\":\"chatcmpl-001\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"ao-stream-er\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"streamed-ao-text\"},\"finish_reason\":null}]}\n\
+\ndata: [DONE]\n\
+\n";
+
+    let upstream_addr = spawn_stream_upstream("/v1/chat/completions", sse_body.to_string()).await;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "inf-splitter-ao-stream-er-{}.ndjson",
+        uuid_suffix()
+    ));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_openai = "http://{upstream_addr}"
+models = "ao-stream-er"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_anthropic(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "ao-stream-er",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert!(response.status().is_success());
+    let _ = response.text().await.expect("consume SSE stream");
+
+    let lines = wait_for_egress_response_dump(&tmp).await;
+
+    assert!(
+        !lines.is_empty(),
+        "must have at least one egress response dump, got: {lines:?}"
+    );
+    assert_unique_requests(&lines);
+
+    let egress_resp: serde_json::Value = lines
+        .iter()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            if v["stage"] == "egress" && v["direction"] == "response" {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .next()
+        .expect("must have egress/response dump");
+
+    assert_eq!(egress_resp["status"], 200);
+    // Body should contain raw upstream SSE data
+    assert!(
+        egress_resp["body"]
+            .as_str()
+            .unwrap()
+            .contains("streamed-ao-text"),
+        "response dump must contain raw upstream SSE text, got: {}",
+        egress_resp["body"]
+    );
+}
+
+/// Streaming OpenAI→Anthropic conversion success with `dump_mode = "all"`
+/// must write an `egress/response` dump when the stream completes.
+#[tokio::test]
+async fn openai_to_anthropic_streaming_success_egress_response_dump() {
+    let sse_body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_001\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"oa-stream-er\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":5}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"streamed-oa-text\"}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+";
+
+    let upstream_addr = spawn_stream_upstream("/v1/messages", sse_body.to_string()).await;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "inf-splitter-oa-stream-er-{}.ndjson",
+        uuid_suffix()
+    ));
+    let config = format!(
+        r#"
+listen_port = 0
+
+[remote]
+endpoint_anthropic = "http://{upstream_addr}"
+models = "oa-stream-er"
+"#
+    );
+
+    let diag_config = DiagnosticsConfig {
+        dump_mode: DiagnosticMode::All,
+        dump_output: Sink::File(tmp.clone()),
+        ..DiagnosticsConfig::default()
+    };
+    let proxy_addr = spawn_router_with_diagnostics(&config, diag_config).await;
+    let response = post_openai(
+        &proxy_addr,
+        serde_json::json!({
+            "model": "oa-stream-er",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert!(response.status().is_success());
+    let _ = response.text().await.expect("consume SSE stream");
+
+    let lines = wait_for_egress_response_dump(&tmp).await;
+
+    assert!(
+        !lines.is_empty(),
+        "must have at least one egress response dump, got: {lines:?}"
+    );
+    assert_unique_requests(&lines);
+
+    let egress_resp: serde_json::Value = lines
+        .iter()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            if v["stage"] == "egress" && v["direction"] == "response" {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .next()
+        .expect("must have egress/response dump");
+
+    assert_eq!(egress_resp["status"], 200);
+    // Body should contain raw upstream SSE data
+    assert!(
+        egress_resp["body"]
+            .as_str()
+            .unwrap()
+            .contains("streamed-oa-text"),
+        "response dump must contain raw upstream SSE text, got: {}",
+        egress_resp["body"]
+    );
+}
+
 /// Streaming passthrough must record `streaming: true` in stats (not hardcoded false).
 #[tokio::test]
 async fn streaming_passthrough_records_streaming_true_in_stats() {

@@ -667,6 +667,10 @@ impl InteractionsHandler {
                                                         sse::format_openai_sse_chunk(&chunk);
                                                     let payload = bytes::Bytes::from(payload);
                                                     if tx.send(Ok(payload)).await.is_err() {
+                                                        // Client disconnected before upstream
+                                                        // stream completed — no egress/response
+                                                        // dump is recorded because the upstream
+                                                        // response was never fully received.
                                                         let duration_ms =
                                                             start.elapsed().as_millis() as u64;
                                                         guard.finish(
@@ -685,6 +689,10 @@ impl InteractionsHandler {
                                         } else {
                                             let payload = sse::format_sse_event(event);
                                             if tx.send(Ok(payload)).await.is_err() {
+                                                // Client disconnected before upstream
+                                                // stream completed — no egress/response
+                                                // dump is recorded because the upstream
+                                                // response was never fully received.
                                                 let duration_ms =
                                                     start.elapsed().as_millis() as u64;
                                                 guard.finish(

@@ -146,13 +146,26 @@ impl InteractionsHandler {
         let system = interactions_lib::extract_anthropic_system(&body_val);
         let (tools, tool_choice) = interactions_lib::extract_anthropic_tools(&body_val);
 
-        let prev_id = if session.interaction_id.is_empty() {
+        let prev_id = if start_index == 0 {
+            // Context reset — client started fresh conversation.
+            // Clear previous_interaction_id so the upstream creates a new interaction.
+            None
+        } else if session.interaction_id.is_empty() {
             None
         } else {
             Some(session.interaction_id.as_str())
         };
 
-        // Build the request
+        // Exact retry — all messages already delivered. Replay existing interaction.
+        if start_index == incoming_count {
+            if let Some(pid) = prev_id {
+                return self
+                    .replay_interaction(pid, route, &session_id, &model, Protocol::Anthropic, guard)
+                    .await;
+            }
+        }
+
+        // Build the request (Anthropic ingress)
         let params = interactions_lib::build_interactions_request_anthropic(
             &cleaned_messages,
             start_index,
@@ -299,16 +312,29 @@ impl InteractionsHandler {
             .unwrap_or(false);
         let temperature = body_val.get("temperature").and_then(|v| v.as_f64());
         let ingress_max_tokens = body_val
-            .get("max_tokens")
+            .get("max_completion_tokens")
             .and_then(|v| v.as_u64())
+            .or_else(|| body_val.get("max_tokens").and_then(|v| v.as_u64()))
             .map(clamp_max_tokens);
         let (tools, tool_choice) = interactions_lib::extract_openai_tools(&body_val);
 
-        let prev_id = if session.interaction_id.is_empty() {
+        let prev_id = if start_index == 0 {
+            // Context reset — client started fresh conversation.
+            None
+        } else if session.interaction_id.is_empty() {
             None
         } else {
             Some(session.interaction_id.as_str())
         };
+
+        // Exact retry — all messages already delivered. Replay existing interaction.
+        if start_index == incoming_count {
+            if let Some(pid) = prev_id {
+                return self
+                    .replay_interaction(pid, route, &session_id, &model, Protocol::OpenAi, guard)
+                    .await;
+            }
+        }
 
         let params = interactions_lib::build_interactions_request_openai(
             &cleaned_messages,
@@ -383,6 +409,99 @@ impl InteractionsHandler {
             guard,
         )
         .await
+    }
+
+    /// Fetch and translate an existing interaction (exact retry recovery).
+    async fn replay_interaction(
+        &self,
+        interaction_id: &str,
+        route: &RouteTarget,
+        session_id: &str,
+        model: &str,
+        ingress: Protocol,
+        guard: crate::diagnostics::RequestDiagnostics,
+    ) -> Result<Response, AppError> {
+        let url = build_interaction_url(route, &format!("/{interaction_id}"));
+        let start = std::time::Instant::now();
+
+        let upstream = match self
+            .get_client(route.proxy.as_deref())
+            .get(&url)
+            .header("x-goog-api-key", route.api_key.as_deref().unwrap_or(""))
+            .header("Content-Type", "application/json")
+            .header("Api-Revision", "2026-05-20")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let dur = start.elapsed().as_millis() as u64;
+                return Err(guard.abort_upstream(dur, 0, &url, "replay", false, e));
+            }
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        if !upstream.status().is_success() {
+            let status = upstream.status();
+            let error_body = upstream.text().await.unwrap_or_default();
+            guard.finish_with_upstream_error(
+                status.as_u16(),
+                duration_ms,
+                0,
+                &url,
+                "replay",
+                false,
+                error_body.clone(),
+                vec![],
+            );
+            let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
+            let body = crate::apply_error_translation(sc, body, &self.error_translation);
+            return Response::builder()
+                .status(sc)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(Self::session_header_name(ingress), session_id)
+                .body(Body::from(body))
+                .map_err(|err| AppError::Internal(err.to_string()));
+        }
+
+        let status_code = upstream.status().as_u16();
+        let body_bytes = match upstream.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(guard.abort_upstream(duration_ms, 0, &url, "replay", false, e));
+            }
+        };
+        let validated = match crate::validate_upstream_body(body_bytes, &guard.request_id()) {
+            Ok(v) => v,
+            Err((e, dump)) => {
+                guard.response_dump(dump, 502, true, vec![]);
+                return Err(guard.abort_upstream(duration_ms, 0, &url, "replay", false, e));
+            }
+        };
+        let interaction: Interaction = serde_json::from_str(&validated.text)
+            .map_err(|e| guard.abort_internal(duration_ms, 0, &url, "replay", false, e))?;
+        let response_json =
+            interactions_lib::build_response_from_interaction(&interaction, model, ingress)
+                .map_err(|e| guard.abort_internal(duration_ms, 0, &url, "replay", false, e))?;
+        guard.finish(
+            status_code,
+            duration_ms,
+            0,
+            Some(validated.text.len()),
+            &url,
+            "replay",
+            false,
+        );
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(Self::session_header_name(ingress), session_id)
+            .body(Body::from(
+                serde_json::to_vec(&response_json)
+                    .map_err(|e| AppError::Internal(e.to_string()))?,
+            ))
+            .map_err(|err| AppError::Internal(err.to_string()))
     }
 
     /// Send a single interaction request and translate response.
@@ -730,11 +849,15 @@ impl InteractionsHandler {
                                             }
                                         }
                                     }
-                                    // Track interaction_id from interaction.created events
+                                    // Eagerly persist interaction_id from interaction.created
+                                    // so client-disconnect recovery has a valid ID to probe.
                                     if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
                                         serde_json::from_str::<InteractionSseEvent>(data)
                                     {
-                                        interaction_id = ev.interaction.id;
+                                        interaction_id = ev.interaction.id.clone();
+                                        let _ = session_store
+                                            .update(&sid, ev.interaction.id, new_count, true)
+                                            .await;
                                     }
                                 }
                             }
@@ -882,6 +1005,14 @@ impl InteractionsHandler {
                 .map(|v| v.len())
                 .unwrap_or(0);
             if empty_size > limit {
+                // Compute envelope overhead (everything except system_instruction text)
+                // so split_text_for_limit produces chunks that fit when wrapped.
+                let envelope_without_sys = {
+                    let mut env = first_envelope.clone();
+                    env.system_instruction = Some(String::new());
+                    serde_json::to_vec(&env).map(|v| v.len()).unwrap_or(0)
+                };
+                let sys_limit = limit.saturating_sub(envelope_without_sys);
                 return self
                     .send_split_system_instruction(
                         sys,
@@ -890,7 +1021,7 @@ impl InteractionsHandler {
                         session_id,
                         &chunks,
                         total_message_count,
-                        limit,
+                        sys_limit,
                         model,
                         upstream_label,
                         ingress_body,
@@ -1026,20 +1157,22 @@ impl InteractionsHandler {
 
             // Update session after each successful chunk so retries don't
             // re-send already-accepted content upstream.
-            let total_delta: usize = chunks.iter().map(|c| c.len()).sum();
-            let initial_delivered = total_message_count.saturating_sub(total_delta);
-            let delivered_so_far: usize =
-                initial_delivered + chunks[..=i].iter().map(|c| c.len()).sum::<usize>();
+            // delivered_so_far estimates ingress message count from Content
+            // proportions since Content items may differ from message count.
+            let total_items: usize = chunks.iter().map(|c| c.len()).sum();
+            let delivered_items: usize = chunks[..=i].iter().map(|c| c.len()).sum();
+            let delivered_so_far: usize = if total_items > 0 {
+                let initial_delivered = total_message_count.saturating_sub(total_items);
+                let proportion = delivered_items as f64 / total_items as f64;
+                (initial_delivered as f64 + proportion * total_items as f64)
+                    .round()
+                    .min(total_message_count as f64) as usize
+            } else {
+                total_message_count
+            };
             let _ = self
                 .session_store
                 .update(session_id, interaction_id, delivered_so_far, true)
-                .await;
-        }
-
-        if let Some(ref final_id) = last_id {
-            let _ = self
-                .session_store
-                .update(session_id, final_id.clone(), total_message_count, false)
                 .await;
         }
 
@@ -1056,6 +1189,14 @@ impl InteractionsHandler {
                             e,
                         )
                     })?;
+                // Finalize session after successful translation so retries
+                // can recover if translation fails.
+                if let Some(ref final_id) = last_id {
+                    let _ = self
+                        .session_store
+                        .update(session_id, final_id.clone(), total_message_count, false)
+                        .await;
+                }
                 let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
                 guard.ingress_response_dump(
                     crate::diagnostics::dump_body_from_bytes(&resp_bytes),
@@ -1102,6 +1243,13 @@ impl InteractionsHandler {
                     )
                 })?
         };
+        // Finalize session after successful response translation.
+        if let Some(ref final_id) = last_id {
+            let _ = self
+                .session_store
+                .update(session_id, final_id.clone(), total_message_count, false)
+                .await;
+        }
         // Dump the final ingress response before finishing
         let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
         guard.ingress_response_dump(crate::diagnostics::dump_body_from_bytes(&resp_bytes), 200);
@@ -1262,11 +1410,19 @@ impl InteractionsHandler {
             };
             guard.response_dump(validated.dump, 200, false, response_headers);
             let response_text = validated.text;
-            if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
-                current_prev = Some(interaction.id.clone());
-                last_id = Some(interaction.id.clone());
-                last_interaction = Some(interaction);
-            }
+            let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    stream,
+                    e,
+                )
+            })?;
+            current_prev = Some(interaction.id.clone());
+            last_id = Some(interaction.id.clone());
+            last_interaction = Some(interaction);
         }
 
         // Send remaining chunks if more than one
@@ -1362,11 +1518,20 @@ impl InteractionsHandler {
                     };
                 guard.response_dump(validated.dump, 200, false, response_headers);
                 let response_text = validated.text;
-                if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
-                    current_prev = Some(interaction.id.clone());
-                    last_id = Some(interaction.id.clone());
-                    last_interaction = Some(interaction);
-                }
+                let interaction: Interaction =
+                    serde_json::from_str(&response_text).map_err(|e| {
+                        guard.abort_internal(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            stream,
+                            e,
+                        )
+                    })?;
+                current_prev = Some(interaction.id.clone());
+                last_id = Some(interaction.id.clone());
+                last_interaction = Some(interaction);
             }
         }
 
@@ -2043,12 +2208,15 @@ fn build_interaction_url(route: &RouteTarget, suffix: &str) -> String {
         .endpoint_interactions
         .as_deref()
         .unwrap_or("https://generativelanguage.googleapis.com/v1beta/interactions");
-    let base = match base.find('?') {
-        Some(pos) => &base[..pos],
-        None => base,
+    let (base, query) = match base.find('?') {
+        Some(pos) => (&base[..pos], Some(&base[pos + 1..])),
+        None => (base, None),
     };
     let base = base.trim_end_matches('/');
-    format!("{base}{suffix}")
+    match query {
+        Some(q) if !q.is_empty() => format!("{base}{suffix}?{q}"),
+        _ => format!("{base}{suffix}"),
+    }
 }
 
 /// Split text into chunks that each fit under `limit` bytes.
@@ -2344,9 +2512,13 @@ fn translate_stream_event(
                 None
             }
         },
-        InteractionSseEvent::StepStop(ev) => Some(vec![StreamEvent::ContentBlockStop {
-            index: ev.index as u32,
-        }]),
+        InteractionSseEvent::StepStop(ev) => {
+            let index = ev.index as u32;
+            // Mark block as already stopped so InteractionCompletedEvent
+            // doesn't emit a duplicate ContentBlockStop.
+            *last_active_index = None;
+            Some(vec![StreamEvent::ContentBlockStop { index }])
+        }
         // Status updates have no client-visible effect; safe to skip silently.
         InteractionSseEvent::InteractionStatusUpdate(_) => None,
         InteractionSseEvent::InteractionCompletedEvent(ev) => {
@@ -2363,13 +2535,16 @@ fn translate_stream_event(
                 .and_then(|u| u.total_output_tokens)
                 .unwrap_or(0) as u64;
             let msg_delta = stream_event_message_delta("end_turn", input_tokens, output_tokens);
-            let stop_index = last_active_index.unwrap_or(0);
+            // Only emit ContentBlockStop if the last step didn't already stop it.
+            // StepStop clears last_active_index, so Some means no StepStop preceded.
+            let mut events = Vec::with_capacity(3);
+            if let Some(index) = *last_active_index {
+                events.push(StreamEvent::ContentBlockStop { index });
+            }
             *last_active_index = None;
-            Some(vec![
-                StreamEvent::ContentBlockStop { index: stop_index },
-                msg_delta,
-                StreamEvent::MessageStop {},
-            ])
+            events.push(msg_delta);
+            events.push(StreamEvent::MessageStop {});
+            Some(events)
         }
         InteractionSseEvent::ErrorEvent(ev) => {
             let msg = ev
@@ -2943,7 +3118,7 @@ If you don't know the answer, say so honestly.";
             &mut None,
         )
         .unwrap();
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 2); // message_delta + message_stop (no ContentBlockStop — StepStop already stopped it)
     }
 
     #[test]
@@ -3001,7 +3176,7 @@ If you don't know the answer, say so honestly.";
         assert!(!events3.is_empty());
         let events4 =
             translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "m", &mut None).unwrap();
-        assert_eq!(events4.len(), 3);
+        assert_eq!(events4.len(), 2); // message_delta + message_stop (ContentBlockStop already emitted by StepStop)
     }
 
     #[test]
@@ -3042,7 +3217,7 @@ If you don't know the answer, say so honestly.";
         let completed =
             translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "gemini", &mut None)
                 .unwrap();
-        assert_eq!(completed.len(), 3); // content_block_stop + message_delta + message_stop
+        assert_eq!(completed.len(), 2); // message_delta + message_stop (ContentBlockStop already emitted by StepStop)
 
         // Total events: 1 + 1 + 1 + 1 + 1 + 1 + 1 + 3 = 10
         let total = created.len()
@@ -3053,11 +3228,52 @@ If you don't know the answer, say so honestly.";
             + text_delta.len()
             + text_stop.len()
             + completed.len();
-        assert_eq!(total, 10);
+        assert_eq!(total, 9);
     }
 
     #[test]
-    fn build_interaction_url_strips_query_params() {
+    fn build_interaction_url_preserves_query_params_for_lifecycle_operations() {
+        // When endpoint_interactions has auth-relevant query params like ?key=ABC,
+        // lifecycle operations (cancel/delete/get) must preserve them.
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_interactions: Some("https://host/v1beta/interactions?key=ABC".into()),
+            ..Default::default()
+        };
+        let result = build_interaction_url(&route, "/int-1/cancel");
+        assert_eq!(
+            result,
+            "https://host/v1beta/interactions/int-1/cancel?key=ABC"
+        );
+    }
+
+    #[test]
+    fn build_interaction_url_no_query_params_unchanged() {
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_interactions: Some("https://host/v1beta/interactions".into()),
+            ..Default::default()
+        };
+        let result = build_interaction_url(&route, "/int-1/cancel");
+        assert_eq!(result, "https://host/v1beta/interactions/int-1/cancel");
+    }
+
+    #[test]
+    fn build_interaction_url_preserves_multiple_query_params() {
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_interactions: Some("https://host/v1beta/interactions?key=ABC&alt=sse".into()),
+            ..Default::default()
+        };
+        let result = build_interaction_url(&route, "/cancel");
+        assert_eq!(
+            result,
+            "https://host/v1beta/interactions/cancel?key=ABC&alt=sse"
+        );
+    }
+
+    #[test]
+    fn build_interaction_url_preserves_existing_query_params() {
         let route = crate::config::RouteTarget {
             section: "test".into(),
             endpoint_interactions: Some(
@@ -3066,7 +3282,10 @@ If you don't know the answer, say so honestly.";
             ..Default::default()
         };
         let result = build_interaction_url(&route, "/cancel");
-        assert_eq!(result, "https://host/v1beta/interactions/cancel");
+        assert_eq!(
+            result,
+            "https://host/v1beta/interactions/cancel?model=gemini-2.0-flash&alt=sse"
+        );
     }
 
     #[test]
@@ -3081,10 +3300,22 @@ If you don't know the answer, say so honestly.";
     }
 
     #[test]
-    fn build_interaction_url_strips_bare_qmark() {
+    fn build_interaction_url_preserves_bare_qmark_param() {
         let route = crate::config::RouteTarget {
             section: "test".into(),
             endpoint_interactions: Some("https://host/v1beta/interactions?model".into()),
+            ..Default::default()
+        };
+        let result = build_interaction_url(&route, "/cancel");
+        assert_eq!(result, "https://host/v1beta/interactions/cancel?model");
+    }
+
+    #[test]
+    fn build_interaction_url_strips_empty_qmark() {
+        // Bare "?" with nothing after it is treated as no query
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_interactions: Some("https://host/v1beta/interactions?".into()),
             ..Default::default()
         };
         let result = build_interaction_url(&route, "/cancel");

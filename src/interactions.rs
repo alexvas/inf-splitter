@@ -119,7 +119,12 @@ fn build_request_body(
     // generation_config is set only on the first interaction.
     // Follow-ups reuse the interaction's existing configuration.
     if is_first {
-        let max_tokens = route.max_tokens.or(ingress_max_tokens);
+        // Route max_tokens is a cap, not an override: min(client, route) wins.
+        let max_tokens = match (route.max_tokens, ingress_max_tokens) {
+            (Some(route_cap), Some(client_val)) => Some(route_cap.min(client_val)),
+            (Some(route_cap), None) => Some(route_cap),
+            (None, client_val) => client_val,
+        };
         let has_tool_choice = tool_choice.is_some();
         if max_tokens.is_some() || temperature.is_some() || has_tool_choice {
             let mut gen_config = GenerationConfig {
@@ -493,6 +498,19 @@ pub fn extract_interaction_tool_calls(
     }
 }
 
+/// Clamp i64 token count to u32 range, logging a warning on overflow.
+fn clamp_i64_to_u32(n: i64, field: &str) -> u32 {
+    if n < 0 {
+        tracing::warn!(value = n, field, "negative token count, clamping to 0");
+        0
+    } else if n > u32::MAX as i64 {
+        tracing::warn!(value = n, field, "token count exceeds u32::MAX, clamping");
+        u32::MAX
+    } else {
+        n as u32
+    }
+}
+
 /// Build a typed protocol response from an Interaction.
 ///
 /// Extracts text and tool calls from the interaction and constructs the
@@ -517,6 +535,9 @@ pub fn build_response_from_interaction(
         .as_ref()
         .and_then(|u| u.total_output_tokens)
         .unwrap_or(0);
+
+    let input_u32 = clamp_i64_to_u32(input_tokens, "total_input_tokens");
+    let output_u32 = clamp_i64_to_u32(output_tokens, "total_output_tokens");
 
     match ingress {
         Protocol::OpenAi => {
@@ -555,9 +576,9 @@ pub fn build_response_from_interaction(
                     logprobs: None,
                 }],
                 usage: Some(ChatUsage {
-                    prompt_tokens: input_tokens as u32,
-                    completion_tokens: output_tokens as u32,
-                    total_tokens: (input_tokens + output_tokens) as u32,
+                    prompt_tokens: input_u32,
+                    completion_tokens: output_u32,
+                    total_tokens: input_u32.saturating_add(output_u32),
                     completion_tokens_details: None,
                     prompt_tokens_details: None,
                 }),
@@ -594,8 +615,8 @@ pub fn build_response_from_interaction(
                 stop_reason,
                 stop_sequence: None,
                 usage: Usage {
-                    input_tokens: input_tokens as u32,
-                    output_tokens: output_tokens as u32,
+                    input_tokens: input_u32,
+                    output_tokens: output_u32,
                     ..Default::default()
                 },
                 created: None,
@@ -786,8 +807,8 @@ fn extract_openai_content(msg: &serde_json::Value) -> Option<Content> {
 
 fn extract_openai_system(messages: &[serde_json::Value]) -> Option<String> {
     messages
-        .first()
-        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
         .and_then(|m| {
             m.get("content").and_then(|c| {
                 if let Some(s) = c.as_str() {
@@ -1078,6 +1099,28 @@ mod tests {
         ];
         let sys = extract_openai_system(&msgs);
         assert_eq!(sys, Some("You are helpful.".to_string()));
+    }
+
+    #[test]
+    fn extract_openai_system_in_non_first_position() {
+        // System message can appear at any position in OpenAI message arrays.
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({"role": "system", "content": "Be concise"}),
+            serde_json::json!({"role": "assistant", "content": "OK"}),
+        ];
+        let sys = extract_openai_system(&msgs);
+        assert_eq!(sys, Some("Be concise".to_string()));
+    }
+
+    #[test]
+    fn extract_openai_system_no_system_message_returns_none() {
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({"role": "assistant", "content": "OK"}),
+        ];
+        let sys = extract_openai_system(&msgs);
+        assert_eq!(sys, None);
     }
 
     // --- Tool extraction tests ---
@@ -1437,24 +1480,129 @@ mod tests {
 
     /// Compile-time check: verify all required tool-use types exist.
     #[test]
-    fn check_tool_variants_exist() {
-        // Anthropic
-        let _ = anyllm_translate::anthropic::StopReason::ToolUse;
-        let _ = anyllm_translate::anthropic::ContentBlock::ToolUse {
-            id: String::new(),
-            name: String::new(),
-            input: serde_json::Value::Null,
-        };
-        // OpenAI
-        let _ = anyllm_translate::openai::FinishReason::ToolCalls;
-        let tc = anyllm_translate::openai::ToolCall {
-            call_type: "function".into(),
-            id: String::new(),
-            function: anyllm_translate::openai::FunctionCall {
-                name: String::new(),
-                arguments: String::new(),
-            },
-        };
-        let _ = tc;
+    fn max_tokens_client_lower_than_route_client_wins() {
+        // Client sends max_tokens=100, route has max_tokens=1000.
+        // Lower (more restrictive) client value must win.
+        let mut route = test_route();
+        route.max_tokens = Some(1000);
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &route,
+            None,
+            "test-model",
+            false,
+            None,
+            Some(100),
+            None,
+            None,
+            None,
+        );
+        let gc = req.generation_config.unwrap();
+        assert_eq!(gc.max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn max_tokens_route_lower_than_client_route_caps() {
+        // Client sends max_tokens=1000, route has max_tokens=100.
+        // Route must cap the client.
+        let mut route = test_route();
+        route.max_tokens = Some(100);
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &route,
+            None,
+            "test-model",
+            false,
+            None,
+            Some(1000),
+            None,
+            None,
+            None,
+        );
+        let gc = req.generation_config.unwrap();
+        assert_eq!(gc.max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn max_tokens_no_route_limit_client_used() {
+        // Client sends max_tokens=500, no route limit. Client value preserved.
+        let route = test_route();
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &route,
+            None,
+            "test-model",
+            false,
+            None,
+            Some(500),
+            None,
+            None,
+            None,
+        );
+        let gc = req.generation_config.unwrap();
+        assert_eq!(gc.max_output_tokens, Some(500));
+    }
+
+    #[test]
+    fn max_tokens_no_client_limit_route_used() {
+        // No client limit, route has max_tokens=100. Route value used.
+        let mut route = test_route();
+        route.max_tokens = Some(100);
+        let req = build_interactions_request_anthropic(
+            &anthropic_msgs(),
+            0,
+            &route,
+            None,
+            "test-model",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let gc = req.generation_config.unwrap();
+        assert_eq!(gc.max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn token_count_saturating_conversion_above_u32_max() {
+        let interaction: Interaction = serde_json::from_value(serde_json::json!({
+            "id": "big",
+            "status": "completed",
+            "model": "test",
+            "usage": {
+                "total_input_tokens": 5000000000_i64,
+                "total_output_tokens": 5000000000_i64,
+            }
+        }))
+        .expect("deserialize");
+        let resp = build_response_from_interaction(&interaction, "test", Protocol::Anthropic)
+            .expect("should build response");
+        let msg: MessageResponse = serde_json::from_value(resp).expect("should deserialize");
+        assert_eq!(msg.usage.input_tokens, u32::MAX);
+        assert_eq!(msg.usage.output_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn token_count_within_range_passes_through() {
+        let interaction: Interaction = serde_json::from_value(serde_json::json!({
+            "id": "small",
+            "status": "completed",
+            "model": "test",
+            "usage": {
+                "total_input_tokens": 15000,
+                "total_output_tokens": 8000,
+            }
+        }))
+        .expect("deserialize");
+        let resp = build_response_from_interaction(&interaction, "test", Protocol::Anthropic)
+            .expect("should build response");
+        let msg: MessageResponse = serde_json::from_value(resp).expect("should deserialize");
+        assert_eq!(msg.usage.input_tokens, 15000);
+        assert_eq!(msg.usage.output_tokens, 8000);
     }
 }

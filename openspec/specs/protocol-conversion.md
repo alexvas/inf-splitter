@@ -287,7 +287,7 @@ Only messages not yet delivered to the session are included (delta computation).
 - Non-streaming response construction uses shared `build_response_from_interaction()` across all three paths (`send_and_translate`, `handle_split_send`, `send_split_system_instruction`)
 - Stream: `step.*` events → Anthropic `StreamEvent` SSE, including function_call → tool_use blocks
 - Stream: `InteractionCreatedEvent` emits only `message_start` — `content_block_start` is deferred to `step.start` events to avoid duplicate block starts at index 0
-- Stream: `InteractionCompletedEvent` emits `ContentBlockStop` for the last active block index (tracked from `step.start`), not hardcoded 0
+- Stream: `StepStop` clears the tracked `last_active_index`. `InteractionCompletedEvent` emits `ContentBlockStop` only when `last_active_index` is still `Some` (no prior `StepStop` for that block). When `last_active_index` is `None`, only `message_delta` and `message_stop` are emitted — no duplicate stop.
 
 ### Scenario: Text response from interactions
 - GIVEN `Interaction` with `ModelOutputStep` containing text
@@ -305,8 +305,8 @@ Only messages not yet delivered to the session are included (delta computation).
 OpenAI ingress → `CreateModelInteractionParams`:
 - Ingress body parsed at boundary — `model`, `stream`, `temperature`, `max_tokens` extracted as typed scalars
 - `messages[]` → interactions `Content[]` via typed extractors
-- System message (role=system) → `system_instruction` — **only on the first interaction**
-- `max_tokens` → `generation_config.max_output_tokens` — **only on the first interaction**
+- System message (role=system) at **any position** → `system_instruction` — **only on the first interaction** (all positions scanned, not just `first()`)
+- `max_completion_tokens` → `generation_config.max_output_tokens` — read first, with `max_tokens` as fallback. **only on the first interaction**
 - `temperature` → `generation_config.temperature` — **only on the first interaction**
 - `tools` and `tool_choice` extracted from ingress body — **only on the first interaction**
 - All parameters passed as typed scalars to `build_interactions_request_openai`, which returns `CreateModelInteractionParams` directly
@@ -351,7 +351,7 @@ After system_instruction is delivered (or if it fit without splitting), pack rem
 4. If > limit — finalize current chunk (send it), start a new chunk with the item
 5. If a single item alone exceeds the limit → error (`can_split_under_limit` pre-check)
 
-**Session updates:** `message_count` and `previous_interaction_id` are updated after each successful chunk (not only after all chunks), so retries after a chunk failure don't re-send already-accepted content upstream. The final update sets `pending = false`.
+**Session updates:** `message_count` is estimated proportionally from Content item counts (since Content items may differ from ingress message counts due to tool/result/system entries). `previous_interaction_id` is updated after each successful chunk so retries don't re-send already-accepted content upstream. The final update sets `pending = false` **only after** successful response translation — if translation fails, the session remains pending so the client can retry.
 
 **Invariants:**
 - Every serialized chunk body ≤ `proxy_limit`
@@ -406,6 +406,19 @@ After system_instruction is delivered (or if it fit without splitting), pack rem
 - GIVEN `stream: false` and request exceeding proxy_limit
 - WHEN `handle_split_send` completes all chunks
 - THEN response is `Content-Type: application/json` (unchanged behavior)
+
+### Scenario: message_count tracks ingress messages proportionally
+- GIVEN 5 ingress messages produce 4 Content items (tool/result mapping differs)
+- WHEN session is updated after chunk delivery
+- THEN `message_count` uses proportional estimation from Content counts
+- AND the final update uses the correct `total_message_count` (ingress message count)
+
+### Scenario: Session finalized only after successful translation
+- GIVEN all chunks succeed
+- WHEN `build_response_from_interaction` fails during translation
+- THEN the session is NOT marked `pending = false`
+- AND on retry, `compute_delta` includes the undelivered messages
+- AND the client can recover by retrying
 
 ## Requirement: Greedy Chunk Packer
 
@@ -521,6 +534,12 @@ Streaming from interactions endpoint returns SSE with discriminated event types:
 - GIVEN an interactions SSE event `{"event_type": "error", "error": {"code": "not_found", "message": "Result not found."}}`
 - WHEN the proxy translates it to Anthropic streaming format
 - THEN the client receives `event: error` with `{"type": "error", "error": {"type": "not_found", "message": "Result not found."}}`
+
+### Scenario: interaction_id set eagerly from InteractionCreatedEvent
+- GIVEN a streaming interactions request with session `{pending: true, interaction_id: ""}`
+- WHEN upstream emits `InteractionCreatedEvent` with `interaction.id = "int-2"`
+- THEN `session_store.update` is called immediately with `interaction_id = "int-2"` (pending stays true)
+- AND if the client disconnects afterward, startup recovery probes `int-2` (not empty string)
 
 ### Scenario: Streaming function_call step.start
 - GIVEN SSE event `{"event_type":"step.start","index":2,"step":{"type":"function_call","id":"call-1","name":"get_weather"}}`
@@ -799,3 +818,102 @@ When constructing `GenerationConfig` from ingress `max_tokens`, values above `u3
 - GIVEN a message with text after the timestamp
 - WHEN `match_extend_lifetime` processes the message
 - THEN the timestamp is correctly extracted as before
+
+## Requirement: Lifecycle Operations Preserve Endpoint Query Parameters
+
+`build_interaction_url` must preserve query parameters from the configured `endpoint_interactions` URL when constructing lifecycle operation URLs (cancel, delete, get). The endpoint URL is parsed and the query string is reattached to the operation path.
+
+### Scenario: Query parameter preserved for lifecycle operations
+- GIVEN `endpoint_interactions = "https://host/v1beta/interactions?key=ABC"`
+- WHEN `build_interaction_url` constructs a cancel/delete/get URL for interaction `int-1`
+- THEN the URL is `https://host/v1beta/interactions/int-1:cancel?key=ABC`
+- AND the `x-goog-api-key` header is set as normal
+
+### Scenario: No query parameter — no change
+- GIVEN `endpoint_interactions = "https://host/v1beta/interactions"` (no query string)
+- WHEN `build_interaction_url` constructs a lifecycle URL
+- THEN the URL is `https://host/v1beta/interactions/int-1:cancel` (unchanged behavior)
+
+## Requirement: max_tokens is a Cap, Not an Override
+
+`build_request_body` must use `min(client_max_tokens, route.max_tokens)` semantics: if both the client and the route specify a token limit, the lower (more restrictive) value wins. `route.max_tokens.or(ingress_max_tokens)` is replaced with a `min`-based match.
+
+### Scenario: Client limit lower than route — client wins
+- GIVEN client sends `max_tokens = 100` and route has `max_tokens = 1000`
+- WHEN `build_request_body` constructs generation_config
+- THEN `max_output_tokens` is `100` (client's more restrictive limit)
+
+### Scenario: Route limit lower than client — route wins
+- GIVEN client sends `max_tokens = 1000` and route has `max_tokens = 100`
+- WHEN `build_request_body` constructs generation_config
+- THEN `max_output_tokens` is `100` (route caps the client)
+
+### Scenario: No route limit — client value used
+- GIVEN client sends `max_tokens = 500` and route has no `max_tokens`
+- WHEN `build_request_body` constructs generation_config
+- THEN `max_output_tokens` is `500`
+
+## Requirement: OpenAI max_completion_tokens Respected in Interactions Path
+
+`handle_from_openai` must read both `max_completion_tokens` and `max_tokens` from the ingress body. When only `max_completion_tokens` is present, it is used as the token limit. When both are present, `max_completion_tokens` takes precedence (standard OpenAI semantics).
+
+### Scenario: Only max_completion_tokens sent
+- GIVEN client sends `{"max_completion_tokens": 200}` without `max_tokens`
+- WHEN `handle_from_openai` processes the request
+- THEN `ingress_max_tokens` is `Some(200)`
+- AND `generation_config.max_output_tokens` is `200`
+
+### Scenario: Both max_tokens and max_completion_tokens
+- GIVEN client sends `{"max_completion_tokens": 200, "max_tokens": 100}`
+- WHEN `handle_from_openai` processes the request
+- THEN `max_completion_tokens` takes precedence → `Some(200)`
+
+## Requirement: u64 Token Counts Use Saturating Conversion
+
+`Interaction.usage.total_input_tokens` and `total_output_tokens` (both `i64`) must use `clamp_i64_to_u32()` with saturating fallback and `tracing::warn!` instead of silent `as u32` wrapping in release builds.
+
+### Scenario: Token count above u32::MAX
+- GIVEN upstream reports `total_input_tokens = 5000000000` (> u32::MAX)
+- WHEN translated to ingress format (Anthropic `Usage` or OpenAI `ChatUsage`)
+- THEN the value is clamped to `u32::MAX`
+- AND `tracing::warn!` logs the clamp
+
+### Scenario: Token count within u32 range
+- GIVEN upstream reports `total_input_tokens = 15000`
+- WHEN translated to ingress format
+- THEN the value is `15000` (unchanged)
+
+## Requirement: System-Instruction Splitting Uses Full Body Measurement
+
+The proxy_limit check in system-instruction splitting must measure the full serialized `CreateModelInteractionParams` body (including tools, generation_config, model, and all non-content fields), not just the text length of the system instruction. The effective limit for `split_text_for_limit` is `proxy_limit - envelope_without_system_instruction`.
+
+### Scenario: Envelope overhead causes oversized request
+- GIVEN `proxy_limit = 100KB`, tools + generation_config serialized = 60KB, system_instruction = 50KB
+- WHEN checking if system instruction needs splitting
+- THEN the check measures `serialize(envelope + system_instruction + empty_input)` ≈ 110KB > limit
+- AND `split_text_for_limit` is called with `sys_limit = limit - envelope_without_sys` so each chunk + envelope fits within 100KB
+- INSTEAD OF: checking text-only (50KB < 100KB) and sending 110KB oversized
+
+## Requirement: send_split_system_instruction Propagates Errors
+
+`send_split_system_instruction` must propagate deserialization failures from upstream responses instead of silently dropping them via `if let Ok`. The error must interrupt the chunk chain so that stale `current_prev` is not used for subsequent chunks.
+
+### Scenario: Malformed upstream response propagated
+- GIVEN upstream returns HTTP 200 with malformed JSON for a system-instruction chunk
+- WHEN `serde_json::from_str::<Interaction>` fails
+- THEN the error is returned (NOT silently dropped via `if let Ok`)
+- AND no subsequent chunk is sent with stale `previous_interaction_id`
+- AND the client receives an appropriate error
+
+## Requirement: compute_delta Empty Delta for Exact Retries
+
+When `compute_delta` returns an empty delta (`start_index == ingress_count`) and `previous_interaction_id` is `Some`, the handler must fetch the existing interaction via `GET /v1beta/interactions/{id}` and return its result instead of sending an empty `ContentList` upstream.
+
+### Scenario: Exact retry recovers existing interaction
+- GIVEN session has `{interaction_id: "int-1", message_count: 5}`
+- WHEN client retries with the same 5 messages
+- THEN `compute_delta(5, 5)` returns `(start=5, end=5)` → empty delta
+- AND `previous_interaction_id` is `Some("int-1")`
+- THEN handler calls `GET /v1beta/interactions/int-1` to retrieve the existing interaction
+- AND returns the translated response to the client
+- INSTEAD OF sending empty input upstream (which would return an error or empty response)

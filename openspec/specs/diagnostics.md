@@ -255,15 +255,16 @@ Every protocol handler (OpenAI passthrough, Anthropic passthrough, protocol conv
 - **ingress request** — the original client body as received by the proxy
 - **egress request** — the body actually sent upstream (after token caps, protocol translation, control message stripping, etc.)
 - **egress response** — the raw upstream response body (up to 1 MiB for streaming)
+- **ingress response** — the translated response body sent to the client (interactions handler only; passthrough/conversion paths return the upstream response directly so the egress response serves this role)
 
 All dump events for a single request share the same `request_id` as the corresponding stats event.
 
-### Scenario: Non-streaming request produces dump
+### Scenario: Non-streaming interactions request produces dump
 - GIVEN `dump_mode = "all"` and `dump_output` is set to a file path
-- AND a non-streaming request arrives at any handler
-- WHEN the request completes with status 200
-- THEN three dump lines are written: ingress request, egress request, egress response
-- AND all three lines share the same `request_id`
+- AND a non-streaming interactions request completes successfully
+- THEN four dump lines are written: ingress request, egress request, egress response, ingress response
+- AND all four lines share the same `request_id`
+- AND the `ingress/response` body is the translated protocol response (Anthropic `MessageResponse` or OpenAI `ChatCompletionResponse`)
 
 ### Scenario: Streaming request produces dump
 - GIVEN `dump_mode = "all"` and `dump_output` is set to a file path

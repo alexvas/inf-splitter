@@ -51,8 +51,8 @@ On receiving a POST body, the router:
 ## Requirement: Health Check
 
 `GET /health` probes each unique upstream endpoint:
-- HEAD request for OpenAI/Anthropic endpoints
-- GET request for interactions endpoints (may not support HEAD)
+- HEAD request for OpenAI/Anthropic endpoints (strips query params, appends "/")
+- GET request for interactions endpoints (uses the configured endpoint as-is, preserving query parameters)
 - 2-second timeout per upstream check
 - 5-second result cache
 - Parallel checks for all endpoints
@@ -264,22 +264,39 @@ Session state fields: `interaction_id`, `message_count`, `last_access_utc`, `exp
 
 ## Requirement: Session Persistence
 
-Session state is persisted to a TOML file. Written atomically on every state change, flushed on shutdown/panic. On startup: expired sessions cleaned, pending sessions verified via GET.
+Session state is persisted to a TOML file. Written atomically on every state change, flushed on shutdown/panic.
+
+**Startup recovery:** In `build_app`, after loading the session store, the proxy iterates all `pending_sessions()` and verifies each via `GET /v1beta/interactions/{id}` against each configured interactions endpoint:
+- If the interaction exists (200): clear `pending`, keep the session
+- If the interaction is not found (404): remove the session from the store
+- If the interaction is still in-progress: keep `pending = true` (recovery is indeterminate)
+- Errors during verification are logged; the session stays pending for a future recovery attempt
+
+**Periodic eviction:** On each new session creation (`get_or_create`), expired sessions (where `now > expires_at_utc`) are evicted from the store and the persisted file. The upstream interaction is not explicitly cancelled/deleted during periodic eviction — the upstream's own TTL handles cleanup.
+
+**Streaming pending:** Streaming requests set `pending = true` before the upstream call and advance `message_count` eagerly (to prevent racing follow-up requests from re-sending in-flight messages). `pending` is cleared to `false` only after the stream completes successfully and the real `interaction_id` is known. On crash, the pending flag triggers startup verification.
 
 ### Scenario: Session survives restart
 - GIVEN session with `interaction_id = "abc123"` and `message_count = 5`
 - WHEN proxy restarts
 - THEN session is recovered from TOML with same state
 
-### Scenario: Expired sessions cleaned on startup
-- GIVEN expired session in TOML
-- WHEN proxy starts
-- THEN POST cancel + DELETE sent, session removed
+### Scenario: Expired sessions evicted on new session creation
+- GIVEN an expired session in the store
+- WHEN a new session is created via `get_or_create`
+- THEN the expired session is removed from the store and persisted file
+- AND `tracing::info!` logs the eviction count
 
 ### Scenario: Pending session verified on startup
 - GIVEN session with `pending = true`
 - WHEN proxy starts and `GET /v1beta/interactions/{id}` returns 200
 - THEN `pending` cleared to `false`, session kept
+
+### Scenario: Pending session not found on startup
+- GIVEN session with `pending = true`
+- WHEN proxy starts and all interactions endpoints return 404 for the interaction
+- THEN the session is removed from the store
+- AND `cancel_interaction`/`delete_interaction` are not called (interaction already gone)
 
 ### Scenario: Cleanup errors are tolerated
 - GIVEN eviction triggers DELETE for `interaction_id = "abc123"`

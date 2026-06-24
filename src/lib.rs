@@ -160,11 +160,12 @@ pub(crate) struct ValidatedBody {
 /// Validate that upstream response bytes are UTF-8.
 ///
 /// On success returns `ValidatedBody { text, dump }`.  On failure logs a
-/// warning and returns `AppError::Internal("non-utf8 response from upstream")`.
+/// warning and returns `(AppError, DumpBody)` so callers can record the
+/// non-UTF-8 body in diagnostics before the error aborts the guard.
 pub(crate) fn validate_upstream_body(
     body: bytes::Bytes,
     request_id: &str,
-) -> Result<ValidatedBody, AppError> {
+) -> Result<ValidatedBody, (AppError, DumpBody)> {
     let dump = crate::diagnostics::dump_body_from_bytes(&body);
     if dump.is_base64() {
         tracing::warn!(
@@ -173,7 +174,10 @@ pub(crate) fn validate_upstream_body(
             body_len = body.len(),
             "non-utf8 upstream response body"
         );
-        return Err(AppError::Internal("non-utf8 response from upstream".into()));
+        return Err((
+            AppError::Internal("non-utf8 response from upstream".into()),
+            dump,
+        ));
     }
     let text =
         String::from_utf8(body.to_vec()).expect("bytes already validated as UTF-8 by dump_body");
@@ -304,6 +308,67 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
     let anthropic = AnthropicHandler::new(config.as_ref(), diagnostics.clone())?;
     let interactions =
         InteractionsHandler::new(config.as_ref(), diagnostics.clone(), session_store.clone())?;
+
+    // Recover pending sessions: after an unclean shutdown, sessions with
+    // pending=true need verification. For each pending session, check if the
+    // upstream interaction still exists.
+    let pending = session_store.pending_sessions().await;
+    if !pending.is_empty() {
+        // Collect interactions sections from config for recovery attempts
+        let interactions_routes: Vec<crate::config::RouteTarget> = config
+            .sections
+            .iter()
+            .filter(|(_, s)| s.endpoint_interactions.is_some())
+            .map(|(name, s)| crate::config::RouteTarget {
+                section: name.clone(),
+                endpoint_interactions: s.endpoint_interactions.clone(),
+                api_key: s.api_key.clone(),
+                proxy: s.proxy.clone(),
+                ..Default::default()
+            })
+            .collect();
+        for (session_id, state) in &pending {
+            let mut found = false;
+            for route in &interactions_routes {
+                match interactions
+                    .get_interaction(&state.interaction_id, route)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::info!(
+                            session_id = %session_id,
+                            interaction_id = %state.interaction_id,
+                            "pending session recovered: interaction verified"
+                        );
+                        let _ = session_store.clear_pending(session_id).await;
+                        found = true;
+                        break;
+                    }
+                    Ok(false) => {
+                        // 404 or non-success — interaction doesn't exist at this endpoint
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            interaction_id = %state.interaction_id,
+                            error = %e,
+                            "pending session recovery: get_interaction failed"
+                        );
+                    }
+                }
+            }
+            if !found {
+                // Interaction not found at any configured endpoint — remove stale session
+                tracing::warn!(
+                    session_id = %session_id,
+                    interaction_id = %state.interaction_id,
+                    "pending session not found at any upstream, removing"
+                );
+                let _ = session_store.remove(session_id).await;
+            }
+        }
+    }
 
     let health_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))

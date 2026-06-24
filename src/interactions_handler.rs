@@ -35,6 +35,19 @@ use anyllm_translate::openai::{
 
 pub const API_REVISION: &str = "2026-05-20";
 
+/// Clamp a u64 max_tokens value to u32 range.
+/// Values above u32::MAX are clamped with a warning — the Gemini API only
+/// accepts i64 but practical values fit in u32.
+fn clamp_max_tokens(n: u64) -> u32 {
+    match u32::try_from(n) {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!(max_tokens = n, "max_tokens exceeds u32::MAX, clamping");
+            u32::MAX
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct InteractionsHandler {
     clients: HashMap<String, HttpClient>,
@@ -129,7 +142,7 @@ impl InteractionsHandler {
         let ingress_max_tokens = body_val
             .get("max_tokens")
             .and_then(|v| v.as_u64())
-            .map(|n| n as u32);
+            .map(clamp_max_tokens);
         let system = interactions_lib::extract_anthropic_system(&body_val);
         let (tools, tool_choice) = interactions_lib::extract_anthropic_tools(&body_val);
 
@@ -288,7 +301,7 @@ impl InteractionsHandler {
         let ingress_max_tokens = body_val
             .get("max_tokens")
             .and_then(|v| v.as_u64())
-            .map(|n| n as u32);
+            .map(clamp_max_tokens);
         let (tools, tool_choice) = interactions_lib::extract_openai_tools(&body_val);
 
         let prev_id = if session.interaction_id.is_empty() {
@@ -476,7 +489,8 @@ impl InteractionsHandler {
         let validated = match crate::validate_upstream_body(response_body_bytes, guard.request_id())
         {
             Ok(v) => v,
-            Err(e) => {
+            Err((e, dump)) => {
+                guard.response_dump(dump, 502, true, response_headers);
                 return Err(guard.abort_upstream(
                     duration_ms,
                     ingress_body.len(),
@@ -526,6 +540,9 @@ impl InteractionsHandler {
                 }
             };
 
+        let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
+        guard.ingress_response_dump(crate::diagnostics::dump_body_from_bytes(&resp_bytes), 200);
+
         guard.finish(
             200,
             duration_ms,
@@ -560,6 +577,7 @@ impl InteractionsHandler {
         let mut interaction_id = String::new();
         let mut total_bytes: usize = 0;
         let mut dump_buffer: Vec<u8> = Vec::new();
+        let mut last_active_index: Option<u32> = None;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
 
@@ -574,11 +592,12 @@ impl InteractionsHandler {
         let session_hdr_name = Self::session_header_name(ingress);
         let session_hdr_value = session_id.to_string();
 
-        // Eagerly commit message_count to prevent racing follow-up requests
-        // from re-sending messages the in-flight stream is about to deliver.
-        // interaction_id is set to empty (pending) — updated after stream completes.
+        // Mark session pending before starting stream — if the process crashes
+        // mid-stream, startup recovery will see pending=true and verify the
+        // interaction status. The message_count is advanced eagerly to prevent
+        // racing follow-up requests from re-sending in-flight messages.
         let _ = session_store
-            .update(&sid, String::new(), new_count, false)
+            .update(&sid, String::new(), new_count, true)
             .await;
 
         tokio::spawn(async move {
@@ -638,9 +657,12 @@ impl InteractionsHandler {
                                 if data.is_empty() || data == "[DONE]" {
                                     continue;
                                 }
-                                if let Some(events) =
-                                    translate_stream_event(data, &model_owned, &model_owned)
-                                {
+                                if let Some(events) = translate_stream_event(
+                                    data,
+                                    &model_owned,
+                                    &model_owned,
+                                    &mut last_active_index,
+                                ) {
                                     for event in &events {
                                         if is_openai {
                                             // Pipe StreamEvent through ReverseStreamingTranslator
@@ -825,6 +847,12 @@ impl InteractionsHandler {
             model: model.to_string(),
             input: InteractionsInput::ContentList(vec![]),
             stream: Some(false),
+            // Include a representative previous_interaction_id so that
+            // chunk size estimation accounts for the field that
+            // build_chunk_request actually serializes.  Without this the
+            // measured size can be smaller than the real serialized body,
+            // causing chunks to silently exceed proxy_limit.
+            previous_interaction_id: Some("x".repeat(36)),
             ..Default::default()
         };
 
@@ -948,6 +976,7 @@ impl InteractionsHandler {
                 return Response::builder()
                     .status(sc)
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(Self::session_header_name(ingress), session_id)
                     .body(Body::from(body))
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
@@ -962,17 +991,21 @@ impl InteractionsHandler {
                     e,
                 )
             })?;
-            let validated = crate::validate_upstream_body(response_bytes, guard.request_id())
-                .map_err(|e| {
-                    guard.abort_upstream(
+            let validated = match crate::validate_upstream_body(response_bytes, guard.request_id())
+            {
+                Ok(v) => v,
+                Err((e, dump)) => {
+                    guard.response_dump(dump, 502, true, response_headers);
+                    return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
                         upstream_label,
                         direction,
                         stream,
                         e,
-                    )
-                })?;
+                    ));
+                }
+            };
             guard.response_dump(validated.dump, 200, false, response_headers);
             let response_text = validated.text;
             let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
@@ -986,9 +1019,21 @@ impl InteractionsHandler {
                 )
             })?;
             total_response_bytes += response_text.len();
-            current_prev = Some(interaction.id.clone());
-            last_id = Some(interaction.id.clone());
+            let interaction_id = interaction.id.clone();
+            current_prev = Some(interaction_id.clone());
+            last_id = Some(interaction_id.clone());
             last_interaction = Some(interaction);
+
+            // Update session after each successful chunk so retries don't
+            // re-send already-accepted content upstream.
+            let total_delta: usize = chunks.iter().map(|c| c.len()).sum();
+            let initial_delivered = total_message_count.saturating_sub(total_delta);
+            let delivered_so_far: usize =
+                initial_delivered + chunks[..=i].iter().map(|c| c.len()).sum::<usize>();
+            let _ = self
+                .session_store
+                .update(session_id, interaction_id, delivered_so_far, true)
+                .await;
         }
 
         if let Some(ref final_id) = last_id {
@@ -1185,6 +1230,7 @@ impl InteractionsHandler {
                 return Response::builder()
                     .status(sc)
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(Self::session_header_name(ingress), session_id)
                     .body(Body::from(body))
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
@@ -1199,22 +1245,27 @@ impl InteractionsHandler {
                 )
             })?;
             total_response_bytes += response_bytes.len();
-            let validated = crate::validate_upstream_body(response_bytes, guard.request_id())
-                .map_err(|e| {
-                    guard.abort_upstream(
+            let validated = match crate::validate_upstream_body(response_bytes, guard.request_id())
+            {
+                Ok(v) => v,
+                Err((e, dump)) => {
+                    guard.response_dump(dump, 502, true, response_headers);
+                    return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
                         upstream_label,
                         direction,
                         stream,
                         e,
-                    )
-                })?;
+                    ));
+                }
+            };
             guard.response_dump(validated.dump, 200, false, response_headers);
             let response_text = validated.text;
             if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
                 current_prev = Some(interaction.id.clone());
-                last_id = Some(interaction.id);
+                last_id = Some(interaction.id.clone());
+                last_interaction = Some(interaction);
             }
         }
 
@@ -1279,6 +1330,7 @@ impl InteractionsHandler {
                     return Response::builder()
                         .status(sc)
                         .header(header::CONTENT_TYPE, "application/json")
+                        .header(Self::session_header_name(ingress), session_id)
                         .body(Body::from(body))
                         .map_err(|err| AppError::Internal(err.to_string()));
                 }
@@ -1293,17 +1345,21 @@ impl InteractionsHandler {
                     )
                 })?;
                 total_response_bytes += response_bytes.len();
-                let validated = crate::validate_upstream_body(response_bytes, guard.request_id())
-                    .map_err(|e| {
-                    guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    )
-                })?;
+                let validated =
+                    match crate::validate_upstream_body(response_bytes, guard.request_id()) {
+                        Ok(v) => v,
+                        Err((e, dump)) => {
+                            guard.response_dump(dump, 502, true, response_headers);
+                            return Err(guard.abort_upstream(
+                                start.elapsed().as_millis() as u64,
+                                ingress_body.len(),
+                                upstream_label,
+                                direction,
+                                stream,
+                                e,
+                            ));
+                        }
+                    };
                 guard.response_dump(validated.dump, 200, false, response_headers);
                 let response_text = validated.text;
                 if let Ok(interaction) = serde_json::from_str::<Interaction>(&response_text) {
@@ -1395,7 +1451,7 @@ impl InteractionsHandler {
         Ok(Self::ok_with_session_header(ingress, session_id, resp))
     }
 
-    /// Cancel an interaction upstream (ignores 404).
+    /// Cancel an interaction upstream.
     async fn cancel_interaction(
         &self,
         interaction_id: &str,
@@ -1408,7 +1464,20 @@ impl InteractionsHandler {
             &HeaderMap::new(),
         );
         match builder.send().await {
-            Ok(_) => Ok(()),
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    status = %status,
+                    body = %body,
+                    "cancel interaction: upstream returned non-success"
+                );
+                Err(AppError::Internal(format!(
+                    "cancel interaction {interaction_id}: HTTP {status}"
+                )))
+            }
             Err(e) => {
                 tracing::warn!(interaction_id = %interaction_id, error = %e, "cancel interaction failed");
                 Err(AppError::Internal(format!(
@@ -1430,7 +1499,20 @@ impl InteractionsHandler {
             &HeaderMap::new(),
         );
         match builder.send().await {
-            Ok(_) => Ok(()),
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    status = %status,
+                    body = %body,
+                    "delete interaction: upstream returned non-success"
+                );
+                Err(AppError::Internal(format!(
+                    "delete interaction {interaction_id}: HTTP {status}"
+                )))
+            }
             Err(e) => {
                 tracing::warn!(interaction_id = %interaction_id, error = %e, "delete interaction failed");
                 Err(AppError::Internal(format!(
@@ -2193,12 +2275,16 @@ fn stream_event_error(code: &str, message: &str) -> anyllm_translate::anthropic:
 /// Deserializes into the generated `InteractionSseEvent` enum for type-safe
 /// dispatch.
 ///
+/// `last_active_index` tracks the most recent step.start index so that
+/// `InteractionCompletedEvent` can emit the correct `ContentBlockStop`.
+///
 /// Returns `None` for events that are intentionally skipped (status updates)
 /// or malformed (logged via `tracing::info!`).
 fn translate_stream_event(
     data: &str,
     _message_id: &str,
     model: &str,
+    last_active_index: &mut Option<u32>,
 ) -> Option<Vec<anyllm_translate::anthropic::StreamEvent>> {
     use anyllm_translate::anthropic::StreamEvent;
 
@@ -2214,23 +2300,27 @@ fn translate_stream_event(
     match event {
         InteractionSseEvent::InteractionCreatedEvent(ev) => {
             let msg_start = stream_event_message_start(&ev.interaction.id, model, 0, 0);
-            let block_start = stream_event_content_block_start_text(0);
-            Some(vec![msg_start, block_start])
+            // Do not emit content_block_start here — step.start events provide
+            // the actual content block structure with correct indices.
+            Some(vec![msg_start])
         }
-        InteractionSseEvent::StepStart(ev) => match &ev.step {
-            Step::FunctionCallStep(fcs) => {
-                let block_start = stream_event_content_block_start_tool_use(
-                    ev.index as u32,
-                    &fcs.id,
-                    fcs.name.as_str(),
-                );
-                Some(vec![block_start])
+        InteractionSseEvent::StepStart(ev) => {
+            *last_active_index = Some(ev.index as u32);
+            match &ev.step {
+                Step::FunctionCallStep(fcs) => {
+                    let block_start = stream_event_content_block_start_tool_use(
+                        ev.index as u32,
+                        &fcs.id,
+                        fcs.name.as_str(),
+                    );
+                    Some(vec![block_start])
+                }
+                _ => {
+                    let block_start = stream_event_content_block_start_text(ev.index as u32);
+                    Some(vec![block_start])
+                }
             }
-            _ => {
-                let block_start = stream_event_content_block_start_text(ev.index as u32);
-                Some(vec![block_start])
-            }
-        },
+        }
         InteractionSseEvent::StepDelta(ev) => match ev.delta {
             StepDeltaData::TextDelta(td) => {
                 let delta = stream_event_content_block_delta_text(ev.index as u32, &td.text);
@@ -2273,8 +2363,10 @@ fn translate_stream_event(
                 .and_then(|u| u.total_output_tokens)
                 .unwrap_or(0) as u64;
             let msg_delta = stream_event_message_delta("end_turn", input_tokens, output_tokens);
+            let stop_index = last_active_index.unwrap_or(0);
+            *last_active_index = None;
             Some(vec![
-                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::ContentBlockStop { index: stop_index },
                 msg_delta,
                 StreamEvent::MessageStop {},
             ])
@@ -2301,6 +2393,22 @@ mod tests {
     use super::*;
     use crate::interactions::{single_element_too_large, split_content_for_limit};
     use crate::interactions_types::{Content, TextContent};
+
+    // --- clamp_max_tokens tests ---
+
+    #[test]
+    fn clamp_max_tokens_within_range() {
+        assert_eq!(clamp_max_tokens(0), 0);
+        assert_eq!(clamp_max_tokens(4096), 4096);
+        assert_eq!(clamp_max_tokens(u32::MAX as u64), u32::MAX);
+    }
+
+    #[test]
+    fn clamp_max_tokens_above_u32_max_clamps() {
+        // 5_000_000_000 > u32::MAX (4_294_967_295) — should clamp, not wrap to 705_032_704
+        assert_eq!(clamp_max_tokens(5_000_000_000), u32::MAX);
+        assert_eq!(clamp_max_tokens(u64::MAX), u32::MAX);
+    }
 
     // --- split_text_for_limit tests ---
 
@@ -2799,52 +2907,69 @@ If you don't know the answer, say so honestly.";
 
     #[test]
     fn translate_step_delta_text_produces_block_delta() {
-        let events = translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "test-model").unwrap();
+        let events =
+            translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "test-model", &mut None)
+                .unwrap();
         assert_eq!(events.len(), 1);
     }
 
     #[test]
     fn translate_step_delta_signature_produces_block_delta() {
-        let events =
-            translate_stream_event(STREAM_STEP_DELTA_SIGNATURE, "msg-1", "test-model").unwrap();
+        let events = translate_stream_event(
+            STREAM_STEP_DELTA_SIGNATURE,
+            "msg-1",
+            "test-model",
+            &mut None,
+        )
+        .unwrap();
         assert_eq!(events.len(), 1);
     }
 
     #[test]
-    fn translate_interaction_created_produces_message_and_block_start() {
+    fn translate_interaction_created_produces_message_start_only() {
         let events =
-            translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "test-model").unwrap();
-        assert_eq!(events.len(), 2);
+            translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "test-model", &mut None)
+                .unwrap();
+        // Only message_start — content_block_start is deferred to step.start events
+        assert_eq!(events.len(), 1);
     }
 
     #[test]
     fn translate_interaction_completed_produces_stop_events() {
-        let events =
-            translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "test-model").unwrap();
+        let events = translate_stream_event(
+            STREAM_INTERACTION_COMPLETED,
+            "msg-1",
+            "test-model",
+            &mut None,
+        )
+        .unwrap();
         assert_eq!(events.len(), 3);
     }
 
     #[test]
     fn translate_step_start_model_output_produces_text_block() {
-        let events = translate_stream_event(STREAM_STEP_START_MODEL_OUTPUT, "msg-1", "m").unwrap();
+        let events =
+            translate_stream_event(STREAM_STEP_START_MODEL_OUTPUT, "msg-1", "m", &mut None)
+                .unwrap();
         assert_eq!(events.len(), 1);
     }
 
     #[test]
     fn translate_step_start_thought_produces_text_block() {
-        let events = translate_stream_event(STREAM_STEP_START_THOUGHT, "msg-1", "m").unwrap();
+        let events =
+            translate_stream_event(STREAM_STEP_START_THOUGHT, "msg-1", "m", &mut None).unwrap();
         assert_eq!(events.len(), 1);
     }
 
     #[test]
     fn translate_step_stop_produces_block_stop() {
-        let events = translate_stream_event(STREAM_STEP_STOP, "msg-1", "m").unwrap();
+        let events = translate_stream_event(STREAM_STEP_STOP, "msg-1", "m", &mut None).unwrap();
         assert_eq!(events.len(), 1);
     }
 
     #[test]
     fn translate_error_event_produces_error() {
-        let events = translate_stream_event(STREAM_ERROR, "msg-1", "m").unwrap();
+        let events = translate_stream_event(STREAM_ERROR, "msg-1", "m", &mut None).unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -2852,27 +2977,30 @@ If you don't know the answer, say so honestly.";
     fn translate_returns_none_for_unknown_event_type() {
         // "interaction.status_update" is a real event type but we skip it
         let status_update = r#"{"event_type":"interaction.status_update","interaction_id":"abc","status":"in_progress"}"#;
-        let events = translate_stream_event(status_update, "msg-1", "test-model");
+        let events = translate_stream_event(status_update, "msg-1", "test-model", &mut None);
         assert!(events.is_none());
     }
 
     #[test]
     fn translate_returns_none_for_malformed_json() {
-        let events = translate_stream_event("not valid json", "msg-1", "test-model");
+        let events = translate_stream_event("not valid json", "msg-1", "test-model", &mut None);
         assert!(events.is_none());
     }
 
     #[test]
     fn translate_multiple_deltas_accumulate() {
-        let events1 = translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "m").unwrap();
+        let events1 =
+            translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "m", &mut None).unwrap();
         assert!(!events1.is_empty());
-        let events2 = translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "m").unwrap();
+        let events2 =
+            translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "m", &mut None).unwrap();
         assert!(!events2.is_empty());
         let delta2 =
             r#"{"event_type":"step.delta","delta":{"type":"text","text":" World"},"index":1}"#;
-        let events3 = translate_stream_event(delta2, "msg-1", "m").unwrap();
+        let events3 = translate_stream_event(delta2, "msg-1", "m", &mut None).unwrap();
         assert!(!events3.is_empty());
-        let events4 = translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "m").unwrap();
+        let events4 =
+            translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "m", &mut None).unwrap();
         assert_eq!(events4.len(), 3);
     }
 
@@ -2880,35 +3008,43 @@ If you don't know the answer, say so honestly.";
     fn translate_full_dump_sequence() {
         // Simulate the full event sequence from the dump
         let created =
-            translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "gemini").unwrap();
-        assert_eq!(created.len(), 2); // message_start + content_block_start
+            translate_stream_event(STREAM_INTERACTION_CREATED, "msg-1", "gemini", &mut None)
+                .unwrap();
+        assert_eq!(created.len(), 1); // message_start only (no content_block_start)
 
         let thought_start =
-            translate_stream_event(STREAM_STEP_START_THOUGHT, "msg-1", "gemini").unwrap();
+            translate_stream_event(STREAM_STEP_START_THOUGHT, "msg-1", "gemini", &mut None)
+                .unwrap();
         assert_eq!(thought_start.len(), 1); // content_block_start (thinking)
 
         let sig_delta =
-            translate_stream_event(STREAM_STEP_DELTA_SIGNATURE, "msg-1", "gemini").unwrap();
+            translate_stream_event(STREAM_STEP_DELTA_SIGNATURE, "msg-1", "gemini", &mut None)
+                .unwrap();
         assert_eq!(sig_delta.len(), 1); // content_block_delta (signature)
 
-        let thought_stop = translate_stream_event(STREAM_STEP_STOP, "msg-1", "gemini").unwrap();
+        let thought_stop =
+            translate_stream_event(STREAM_STEP_STOP, "msg-1", "gemini", &mut None).unwrap();
         assert_eq!(thought_stop.len(), 1); // content_block_stop
 
         let text_start =
-            translate_stream_event(STREAM_STEP_START_MODEL_OUTPUT, "msg-1", "gemini").unwrap();
+            translate_stream_event(STREAM_STEP_START_MODEL_OUTPUT, "msg-1", "gemini", &mut None)
+                .unwrap();
         assert_eq!(text_start.len(), 1); // content_block_start (text)
 
-        let text_delta = translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "gemini").unwrap();
+        let text_delta =
+            translate_stream_event(STREAM_STEP_DELTA_TEXT, "msg-1", "gemini", &mut None).unwrap();
         assert_eq!(text_delta.len(), 1); // content_block_delta (text)
 
-        let text_stop = translate_stream_event(STREAM_STEP_STOP, "msg-1", "gemini").unwrap();
+        let text_stop =
+            translate_stream_event(STREAM_STEP_STOP, "msg-1", "gemini", &mut None).unwrap();
         assert_eq!(text_stop.len(), 1); // content_block_stop
 
         let completed =
-            translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "gemini").unwrap();
+            translate_stream_event(STREAM_INTERACTION_COMPLETED, "msg-1", "gemini", &mut None)
+                .unwrap();
         assert_eq!(completed.len(), 3); // content_block_stop + message_delta + message_stop
 
-        // Total events: 2 + 1 + 1 + 1 + 1 + 1 + 1 + 3 = 11
+        // Total events: 1 + 1 + 1 + 1 + 1 + 1 + 1 + 3 = 10
         let total = created.len()
             + thought_start.len()
             + sig_delta.len()
@@ -2917,7 +3053,7 @@ If you don't know the answer, say so honestly.";
             + text_delta.len()
             + text_stop.len()
             + completed.len();
-        assert_eq!(total, 11);
+        assert_eq!(total, 10);
     }
 
     #[test]
@@ -3206,7 +3342,9 @@ If you don't know the answer, say so honestly.";
 
     #[test]
     fn translate_step_start_function_call_produces_tool_use_block() {
-        let events = translate_stream_event(STREAM_STEP_START_FUNCTION_CALL, "msg-1", "m").unwrap();
+        let events =
+            translate_stream_event(STREAM_STEP_START_FUNCTION_CALL, "msg-1", "m", &mut None)
+                .unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             anyllm_translate::anthropic::StreamEvent::ContentBlockStart {
@@ -3225,7 +3363,8 @@ If you don't know the answer, say so honestly.";
 
     #[test]
     fn translate_arguments_delta_produces_input_json_delta() {
-        let events = translate_stream_event(STREAM_STEP_DELTA_ARGUMENTS, "msg-1", "m").unwrap();
+        let events =
+            translate_stream_event(STREAM_STEP_DELTA_ARGUMENTS, "msg-1", "m", &mut None).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             anyllm_translate::anthropic::StreamEvent::ContentBlockDelta { delta, .. } => {

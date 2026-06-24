@@ -158,10 +158,13 @@ fn match_extend_lifetime(text: &str, constant: &str) -> Option<u64> {
 
     // Find the prefix within the text
     let after_prefix = text.find(prefix).map(|i| &text[i + prefix.len()..])?;
-    // Extract digits (the timestamp)
-    let digits_end = after_prefix.find(|c: char| !c.is_ascii_digit())?;
-    let digits = &after_prefix[..digits_end];
-    let remainder = &after_prefix[digits_end..];
+    // Extract digits (the timestamp). If no non-digit is found (timestamp
+    // at end of message), use the entire remaining string.
+    let digits = match after_prefix.find(|c: char| !c.is_ascii_digit()) {
+        Some(digits_end) => &after_prefix[..digits_end],
+        None => after_prefix,
+    };
+    let remainder = &after_prefix[digits.len()..];
 
     if remainder.starts_with(suffix) {
         digits.parse().ok()
@@ -264,5 +267,15 @@ mod tests {
     fn extract_timestamp_no_match() {
         let result = match_extend_lifetime("no timestamp here", EXTEND_LIFETIME);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn extract_timestamp_at_end_of_message() {
+        // Timestamp at the very end of the message with no trailing characters
+        let text = "***!___!--- текущую сессию gemini interactions храни до 1718571800";
+        // Use a constant where the suffix after <unix_utc> ends the message
+        let constant = "***!___!--- текущую сессию gemini interactions храни до <unix_utc>";
+        let result = match_extend_lifetime(text, constant);
+        assert_eq!(result, Some(1718571800));
     }
 }

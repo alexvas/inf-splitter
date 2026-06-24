@@ -286,7 +286,8 @@ Only messages not yet delivered to the session are included (delta computation).
 - `Interaction.usage` → response usage metadata
 - Non-streaming response construction uses shared `build_response_from_interaction()` across all three paths (`send_and_translate`, `handle_split_send`, `send_split_system_instruction`)
 - Stream: `step.*` events → Anthropic `StreamEvent` SSE, including function_call → tool_use blocks
-- Stream: `InteractionCompletedEvent` → final events with appropriate stop_reason
+- Stream: `InteractionCreatedEvent` emits only `message_start` — `content_block_start` is deferred to `step.start` events to avoid duplicate block starts at index 0
+- Stream: `InteractionCompletedEvent` emits `ContentBlockStop` for the last active block index (tracked from `step.start`), not hardcoded 0
 
 ### Scenario: Text response from interactions
 - GIVEN `Interaction` with `ModelOutputStep` containing text
@@ -335,14 +336,14 @@ When a request exceeds `proxy_limit`, content is split into chunks and sent sequ
 
 **Envelope** — per-chunk overhead from non-content fields:
 - First chunk: `{model, stream: false, tools?, generation_config?, system_instruction?}`
-- Subsequent chunks: `{model, stream: false, previous_interaction_id}`
+- Subsequent chunks: `{model, stream: false, previous_interaction_id}` — includes a dummy `previous_interaction_id` (36-char placeholder) in size estimation to account for the field that `build_chunk_request` serializes.
 
 **Two-phase greedy algorithm:**
 
-**Phase 1 — System instruction:**
-If `serialize(envelope_first + system_instruction + empty_input) > limit`, split `system_instruction` text via `split_text_for_limit`. Each part is sent as a separate chunk (with empty input), chained via `previous_interaction_id`. The first system-instruction chunk carries `tools` and `generation_config`.
+Phase 1 — System instruction:
+If `serialize(envelope_first + system_instruction + empty_input) > limit`, split `system_instruction` text via `split_text_for_limit`. Each part is sent as a separate chunk (with empty input), chained via `previous_interaction_id`. The first system-instruction chunk carries `tools` and `generation_config`. Each system-instruction chunk response is stored in `last_interaction` so that `build_fallback_response` has data when no content chunks follow.
 
-**Phase 2 — Content packing:**
+Phase 2 — Content packing:
 After system_instruction is delivered (or if it fit without splitting), pack remaining content items greedily:
 1. Start a new chunk with the current envelope
 2. For each content item, compute `serialize(chunk + item)`
@@ -350,10 +351,14 @@ After system_instruction is delivered (or if it fit without splitting), pack rem
 4. If > limit — finalize current chunk (send it), start a new chunk with the item
 5. If a single item alone exceeds the limit → error (`can_split_under_limit` pre-check)
 
+**Session updates:** `message_count` and `previous_interaction_id` are updated after each successful chunk (not only after all chunks), so retries after a chunk failure don't re-send already-accepted content upstream. The final update sets `pending = false`.
+
 **Invariants:**
 - Every serialized chunk body ≤ `proxy_limit`
 - Each chunk is as full as possible (greedy)
 - System instruction consumed first (empty input), then user content
+- Chunk size estimation for subsequent chunks accounts for `previous_interaction_id`
+- Per-chunk session updates prevent content duplication on retry
 
 **Streaming response:** When the original ingress was streaming (`stream: true`), the final response is SSE events with `Content-Type: text/event-stream`. The final `Interaction` is translated to synthetic `StreamEvent` items via `build_response_from_interaction`.
 
@@ -763,3 +768,34 @@ The interactions streaming path (`handle_stream_response`) also detects non-UTF-
 - WHEN the chunk is received by `handle_stream_response`
 - THEN an SSE `error` event is sent to the client
 - AND the stream is aborted with `finish_with_error(502, ...)`
+
+## Requirement: max_tokens Clamping at u32::MAX
+
+When constructing `GenerationConfig` from ingress `max_tokens`, values above `u32::MAX` are clamped to `u32::MAX` with a `tracing::warn!` log, instead of silently wrapping via `as u32`. The clamp is applied in a shared `clamp_max_tokens` helper used by both Anthropic and OpenAI ingress paths.
+
+### Scenario: max_tokens above u32::MAX clamped
+- GIVEN a client sends `max_tokens: 5000000000` (exceeds u32::MAX)
+- WHEN the interactions handler constructs `GenerationConfig`
+- THEN `max_output_tokens` is set to `u32::MAX` (4294967295)
+- AND `tracing::warn!("max_tokens {} exceeds u32::MAX, clamping", val)` is emitted
+
+### Scenario: max_tokens within range unchanged
+- GIVEN a client sends `max_tokens: 4096`
+- WHEN the interactions handler constructs `GenerationConfig`
+- THEN `max_output_tokens` is set to `4096` (unchanged)
+
+## Requirement: extend_lifetime Matches Timestamp at End of Message
+
+`match_extend_lifetime` in `control.rs` correctly extracts the timestamp from `extend_lifetime` control messages even when the timestamp is the final token in the message (no trailing non-digit character).
+
+### Scenario: Timestamp at end of message
+- GIVEN a control template ending in the timestamp placeholder and a message with the timestamp at its end
+- WHEN `match_extend_lifetime` processes the message
+- THEN `after_prefix.find(|c: char| !c.is_ascii_digit())` returns `None`
+- AND the handler treats the entire remaining string as the timestamp
+- AND the session lifetime is extended correctly
+
+### Scenario: Timestamp not at end (existing behavior preserved)
+- GIVEN a message with text after the timestamp
+- WHEN `match_extend_lifetime` processes the message
+- THEN the timestamp is correctly extracted as before

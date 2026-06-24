@@ -100,12 +100,19 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             let name = name.clone();
             let use_get = *is_interactions;
             async move {
-                // Strip query params before appending health-check path
-                let base = match endpoint.find('?') {
-                    Some(pos) => &endpoint[..pos],
-                    None => endpoint.as_str(),
+                let url = if use_get {
+                    // Interactions endpoints may carry query parameters (e.g. ?key=...).
+                    // Use the configured endpoint as-is rather than stripping the query
+                    // string and appending "/".
+                    endpoint.clone()
+                } else {
+                    // OpenAI/Anthropic endpoints: strip query params, append "/"
+                    let base = match endpoint.find('?') {
+                        Some(pos) => &endpoint[..pos],
+                        None => endpoint.as_str(),
+                    };
+                    format!("{base}/")
                 };
-                let url = format!("{base}/");
                 let req = if use_get {
                     client.get(&url)
                 } else {

@@ -798,10 +798,20 @@ async fn relay_upstream_response(
     let body = upstream.bytes().await.map_err(|e| {
         guard.abort_upstream(0, guard.ingress_size(), upstream_url, direction, false, e)
     })?;
-    let validated =
-        crate::validate_upstream_body(body.clone(), guard.request_id()).map_err(|e| {
-            guard.abort_upstream(0, guard.ingress_size(), upstream_url, direction, false, e)
-        })?;
+    let validated = match crate::validate_upstream_body(body.clone(), guard.request_id()) {
+        Ok(v) => v,
+        Err((e, dump)) => {
+            guard.response_dump(dump, status.as_u16(), true, response_headers.clone());
+            return Err(guard.abort_upstream(
+                0,
+                guard.ingress_size(),
+                upstream_url,
+                direction,
+                false,
+                e,
+            ));
+        }
+    };
     guard.response_dump(
         validated.dump,
         status.as_u16(),

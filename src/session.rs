@@ -79,6 +79,7 @@ impl SessionStore {
     }
 
     /// Get or create a session. Updates last_access_utc.
+    /// On new session creation, evicts any expired sessions from the store.
     pub async fn get_or_create(&self, session_id: &str) -> SessionState {
         let now = unix_now();
         let mut sessions = self.sessions.write().await;
@@ -86,6 +87,19 @@ impl SessionStore {
             state.last_access_utc = now;
             state.clone()
         } else {
+            // Evict expired sessions before creating a new one
+            let expired: Vec<String> = sessions
+                .iter()
+                .filter(|(_, s)| now > s.expires_at_utc)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for id in &expired {
+                sessions.remove(id);
+            }
+            if !expired.is_empty() {
+                tracing::info!(count = expired.len(), "evicted expired sessions");
+            }
+
             let state = SessionState {
                 interaction_id: String::new(),
                 message_count: 0,

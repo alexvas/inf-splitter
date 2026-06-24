@@ -818,12 +818,14 @@ control_clean_all = "{CTRL_CLEAN_ALL}"
     .await;
     assert_eq!(response1.status(), reqwest::StatusCode::OK);
 
-    // Send the clean-all control message
+    let double_clean = format!("{CTRL_CLEAN_ALL}{CTRL_CLEAN_ALL}");
+
+    // Send the clean-all control message (double appearance required)
     let clean_request = serde_json::json!({
         "model": "gemini-3.1-flash-lite",
         "max_tokens": 64,
         "messages": [
-            {"role": "user", "content": CTRL_CLEAN_ALL}
+            {"role": "user", "content": double_clean}
         ]
     });
     let response2 = post_anthropic_with_session(&proxy_addr, clean_request, "sess-ctrl").await;
@@ -880,12 +882,13 @@ control_extend_lifetime = "{CTRL_EXTEND}"
         .as_secs()
         + 86400;
     let extend_msg = CTRL_EXTEND.replace("<unix_utc>", &future_ts.to_string());
+    let double_extend = format!("{extend_msg}{extend_msg}");
 
     let extend_request = serde_json::json!({
         "model": "gemini-3.1-flash-lite",
         "max_tokens": 64,
         "messages": [
-            {"role": "user", "content": extend_msg}
+            {"role": "user", "content": double_extend}
         ]
     });
     let response = post_anthropic_with_session(&proxy_addr, extend_request, "sess-extend").await;
@@ -928,11 +931,12 @@ control_clean_all = "{CTRL_CLEAN_ALL}"
     );
     let proxy_addr = spawn_router(&config).await;
 
+    let double_clean = format!("{CTRL_CLEAN_ALL}{CTRL_CLEAN_ALL}");
     let clean_request = serde_json::json!({
         "model": "gemini-3.1-flash-lite",
         "max_tokens": 64,
         "messages": [
-            {"role": "user", "content": CTRL_CLEAN_ALL}
+            {"role": "user", "content": double_clean}
         ]
     });
     // First: should be processed
@@ -1003,11 +1007,12 @@ control_extend_lifetime = "{CTRL_EXTEND}"
             + 86400)
             .to_string(),
     );
+    let double_extend = format!("{extend_msg}{extend_msg}");
     let request = serde_json::json!({
         "model": "gemini-3.1-flash-lite",
         "max_tokens": 64,
         "messages": [
-            {"role": "user", "content": extend_msg}
+            {"role": "user", "content": double_extend}
         ]
     });
     let response = post_anthropic_with_session(&proxy_addr, request, "sess-strip").await;
@@ -1520,12 +1525,13 @@ control_clean_all = "{CTRL_CLEAN_ALL}"
     // and delete (DELETE /v1beta/interactions/{id}) will get HTTP 404 — which is still Ok()
     // This verifies that CleanAll does NOT crash/silently fail even when lifecycle calls get non-200
 
-    // Send clean-all
+    // Send clean-all (double appearance required)
+    let double_clean = format!("{CTRL_CLEAN_ALL}{CTRL_CLEAN_ALL}");
     let clean_request = serde_json::json!({
         "model": "gemini-3.1-flash-lite",
         "max_tokens": 64,
         "messages": [
-            {"role": "user", "content": CTRL_CLEAN_ALL}
+            {"role": "user", "content": double_clean}
         ]
     });
     let response2 = post_anthropic_with_session(&proxy_addr, clean_request, "sess-err").await;

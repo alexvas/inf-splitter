@@ -163,6 +163,12 @@ impl InteractionsHandler {
                     .replay_interaction(pid, route, &session_id, &model, Protocol::Anthropic, guard)
                     .await;
             }
+            // All messages delivered but no interaction_id to replay —
+            // session state was lost or never persisted. Sending an empty
+            // ContentList upstream is invalid.
+            return Err(AppError::Internal(
+                "session has no interaction_id for replay".to_string(),
+            ));
         }
 
         // Build the request (Anthropic ingress)
@@ -182,7 +188,19 @@ impl InteractionsHandler {
 
         // Send to upstream
         let backend_url = endpoint.to_string();
-        let request_body = serde_json::to_vec(&params).map_err(|e| {
+        let mut body_value = serde_json::to_value(&params).map_err(|e| {
+            guard.abort_internal(
+                0,
+                body.len(),
+                endpoint,
+                "anthropic->interactions",
+                stream,
+                e,
+            )
+        })?;
+        let df = route.drop_fields.for_model(&model);
+        crate::drop_fields_from_value(&mut body_value, &df);
+        let request_body = serde_json::to_vec(&body_value).map_err(|e| {
             guard.abort_internal(
                 0,
                 body.len(),
@@ -334,6 +352,9 @@ impl InteractionsHandler {
                     .replay_interaction(pid, route, &session_id, &model, Protocol::OpenAi, guard)
                     .await;
             }
+            return Err(AppError::Internal(
+                "session has no interaction_id for replay".to_string(),
+            ));
         }
 
         let params = interactions_lib::build_interactions_request_openai(
@@ -350,17 +371,14 @@ impl InteractionsHandler {
         );
 
         let backend_url = endpoint.to_string();
-        let request_body = serde_json::to_vec(&params).map_err(|e| {
-            guard.abort_internal(0, body.len(), endpoint, "openai->interactions", stream, e)
-        })?;
+        let params_size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(0);
 
         if let Some(limit) = route.proxy_limit {
             let contents = match &params.input {
                 InteractionsInput::ContentList(list) => list.clone(),
                 _ => vec![],
             };
-            let size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(0);
-            if size > limit {
+            if params_size > limit {
                 if interactions_lib::can_split_under_limit(&params, limit).is_err() {
                     return Err(guard.abort_bad_request(
                         0,
@@ -392,6 +410,15 @@ impl InteractionsHandler {
                     .await;
             }
         }
+
+        let mut body_value = serde_json::to_value(&params).map_err(|e| {
+            guard.abort_internal(0, body.len(), endpoint, "openai->interactions", stream, e)
+        })?;
+        let df = route.drop_fields.for_model(&model);
+        crate::drop_fields_from_value(&mut body_value, &df);
+        let request_body = serde_json::to_vec(&body_value).map_err(|e| {
+            guard.abort_internal(0, body.len(), endpoint, "openai->interactions", stream, e)
+        })?;
 
         self.send_and_translate(
             &backend_url,
@@ -472,7 +499,7 @@ impl InteractionsHandler {
                 return Err(guard.abort_upstream(duration_ms, 0, &url, "replay", false, e));
             }
         };
-        let validated = match crate::validate_upstream_body(body_bytes, &guard.request_id()) {
+        let validated = match crate::validate_upstream_body(body_bytes, guard.request_id()) {
             Ok(v) => v,
             Err((e, dump)) => {
                 guard.response_dump(dump, 502, true, vec![]);
@@ -609,7 +636,7 @@ impl InteractionsHandler {
         {
             Ok(v) => v,
             Err((e, dump)) => {
-                guard.response_dump(dump, 502, true, response_headers);
+                guard.response_dump(dump, 502, true, response_headers.clone());
                 return Err(guard.abort_upstream(
                     duration_ms,
                     ingress_body.len(),
@@ -620,7 +647,7 @@ impl InteractionsHandler {
                 ));
             }
         };
-        guard.response_dump(validated.dump, 200, false, response_headers);
+        guard.response_dump(validated.dump, 200, false, response_headers.clone());
         let response_body = validated.text;
         let interaction: Interaction = match serde_json::from_str(&response_body) {
             Ok(inter) => inter,
@@ -638,10 +665,17 @@ impl InteractionsHandler {
 
         // Update session
         let interaction_id = interaction.id.clone();
-        let _ = self
-            .session_store
+        self.session_store
             .update(session_id, interaction_id, new_count, false)
-            .await;
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "session update failed after successful upstream interaction"
+                );
+                AppError::Internal(format!("session update failed: {e}"))
+            })?;
 
         // Translate response back to ingress protocol
         let resp =
@@ -672,7 +706,12 @@ impl InteractionsHandler {
             stream,
         );
 
-        Ok(Self::ok_with_session_header(ingress, session_id, resp))
+        Ok(Self::ok_with_session_header_and_upstream_headers(
+            ingress,
+            session_id,
+            resp,
+            &response_headers,
+        ))
     }
 
     /// Stream interactions response events translated to the client's protocol.
@@ -812,6 +851,16 @@ impl InteractionsHandler {
                                                         // stream completed — no egress/response
                                                         // dump is recorded because the upstream
                                                         // response was never fully received.
+                                                        if interaction_id.is_empty() {
+                                                            let _ = session_store
+                                                                .update(
+                                                                    &sid,
+                                                                    String::new(),
+                                                                    new_count,
+                                                                    false,
+                                                                )
+                                                                .await;
+                                                        }
                                                         let duration_ms =
                                                             start.elapsed().as_millis() as u64;
                                                         guard.finish(
@@ -888,9 +937,16 @@ impl InteractionsHandler {
 
             // Update session after stream completes
             if !interaction_id.is_empty() {
-                let _ = session_store
+                if let Err(e) = session_store
                     .update(&sid, interaction_id, new_count, false)
-                    .await;
+                    .await
+                {
+                    tracing::error!(
+                        session_id = %sid,
+                        error = %e,
+                        "session update failed after successful upstream stream"
+                    );
+                }
             }
 
             // Response dump for streaming
@@ -966,7 +1022,7 @@ impl InteractionsHandler {
             generation_config: params.generation_config.clone(),
             ..Default::default()
         };
-        let subsequent_envelope = CreateModelInteractionParams {
+        let mut subsequent_envelope = CreateModelInteractionParams {
             model: model.to_string(),
             input: InteractionsInput::ContentList(vec![]),
             stream: Some(false),
@@ -1126,7 +1182,7 @@ impl InteractionsHandler {
             {
                 Ok(v) => v,
                 Err((e, dump)) => {
-                    guard.response_dump(dump, 502, true, response_headers);
+                    guard.response_dump(dump, 502, true, response_headers.clone());
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -1137,7 +1193,7 @@ impl InteractionsHandler {
                     ));
                 }
             };
-            guard.response_dump(validated.dump, 200, false, response_headers);
+            guard.response_dump(validated.dump, 200, false, response_headers.clone());
             let response_text = validated.text;
             let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
                 guard.abort_upstream(
@@ -1155,25 +1211,48 @@ impl InteractionsHandler {
             last_id = Some(interaction_id.clone());
             last_interaction = Some(interaction);
 
+            // After first chunk, rebuild subsequent_envelope with the real
+            // previous_interaction_id so subsequent chunk size estimation
+            // uses the actual ID length, not a hardcoded 36-char placeholder.
+            if i == 0 {
+                subsequent_envelope.previous_interaction_id = Some(interaction_id.clone());
+                // Verify remaining pre-packed chunks still fit with real ID
+                for (j, chunk) in chunks.iter().enumerate().skip(1) {
+                    let body = interactions_lib::build_pack_body(&subsequent_envelope, chunk);
+                    let size = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
+                    if size > limit {
+                        return Err(guard.abort_bad_request(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            stream,
+                            format!(
+                                "chunk {} exceeds proxy_limit with real previous_interaction_id ({} > {})",
+                                j, size, limit
+                            ),
+                        ));
+                    }
+                }
+            }
+
             // Update session after each successful chunk so retries don't
             // re-send already-accepted content upstream.
-            // delivered_so_far estimates ingress message count from Content
-            // proportions since Content items may differ from message count.
-            let total_items: usize = chunks.iter().map(|c| c.len()).sum();
+            // Track delivered Content items by index (upper bound) to
+            // prevent underestimation from proportional rounding.
             let delivered_items: usize = chunks[..=i].iter().map(|c| c.len()).sum();
-            let delivered_so_far: usize = if total_items > 0 {
-                let initial_delivered = total_message_count.saturating_sub(total_items);
-                let proportion = delivered_items as f64 / total_items as f64;
-                (initial_delivered as f64 + proportion * total_items as f64)
-                    .round()
-                    .min(total_message_count as f64) as usize
-            } else {
-                total_message_count
-            };
-            let _ = self
+            let delivered_so_far = std::cmp::min(delivered_items, total_message_count);
+            if let Err(e) = self
                 .session_store
                 .update(session_id, interaction_id, delivered_so_far, true)
-                .await;
+                .await
+            {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "session update failed after successful split-send chunk"
+                );
+            }
         }
 
         if stream {
@@ -1192,10 +1271,17 @@ impl InteractionsHandler {
                 // Finalize session after successful translation so retries
                 // can recover if translation fails.
                 if let Some(ref final_id) = last_id {
-                    let _ = self
-                        .session_store
+                    self.session_store
                         .update(session_id, final_id.clone(), total_message_count, false)
-                        .await;
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "session update failed after successful split-send stream"
+                            );
+                            AppError::Internal(format!("session update failed: {e}"))
+                        })?;
                 }
                 let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
                 guard.ingress_response_dump(
@@ -1245,10 +1331,17 @@ impl InteractionsHandler {
         };
         // Finalize session after successful response translation.
         if let Some(ref final_id) = last_id {
-            let _ = self
-                .session_store
+            self.session_store
                 .update(session_id, final_id.clone(), total_message_count, false)
-                .await;
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        session_id = %session_id,
+                        error = %e,
+                        "session update failed after successful split-send"
+                    );
+                    AppError::Internal(format!("session update failed: {e}"))
+                })?;
         }
         // Dump the final ingress response before finishing
         let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
@@ -1397,7 +1490,7 @@ impl InteractionsHandler {
             {
                 Ok(v) => v,
                 Err((e, dump)) => {
-                    guard.response_dump(dump, 502, true, response_headers);
+                    guard.response_dump(dump, 502, true, response_headers.clone());
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -1408,7 +1501,7 @@ impl InteractionsHandler {
                     ));
                 }
             };
-            guard.response_dump(validated.dump, 200, false, response_headers);
+            guard.response_dump(validated.dump, 200, false, response_headers.clone());
             let response_text = validated.text;
             let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
                 guard.abort_internal(
@@ -1505,7 +1598,7 @@ impl InteractionsHandler {
                     match crate::validate_upstream_body(response_bytes, guard.request_id()) {
                         Ok(v) => v,
                         Err((e, dump)) => {
-                            guard.response_dump(dump, 502, true, response_headers);
+                            guard.response_dump(dump, 502, true, response_headers.clone());
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -1516,7 +1609,7 @@ impl InteractionsHandler {
                             ));
                         }
                     };
-                guard.response_dump(validated.dump, 200, false, response_headers);
+                guard.response_dump(validated.dump, 200, false, response_headers.clone());
                 let response_text = validated.text;
                 let interaction: Interaction =
                     serde_json::from_str(&response_text).map_err(|e| {
@@ -1536,10 +1629,17 @@ impl InteractionsHandler {
         }
 
         if let Some(ref final_id) = last_id {
-            let _ = self
-                .session_store
+            self.session_store
                 .update(session_id, final_id.clone(), total_message_count, false)
-                .await;
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        session_id = %session_id,
+                        error = %e,
+                        "session update failed after successful split-system-instruction"
+                    );
+                    AppError::Internal(format!("session update failed: {e}"))
+                })?;
         }
 
         if stream {
@@ -1839,12 +1939,29 @@ impl InteractionsHandler {
         session_id: &str,
         json: serde_json::Value,
     ) -> Response {
+        Self::ok_with_session_header_and_upstream_headers(ingress, session_id, json, &[])
+    }
+
+    fn ok_with_session_header_and_upstream_headers(
+        ingress: Protocol,
+        session_id: &str,
+        json: serde_json::Value,
+        upstream_headers: &[(String, String)],
+    ) -> Response {
         let hdr_name = Self::session_header_name(ingress);
         let hdr_value = HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
         let mut response = (StatusCode::OK, axum::Json(json)).into_response();
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static(hdr_name), hdr_value);
+        let headers = response.headers_mut();
+        headers.insert(HeaderName::from_static(hdr_name), hdr_value);
+        for (name, value) in upstream_headers {
+            if is_interactions_response_header_whitelisted(name) {
+                if let Ok(v) = HeaderValue::from_str(value) {
+                    if let Ok(n) = HeaderName::from_bytes(name.as_bytes()) {
+                        headers.insert(n, v);
+                    }
+                }
+            }
+        }
         response
     }
 
@@ -1971,7 +2088,13 @@ fn synthesize_anthropic_events(
 // types are not publicly exported by anyllm_translate. The functions
 // return pre-formatted "data: {...}\n\n" strings ready for the SSE stream.
 
-fn openai_sse_role_chunk(msg_id: &str, model: &str, index: u32) -> String {
+fn openai_sse_chunk(
+    msg_id: &str,
+    model: &str,
+    index: u32,
+    delta: serde_json::Value,
+    finish_reason: Option<&str>,
+) -> String {
     let chunk = serde_json::json!({
         "id": msg_id,
         "object": "chat.completion.chunk",
@@ -1979,49 +2102,58 @@ fn openai_sse_role_chunk(msg_id: &str, model: &str, index: u32) -> String {
         "model": model,
         "choices": [{
             "index": index,
-            "delta": {"role": "assistant"},
-            "finish_reason": null
-        }]
-    });
-    format!(
-        "data: {}\n\n",
-        serde_json::to_string(&chunk).unwrap_or_default()
-    )
-}
-
-fn openai_sse_content_chunk(msg_id: &str, model: &str, index: u32, content: &str) -> String {
-    let chunk = serde_json::json!({
-        "id": msg_id,
-        "object": "chat.completion.chunk",
-        "created": 0,
-        "model": model,
-        "choices": [{
-            "index": index,
-            "delta": {"content": content},
-            "finish_reason": null
-        }]
-    });
-    format!(
-        "data: {}\n\n",
-        serde_json::to_string(&chunk).unwrap_or_default()
-    )
-}
-
-fn openai_sse_finish_chunk(msg_id: &str, model: &str, index: u32, finish_reason: &str) -> String {
-    let chunk = serde_json::json!({
-        "id": msg_id,
-        "object": "chat.completion.chunk",
-        "created": 0,
-        "model": model,
-        "choices": [{
-            "index": index,
-            "delta": {},
+            "delta": delta,
             "finish_reason": finish_reason
         }]
     });
     format!(
         "data: {}\n\n",
         serde_json::to_string(&chunk).unwrap_or_default()
+    )
+}
+
+fn openai_sse_role_chunk(msg_id: &str, model: &str, index: u32) -> String {
+    openai_sse_chunk(
+        msg_id,
+        model,
+        index,
+        serde_json::json!({"role": "assistant"}),
+        None,
+    )
+}
+
+fn openai_sse_content_chunk(msg_id: &str, model: &str, index: u32, content: &str) -> String {
+    openai_sse_chunk(
+        msg_id,
+        model,
+        index,
+        serde_json::json!({"content": content}),
+        None,
+    )
+}
+
+fn openai_sse_tool_calls_chunk(
+    msg_id: &str,
+    model: &str,
+    index: u32,
+    tool_calls: &[serde_json::Value],
+) -> String {
+    openai_sse_chunk(
+        msg_id,
+        model,
+        index,
+        serde_json::json!({"tool_calls": tool_calls}),
+        None,
+    )
+}
+
+fn openai_sse_finish_chunk(msg_id: &str, model: &str, index: u32, finish_reason: &str) -> String {
+    openai_sse_chunk(
+        msg_id,
+        model,
+        index,
+        serde_json::json!({}),
+        Some(finish_reason),
     )
 }
 
@@ -2047,10 +2179,18 @@ fn synthesize_openai_chunks(model: &str, resp: &serde_json::Value) -> Vec<String
                 .and_then(|m| m.get("content"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let tool_calls = choice
+                .get("message")
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|v| v.as_array());
 
             chunks.push(openai_sse_role_chunk(msg_id, model, index));
 
-            if !delta_content.is_empty() {
+            if let Some(tc_arr) = tool_calls {
+                if !tc_arr.is_empty() {
+                    chunks.push(openai_sse_tool_calls_chunk(msg_id, model, index, tc_arr));
+                }
+            } else if !delta_content.is_empty() {
                 chunks.push(openai_sse_content_chunk(
                     msg_id,
                     model,
@@ -2108,9 +2248,18 @@ fn build_fallback_response(
                     logprobs: None,
                 }],
                 usage: Some(ChatUsage {
-                    prompt_tokens: input_tokens as u32,
-                    completion_tokens: output_tokens as u32,
-                    total_tokens: (input_tokens + output_tokens) as u32,
+                    prompt_tokens: interactions_lib::clamp_i64_to_u32(
+                        input_tokens,
+                        "total_input_tokens",
+                    ),
+                    completion_tokens: interactions_lib::clamp_i64_to_u32(
+                        output_tokens,
+                        "total_output_tokens",
+                    ),
+                    total_tokens: interactions_lib::clamp_i64_to_u32(
+                        input_tokens + output_tokens,
+                        "total_tokens",
+                    ),
                     completion_tokens_details: None,
                     prompt_tokens_details: None,
                 }),
@@ -2130,8 +2279,14 @@ fn build_fallback_response(
                 stop_reason: Some(StopReason::EndTurn),
                 stop_sequence: None,
                 usage: Usage {
-                    input_tokens: input_tokens as u32,
-                    output_tokens: output_tokens as u32,
+                    input_tokens: interactions_lib::clamp_i64_to_u32(
+                        input_tokens,
+                        "total_input_tokens",
+                    ),
+                    output_tokens: interactions_lib::clamp_i64_to_u32(
+                        output_tokens,
+                        "total_output_tokens",
+                    ),
                     ..Default::default()
                 },
                 created: None,
@@ -2183,10 +2338,28 @@ fn build_interactions_headers_map(api_key: Option<&str>, request_headers: &Heade
             HeaderValue::from_str(key).unwrap_or(HeaderValue::from_static("")),
         );
     }
+
+    // Forward x-claude-code-session-id as X-Client-Request-Id for
+    // OpenAI upstream request correlation.
+    if headers.contains_key("x-claude-code-session-id")
+        && !headers.contains_key("x-client-request-id")
+    {
+        if let Some(val) = headers.get("x-claude-code-session-id").cloned() {
+            headers.insert(HeaderName::from_static("x-client-request-id"), val);
+        }
+    }
+
     headers
 }
 
-/// Build headers for interactions upstream requests.
+/// Whitelist of upstream response headers to forward through interactions success responses.
+fn is_interactions_response_header_whitelisted(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "x-request-id"
+        || name == "x-claude-code-session-id"
+        || name.starts_with("x-ratelimit-")
+        || name == "request-id"
+}
 fn build_interactions_headers(
     builder: reqwest::RequestBuilder,
     api_key: Option<&str>,
@@ -3608,5 +3781,62 @@ If you don't know the answer, say so honestly.";
             }
             other => panic!("expected ContentBlockDelta, got {:?}", other),
         }
+    }
+
+    // --- synthesize_openai_chunks tests ---
+
+    #[test]
+    fn synthesize_openai_chunks_with_tool_calls() {
+        let resp = serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"location\":\"Boston\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let chunks = synthesize_openai_chunks("test-model", &resp);
+        let joined = chunks.join("");
+        assert!(
+            joined.contains("tool_calls"),
+            "must contain tool_calls delta chunk"
+        );
+        assert!(
+            joined.contains("get_weather"),
+            "must contain tool call name"
+        );
+        assert!(
+            joined.contains("tool_calls"),
+            "finish reason must be tool_calls"
+        );
+    }
+
+    #[test]
+    fn synthesize_openai_chunks_text_only_unchanged() {
+        let resp = serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }]
+        });
+        let chunks = synthesize_openai_chunks("test-model", &resp);
+        let joined = chunks.join("");
+        assert!(
+            joined.contains("\"content\":\"hello\""),
+            "must contain text content"
+        );
+        assert!(
+            !joined.contains("tool_calls"),
+            "must NOT contain tool_calls for text-only response"
+        );
     }
 }

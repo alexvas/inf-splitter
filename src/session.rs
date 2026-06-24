@@ -131,9 +131,10 @@ impl SessionStore {
         state.expires_at_utc = now + DEFAULT_SESSION_TTL_SECS;
         state.pending = pending;
         drop(sessions);
-        self.save_to_disk().await.inspect_err(|e| {
+        if let Err(e) = self.save_to_disk().await {
             tracing::warn!(session_id = %session_id, error = %e, "session update: save_to_disk failed");
-        })
+        }
+        Ok(())
     }
 
     /// Extend session lifetime to a specific UTC timestamp.

@@ -275,7 +275,7 @@ pub fn pack_content_into_chunks(
 }
 
 /// Build a `CreateModelInteractionParams` body for size measurement during packing.
-fn build_pack_body(
+pub(crate) fn build_pack_body(
     envelope: &CreateModelInteractionParams,
     input: &[Content],
 ) -> CreateModelInteractionParams {
@@ -499,7 +499,7 @@ pub fn extract_interaction_tool_calls(
 }
 
 /// Clamp i64 token count to u32 range, logging a warning on overflow.
-fn clamp_i64_to_u32(n: i64, field: &str) -> u32 {
+pub fn clamp_i64_to_u32(n: i64, field: &str) -> u32 {
     if n < 0 {
         tracing::warn!(value = n, field, "negative token count, clamping to 0");
         0
@@ -761,8 +761,33 @@ fn extract_anthropic_content(msg: &serde_json::Value) -> Option<Content> {
     } else if let Some(blocks) = content.as_array() {
         blocks
             .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<&str>>()
+            .filter_map(|b| {
+                let block_type = b.get("type").and_then(|t| t.as_str());
+                match block_type {
+                    Some("text") => b.get("text").and_then(|t| t.as_str()).map(String::from),
+                    Some("tool_result") => {
+                        let c = b.get("content")?;
+                        if let Some(s) = c.as_str() {
+                            Some(s.to_string())
+                        } else if let Some(arr) = c.as_array() {
+                            let joined: String = arr
+                                .iter()
+                                .filter_map(|tb| tb.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<&str>>()
+                                .join("\n");
+                            if joined.is_empty() {
+                                None
+                            } else {
+                                Some(joined)
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<String>>()
             .join("\n")
     } else {
         return None;
@@ -1604,5 +1629,52 @@ mod tests {
         let msg: MessageResponse = serde_json::from_value(resp).expect("should deserialize");
         assert_eq!(msg.usage.input_tokens, 15000);
         assert_eq!(msg.usage.output_tokens, 8000);
+    }
+
+    // --- tool_result extraction tests ---
+
+    #[test]
+    fn extract_anthropic_content_tool_result_string() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "sunny"}]
+        });
+        let result = extract_anthropic_content(&msg);
+        let content = result.expect("should extract tool_result with string content");
+        match content {
+            Content::TextContent(tc) => assert_eq!(tc.text, "sunny"),
+            other => panic!("expected TextContent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_anthropic_content_tool_result_array() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": [{"type": "text", "text": "result: 42"}]}]
+        });
+        let result = extract_anthropic_content(&msg);
+        let content = result.expect("should extract tool_result with array content");
+        match content {
+            Content::TextContent(tc) => assert_eq!(tc.text, "result: 42"),
+            other => panic!("expected TextContent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_anthropic_content_mixed_text_and_tool_result() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "b"}
+            ]
+        });
+        let result = extract_anthropic_content(&msg);
+        let content = result.expect("should extract mixed text and tool_result");
+        match content {
+            Content::TextContent(tc) => assert_eq!(tc.text, "a\nb"),
+            other => panic!("expected TextContent, got {:?}", other),
+        }
     }
 }

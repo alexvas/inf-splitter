@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use axum::http::HeaderValue;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -274,6 +275,8 @@ pub enum ConfigError {
     InvalidDuration { value: String, message: String },
     #[error("invalid byte size {value}: {message}")]
     InvalidByteSize { value: String, message: String },
+    #[error("invalid api_key in section {section}: {message}")]
+    InvalidApiKey { section: String, message: String },
 }
 
 impl Config {
@@ -380,7 +383,23 @@ impl Config {
             };
 
             let api_key = match raw_section.api_key {
-                Some(value) => Some(resolve_secret(&value)?),
+                Some(value) => {
+                    let resolved = resolve_secret(&value)?;
+                    // Validate as legal HTTP header value
+                    if resolved.is_empty() {
+                        return Err(ConfigError::InvalidApiKey {
+                            section: name.clone(),
+                            message: "api_key must not be empty".to_string(),
+                        });
+                    }
+                    if let Err(e) = HeaderValue::from_str(&resolved) {
+                        return Err(ConfigError::InvalidApiKey {
+                            section: name.clone(),
+                            message: format!("api_key contains invalid HTTP header bytes: {e}"),
+                        });
+                    }
+                    Some(resolved)
+                }
                 None => None,
             };
 

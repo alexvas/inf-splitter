@@ -364,10 +364,17 @@ GET /interactions/v1/control-constants
 
 Returns JSON keyed by section name. Only sections with `endpoint_interactions` AND at least one control constant are included.
 
+The endpoint is intentionally left without authentication. Proxy access is controlled at the environment level (local process or container). The sentinels are protected against accidental triggering via a deduplication requirement: the sentinel text must appear twice consecutively in the message to activate.
+
 ### Scenario: Constants returned
 - GIVEN config has section with `endpoint_interactions`, `control_clean_all`, `control_extend_lifetime`
 - WHEN endpoint is called
 - THEN response maps section name to `{"clean_all": "...", "extend_lifetime": "..."}`
+
+### Scenario: Endpoint returns constants without auth
+- GIVEN any request to `GET /interactions/v1/control-constants`
+- WHEN no auth header is present
+- THEN 200 with JSON constants is returned (no authentication required)
 
 ## Requirement: Egress Message Splitting (proxy_limit)
 

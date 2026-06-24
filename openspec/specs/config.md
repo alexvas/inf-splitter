@@ -89,6 +89,8 @@ Models are matched against provider sections in order of definition. Supported m
 1. Environment variable `VAR`
 2. File `secrets/VAR` (first line, trimmed)
 
+Resolved values are validated as legal HTTP header values via `HeaderValue::from_str`. Keys containing bytes outside the visible ASCII range, newlines, or other characters illegal in HTTP headers are rejected at startup with `ConfigError::InvalidApiKey`.
+
 ### Scenario: Env var takes precedence
 - GIVEN `api_key = "${DEEPSEEK_API_KEY}"` and both env var and `secrets/DEEPSEEK_API_KEY` exist
 - WHEN resolving the secret
@@ -98,6 +100,16 @@ Models are matched against provider sections in order of definition. Supported m
 - GIVEN `api_key = "${MISSING_KEY}"` and neither env var nor file exists
 - WHEN resolving the secret
 - THEN startup fails with "secret not found" error
+
+### Scenario: Invalid API key rejected
+- GIVEN `api_key = "${BAD_KEY}"` where secret contains newline characters
+- WHEN config is loaded
+- THEN startup fails with `ConfigError::InvalidApiKey { section, message: "api_key contains invalid HTTP header bytes" }`
+
+### Scenario: Empty API key rejected
+- GIVEN `api_key = ""` (literal empty)
+- WHEN config is loaded
+- THEN startup fails with `ConfigError::InvalidApiKey { section, message: "api_key must not be empty" }`
 
 ## Requirement: Token Limits
 

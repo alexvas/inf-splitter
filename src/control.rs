@@ -42,10 +42,11 @@ pub fn scan_control_messages(
     for msg in messages {
         let text = message_text(msg);
 
-        // Check clean-all (exact substring match)
+        // Check clean-all (must appear twice consecutively to prevent accidental trigger)
         if let Some(constant) = clean_all_constant {
             if let Some(ref t) = text {
-                if t.contains(constant) {
+                let double = format!("{constant}{constant}");
+                if t.contains(&double) {
                     let hash = hash_str(t);
                     if !processed_hashes.contains(&hash) {
                         processed_hashes.insert(hash);
@@ -57,17 +58,21 @@ pub fn scan_control_messages(
             }
         }
 
-        // Check extend-lifetime (prefix+suffix match around the timestamp)
+        // Check extend-lifetime (must appear twice consecutively to prevent accidental trigger)
         if let Some(constant) = extend_lifetime_constant {
             if let Some(ref t) = text {
                 if let Some(ts) = match_extend_lifetime(t, constant) {
-                    let hash = hash_str(t);
-                    if !processed_hashes.contains(&hash) {
-                        processed_hashes.insert(hash);
-                        action = Some(ControlAction::ExtendLifetime(ts));
+                    let single = constant.replace("<unix_utc>", &ts.to_string());
+                    let double = format!("{single}{single}");
+                    if t.contains(&double) {
+                        let hash = hash_str(t);
+                        if !processed_hashes.contains(&hash) {
+                            processed_hashes.insert(hash);
+                            action = Some(ControlAction::ExtendLifetime(ts));
+                        }
+                        stripped += 1;
+                        continue;
                     }
-                    stripped += 1;
-                    continue;
                 }
             }
         }
@@ -192,9 +197,14 @@ mod tests {
         serde_json::json!({"role": "user", "content": text})
     }
 
+    fn double_msg(text: &str) -> serde_json::Value {
+        let double = format!("{text}{text}");
+        serde_json::json!({"role": "user", "content": double})
+    }
+
     #[test]
-    fn scan_detects_clean_all() {
-        let msgs = vec![user_msg("Hello"), user_msg(CLEAN_ALL), user_msg("World")];
+    fn scan_detects_clean_all_double() {
+        let msgs = vec![user_msg("Hello"), double_msg(CLEAN_ALL), user_msg("World")];
         let mut hashes = HashSet::new();
         let result = scan_control_messages(&msgs, Some(CLEAN_ALL), None, &mut hashes);
         assert_eq!(result.stripped_count, 1);
@@ -203,10 +213,20 @@ mod tests {
     }
 
     #[test]
-    fn scan_detects_extend_lifetime() {
+    fn scan_single_clean_all_is_noop() {
+        let msgs = vec![user_msg("Hello"), user_msg(CLEAN_ALL), user_msg("World")];
+        let mut hashes = HashSet::new();
+        let result = scan_control_messages(&msgs, Some(CLEAN_ALL), None, &mut hashes);
+        assert_eq!(result.stripped_count, 0);
+        assert_eq!(result.cleaned_messages.len(), 3);
+        assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn scan_detects_extend_lifetime_double() {
         let ext_msg =
             "***!___!--- текущую сессию gemini interactions храни до 1718571800 ---!___!***";
-        let msgs = vec![user_msg(ext_msg)];
+        let msgs = vec![double_msg(ext_msg)];
         let mut hashes = HashSet::new();
         let result = scan_control_messages(&msgs, None, Some(EXTEND_LIFETIME), &mut hashes);
         assert_eq!(result.stripped_count, 1);
@@ -215,6 +235,18 @@ mod tests {
             Some(ControlAction::ExtendLifetime(ts)) => assert_eq!(ts, 1718571800),
             other => panic!("expected ExtendLifetime, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scan_single_extend_lifetime_is_noop() {
+        let ext_msg =
+            "***!___!--- текущую сессию gemini interactions храни до 1718571800 ---!___!***";
+        let msgs = vec![user_msg(ext_msg)];
+        let mut hashes = HashSet::new();
+        let result = scan_control_messages(&msgs, None, Some(EXTEND_LIFETIME), &mut hashes);
+        assert_eq!(result.stripped_count, 0);
+        assert_eq!(result.cleaned_messages.len(), 1);
+        assert!(result.action.is_none());
     }
 
     #[test]
@@ -239,7 +271,7 @@ mod tests {
 
     #[test]
     fn scan_idempotent_skips_repeated_control() {
-        let msgs = vec![user_msg(CLEAN_ALL)];
+        let msgs = vec![double_msg(CLEAN_ALL)];
         let mut hashes = HashSet::new();
         let r1 = scan_control_messages(&msgs, Some(CLEAN_ALL), None, &mut hashes);
         assert_eq!(r1.stripped_count, 1);

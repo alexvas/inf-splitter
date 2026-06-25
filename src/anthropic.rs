@@ -17,7 +17,7 @@ use reqwest::Client;
 use reqwest::RequestBuilder;
 
 use crate::auth::{forward_request_headers, forward_request_headers_map};
-use crate::config::RouteTarget;
+use crate::config::{Protocol, RouteTarget};
 use crate::diagnostics::{Diagnostics, RequestDiagnostics, StatsEvent};
 use crate::error::AppError;
 use crate::relay::cap_openai_max_tokens;
@@ -89,8 +89,11 @@ impl AnthropicHandler {
             )
         })?);
         if self.diagnostics.dump_enabled() {
-            let egress_headers =
-                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            let egress_headers = forward_request_headers_map(
+                route.api_key.as_deref(),
+                request_headers,
+                Protocol::Anthropic,
+            );
             guard.egress_dump(&body, &egress_headers);
         }
         let builder = self
@@ -239,8 +242,11 @@ impl AnthropicHandler {
             }
         }
         if let Some(ref s) = prepared.egress_str {
-            let egress_headers =
-                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            let egress_headers = forward_request_headers_map(
+                route.api_key.as_deref(),
+                request_headers,
+                Protocol::Anthropic,
+            );
             guard.egress_dump(s.as_bytes(), &egress_headers);
         }
         let ingress_str = if self.diagnostics.dump_enabled() {
@@ -378,8 +384,11 @@ impl AnthropicHandler {
             }
         }
         if let Some(ref s) = prepared.egress_str {
-            let egress_headers =
-                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            let egress_headers = forward_request_headers_map(
+                route.api_key.as_deref(),
+                request_headers,
+                Protocol::Anthropic,
+            );
             guard.egress_dump(s.as_bytes(), &egress_headers);
         }
         let ingress_str = if self.diagnostics.dump_enabled() {
@@ -726,6 +735,7 @@ impl AnthropicHandler {
                 .header(header::CONTENT_TYPE, "application/json"),
             request_headers,
             route.api_key.as_deref(),
+            Protocol::Anthropic,
         ))
     }
 }

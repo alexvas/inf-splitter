@@ -12,7 +12,7 @@ use futures::StreamExt;
 use reqwest::Client as HttpClient;
 
 use crate::auth::{forward_request_headers, forward_request_headers_map};
-use crate::config::{Config, ErrorTranslationRule, RouteTarget};
+use crate::config::{Config, ErrorTranslationRule, Protocol, RouteTarget};
 use crate::diagnostics::{Diagnostics, RequestDiagnostics, StatsEvent};
 use crate::error::AppError;
 use crate::relay::cap_openai_max_tokens;
@@ -120,6 +120,7 @@ impl OpenAiHandler {
                 .header(header::CONTENT_TYPE, "application/json"),
             request_headers,
             route.api_key.as_deref(),
+            Protocol::OpenAi,
         );
 
         let downstream_body = if self.diagnostics.dump_enabled() {
@@ -128,8 +129,11 @@ impl OpenAiHandler {
             None
         };
         if let Some(ref body_bytes) = downstream_body {
-            let egress_headers =
-                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            let egress_headers = forward_request_headers_map(
+                route.api_key.as_deref(),
+                request_headers,
+                Protocol::OpenAi,
+            );
             guard.egress_dump(body_bytes, &egress_headers);
         }
         let start = std::time::Instant::now();
@@ -250,8 +254,11 @@ impl OpenAiHandler {
             }
         }
         if let Some(ref s) = prepared.egress_str {
-            let egress_headers =
-                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            let egress_headers = forward_request_headers_map(
+                route.api_key.as_deref(),
+                request_headers,
+                Protocol::OpenAi,
+            );
             guard.egress_dump(s.as_bytes(), &egress_headers);
         }
         let ingress_str = if self.diagnostics.dump_enabled() {
@@ -271,6 +278,7 @@ impl OpenAiHandler {
                 .header(header::CONTENT_TYPE, "application/json"),
             request_headers,
             route.api_key.as_deref(),
+            Protocol::OpenAi,
         );
 
         let start = std::time::Instant::now();
@@ -410,8 +418,11 @@ impl OpenAiHandler {
             }
         }
         if let Some(ref s) = prepared.egress_str {
-            let egress_headers =
-                forward_request_headers_map(route.api_key.as_deref(), request_headers);
+            let egress_headers = forward_request_headers_map(
+                route.api_key.as_deref(),
+                request_headers,
+                Protocol::OpenAi,
+            );
             guard.egress_dump(s.as_bytes(), &egress_headers);
         }
         let ingress_str = if self.diagnostics.dump_enabled() {
@@ -431,6 +442,7 @@ impl OpenAiHandler {
                 .header(header::CONTENT_TYPE, "application/json"),
             request_headers,
             route.api_key.as_deref(),
+            Protocol::OpenAi,
         );
 
         let start = std::time::Instant::now();

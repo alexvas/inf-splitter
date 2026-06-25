@@ -2499,16 +2499,6 @@ fn build_interactions_headers_map(api_key: Option<&str>, request_headers: &Heade
         );
     }
 
-    // Forward x-claude-code-session-id as X-Client-Request-Id for
-    // OpenAI upstream request correlation.
-    if headers.contains_key("x-claude-code-session-id")
-        && !headers.contains_key("x-client-request-id")
-    {
-        if let Some(val) = headers.get("x-claude-code-session-id").cloned() {
-            headers.insert(HeaderName::from_static("x-client-request-id"), val);
-        }
-    }
-
     headers
 }
 
@@ -3943,6 +3933,30 @@ If you don't know the answer, say so honestly.";
             map.get("Api-Revision").unwrap().to_str().unwrap(),
             "2026-05-20",
             "fixed Api-Revision must not be overridden by client headers"
+        );
+    }
+
+    // ── 2.1 RED: Gemini X-Client-Request-Id mapping unnecessary ──
+
+    #[test]
+    fn build_interactions_headers_does_not_set_x_client_request_id_for_gemini() {
+        // Gemini is stateful — session continuity is via
+        // previous_interaction_id in request body, not HTTP headers.
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("sess-1"),
+        );
+        let map = build_interactions_headers_map(Some("key"), &client_headers);
+        // GREEN: X-Client-Request-Id must NOT be set — Gemini doesn't need it
+        assert!(
+            map.get("x-client-request-id").is_none(),
+            "X-Client-Request-Id must NOT be set for Gemini — it's stateful"
+        );
+        // x-claude-code-session-id is forwarded as-is (passthrough)
+        assert_eq!(
+            map.get("x-claude-code-session-id").unwrap().to_str().unwrap(),
+            "sess-1"
         );
     }
 

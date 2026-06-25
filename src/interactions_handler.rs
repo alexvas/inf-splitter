@@ -34,6 +34,10 @@ use anyllm_translate::openai::{
 };
 
 pub const API_REVISION: &str = "2026-05-20";
+/// Maximum buffered SSE data before a \\n\\n delimiter. If an upstream
+/// sends a malformed stream without delimiters, this cap prevents unbounded
+/// memory growth.
+const MAX_SSE_BUFFER_BYTES: usize = 1_048_576; // 1 MiB
 
 /// Clamp a u64 max_tokens value to u32 range.
 /// Values above u32::MAX are clamped with a warning — the Gemini API only
@@ -156,11 +160,27 @@ impl InteractionsHandler {
             Some(session.interaction_id.as_str())
         };
 
+        // Zero messages on a new session: nothing to send and no
+        // interaction to replay. Sending empty input upstream is invalid.
+        if incoming_count == 0 && prev_id.is_none() {
+            return Err(AppError::BadRequest(
+                "empty messages on new session".to_string(),
+            ));
+        }
+
         // Exact retry — all messages already delivered. Replay existing interaction.
         if start_index == incoming_count {
             if let Some(pid) = prev_id {
                 return self
-                    .replay_interaction(pid, route, &session_id, &model, Protocol::Anthropic, guard)
+                    .replay_interaction(
+                        pid,
+                        route,
+                        &session_id,
+                        &model,
+                        Protocol::Anthropic,
+                        request_headers,
+                        guard,
+                    )
                     .await;
             }
             // All messages delivered but no interaction_id to replay —
@@ -217,7 +237,7 @@ impl InteractionsHandler {
                 InteractionsInput::ContentList(list) => list.clone(),
                 _ => vec![],
             };
-            let size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(0);
+            let size = request_body.len();
             if size > limit {
                 if interactions_lib::can_split_under_limit(&params, limit).is_err() {
                     return Err(guard.abort_bad_request(
@@ -345,11 +365,27 @@ impl InteractionsHandler {
             Some(session.interaction_id.as_str())
         };
 
+        // Zero messages on a new session: nothing to send and no
+        // interaction to replay.
+        if incoming_count == 0 && prev_id.is_none() {
+            return Err(AppError::BadRequest(
+                "empty messages on new session".to_string(),
+            ));
+        }
+
         // Exact retry — all messages already delivered. Replay existing interaction.
         if start_index == incoming_count {
             if let Some(pid) = prev_id {
                 return self
-                    .replay_interaction(pid, route, &session_id, &model, Protocol::OpenAi, guard)
+                    .replay_interaction(
+                        pid,
+                        route,
+                        &session_id,
+                        &model,
+                        Protocol::OpenAi,
+                        request_headers,
+                        guard,
+                    )
                     .await;
             }
             return Err(AppError::Internal(
@@ -371,14 +407,24 @@ impl InteractionsHandler {
         );
 
         let backend_url = endpoint.to_string();
-        let params_size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(0);
+
+        // Apply drop_fields BEFORE proxy_limit check so removed fields
+        // don't inflate the size measurement and cause unnecessary splitting.
+        let mut body_value = serde_json::to_value(&params).map_err(|e| {
+            guard.abort_internal(0, body.len(), endpoint, "openai->interactions", stream, e)
+        })?;
+        let df = route.drop_fields.for_model(&model);
+        crate::drop_fields_from_value(&mut body_value, &df);
+        let request_body = serde_json::to_vec(&body_value).map_err(|e| {
+            guard.abort_internal(0, body.len(), endpoint, "openai->interactions", stream, e)
+        })?;
 
         if let Some(limit) = route.proxy_limit {
             let contents = match &params.input {
                 InteractionsInput::ContentList(list) => list.clone(),
                 _ => vec![],
             };
-            if params_size > limit {
+            if request_body.len() > limit {
                 if interactions_lib::can_split_under_limit(&params, limit).is_err() {
                     return Err(guard.abort_bad_request(
                         0,
@@ -411,15 +457,6 @@ impl InteractionsHandler {
             }
         }
 
-        let mut body_value = serde_json::to_value(&params).map_err(|e| {
-            guard.abort_internal(0, body.len(), endpoint, "openai->interactions", stream, e)
-        })?;
-        let df = route.drop_fields.for_model(&model);
-        crate::drop_fields_from_value(&mut body_value, &df);
-        let request_body = serde_json::to_vec(&body_value).map_err(|e| {
-            guard.abort_internal(0, body.len(), endpoint, "openai->interactions", stream, e)
-        })?;
-
         self.send_and_translate(
             &backend_url,
             &request_body,
@@ -446,20 +483,21 @@ impl InteractionsHandler {
         session_id: &str,
         model: &str,
         ingress: Protocol,
+        request_headers: &HeaderMap,
         guard: crate::diagnostics::RequestDiagnostics,
     ) -> Result<Response, AppError> {
         let url = build_interaction_url(route, &format!("/{interaction_id}"));
         let start = std::time::Instant::now();
 
-        let upstream = match self
-            .get_client(route.proxy.as_deref())
-            .get(&url)
-            .header("x-goog-api-key", route.api_key.as_deref().unwrap_or(""))
-            .header("Content-Type", "application/json")
-            .header("Api-Revision", "2026-05-20")
-            .send()
-            .await
-        {
+        // Record egress dump for replay request
+        guard.egress_dump(b"{}", &HeaderMap::new());
+
+        let builder = build_interactions_headers(
+            self.get_client(route.proxy.as_deref()).get(&url),
+            route.api_key.as_deref(),
+            request_headers,
+        );
+        let upstream = match builder.send().await {
             Ok(r) => r,
             Err(e) => {
                 let dur = start.elapsed().as_millis() as u64;
@@ -799,6 +837,30 @@ impl InteractionsHandler {
                         }
                         buffer.push_str(std::str::from_utf8(&chunk).unwrap());
 
+                        // Guard against unbounded buffer growth from a
+                        // malformed upstream stream lacking \n\n delimiters.
+                        if buffer.len() > MAX_SSE_BUFFER_BYTES {
+                            let err_payload = bytes::Bytes::from(sse::format_sse_event_str(
+                                &anyllm_translate::anthropic::StreamEvent::Error {
+                                    error: anyllm_translate::anthropic::streaming::StreamError {
+                                        error_type: "upstream_error".into(),
+                                        message: "sse buffer exceeded max line length".into(),
+                                    },
+                                },
+                            ));
+                            let _ = tx.send(Ok(err_payload)).await;
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            let _ = guard.abort_upstream(
+                                duration_ms,
+                                request_size,
+                                &label,
+                                &dir,
+                                true,
+                                "sse buffer exceeded max line length",
+                            );
+                            return;
+                        }
+
                         // Parse complete SSE events separated by \n\n
                         while let Some(pos) = buffer.find("\n\n") {
                             let event_str = buffer[..pos].to_string();
@@ -913,6 +975,18 @@ impl InteractionsHandler {
                         }
                     }
                     Err(e) => {
+                        // Send protocol error event before closing the stream.
+                        // Without this, the client receives an abrupt body close
+                        // after HTTP 200, which violates SSE protocol expectations.
+                        let err_payload = bytes::Bytes::from(sse::format_sse_event_str(
+                            &anyllm_translate::anthropic::StreamEvent::Error {
+                                error: anyllm_translate::anthropic::streaming::StreamError {
+                                    error_type: "upstream_error".into(),
+                                    message: format!("stream read error: {e}"),
+                                },
+                            },
+                        ));
+                        let _ = tx.send(Ok(err_payload)).await;
                         let _ = tx
                             .send(Err(std::io::Error::other(format!("stream error: {e}"))))
                             .await;
@@ -1113,7 +1187,19 @@ impl InteractionsHandler {
                 chunk_req.tools = params.tools.clone();
                 chunk_req.generation_config = params.generation_config.clone();
             }
-            let chunk_body = serde_json::to_vec(&chunk_req).map_err(|e| {
+            let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    stream,
+                    e,
+                )
+            })?;
+            let df = route.drop_fields.for_model(model);
+            crate::drop_fields_from_value(&mut chunk_body_value, &df);
+            let chunk_body = serde_json::to_vec(&chunk_body_value).map_err(|e| {
                 guard.abort_internal(
                     start.elapsed().as_millis() as u64,
                     ingress_body.len(),
@@ -1153,7 +1239,7 @@ impl InteractionsHandler {
                     ingress_body.len(),
                     upstream_label,
                     direction,
-                    false,
+                    stream,
                     error_body.clone(),
                     response_headers,
                 );
@@ -1168,6 +1254,26 @@ impl InteractionsHandler {
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
             let response_headers = response_headers_to_pairs(upstream.headers());
+
+            // Eagerly update session progress before reading the body.
+            // If body read/validation/deserialization fails after a
+            // successful HTTP 200, the upstream already created the
+            // interaction — retry must not re-send the same content.
+            let delivered_items: usize = chunks[..=i].iter().map(|c| c.len()).sum();
+            let delivered_so_far = std::cmp::min(delivered_items, total_message_count);
+            let interim_id = current_prev.clone().unwrap_or_default();
+            if let Err(e) = self
+                .session_store
+                .update(session_id, interim_id, delivered_so_far, true)
+                .await
+            {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "session update failed after successful split-send chunk (eager)"
+                );
+            }
+
             let response_bytes = upstream.bytes().await.map_err(|e| {
                 guard.abort_upstream(
                     start.elapsed().as_millis() as u64,
@@ -1420,7 +1526,19 @@ impl InteractionsHandler {
                 chunk_req.tools = tools.clone();
                 chunk_req.generation_config = generation_config.clone();
             }
-            let chunk_body = serde_json::to_vec(&chunk_req).map_err(|e| {
+            let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    stream,
+                    e,
+                )
+            })?;
+            let df = route.drop_fields.for_model(model);
+            crate::drop_fields_from_value(&mut chunk_body_value, &df);
+            let chunk_body = serde_json::to_vec(&chunk_body_value).map_err(|e| {
                 guard.abort_internal(
                     start.elapsed().as_millis() as u64,
                     ingress_body.len(),
@@ -1513,9 +1631,24 @@ impl InteractionsHandler {
                     e,
                 )
             })?;
-            current_prev = Some(interaction.id.clone());
-            last_id = Some(interaction.id.clone());
+            let int_id = interaction.id.clone();
+            current_prev = Some(int_id.clone());
+            last_id = Some(int_id.clone());
             last_interaction = Some(interaction);
+
+            // Checkpoint session after each system-instruction chunk
+            // so retries don't re-send already-created interaction chain.
+            if let Err(e) = self
+                .session_store
+                .update(session_id, int_id, total_message_count, true)
+                .await
+            {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "session update failed after system-instruction chunk"
+                );
+            }
         }
 
         // Send remaining chunks if more than one
@@ -1886,6 +2019,12 @@ impl InteractionsHandler {
         interaction_id: &str,
         route: &RouteTarget,
     ) -> Result<bool, String> {
+        // Empty interaction_id would produce GET /v1beta/interactions/
+        // (the list endpoint), which returns 200 and would cause recovery
+        // to treat the interaction as found — keeping an orphaned session.
+        if interaction_id.is_empty() {
+            return Ok(false);
+        }
         let url = build_interaction_url(route, &format!("/{interaction_id}"));
         let builder = build_interactions_headers(
             self.get_client(route.proxy.as_deref()).get(&url),
@@ -1902,9 +2041,9 @@ impl InteractionsHandler {
     }
 
     fn resolve_session_id(&self, headers: &HeaderMap, body: &serde_json::Value) -> String {
-        // Priority: x-request-id header → x-claude-code-session-id header → request_id body field → random
+        // Priority: X-Client-Request-Id > x-claude-code-session-id > x-request-id > request_id body field > random
         if let Some(hdr) = headers
-            .get("x-request-id")
+            .get("X-Client-Request-Id")
             .and_then(|v| v.to_str().ok())
             .filter(|s| !s.is_empty())
         {
@@ -1912,6 +2051,13 @@ impl InteractionsHandler {
         }
         if let Some(hdr) = headers
             .get("x-claude-code-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+        {
+            return hdr.to_string();
+        }
+        if let Some(hdr) = headers
+            .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .filter(|s| !s.is_empty())
         {
@@ -2095,10 +2241,14 @@ fn openai_sse_chunk(
     delta: serde_json::Value,
     finish_reason: Option<&str>,
 ) -> String {
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let chunk = serde_json::json!({
         "id": msg_id,
         "object": "chat.completion.chunk",
-        "created": 0,
+        "created": created,
         "model": model,
         "choices": [{
             "index": index,
@@ -2301,6 +2451,7 @@ fn build_fallback_response(
 fn response_headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
+        .filter(|(n, _)| is_interactions_response_header_whitelisted(n.as_str()))
         .map(|(n, v)| {
             (
                 n.as_str().to_string(),
@@ -2316,10 +2467,6 @@ fn build_interactions_headers_map(api_key: Option<&str>, request_headers: &Heade
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    headers.insert(
-        HeaderName::from_bytes(b"Api-Revision").unwrap(),
-        HeaderValue::from_static(API_REVISION),
-    );
 
     for (name, value) in request_headers.iter() {
         let name_str = name.as_str();
@@ -2329,8 +2476,21 @@ fn build_interactions_headers_map(api_key: Option<&str>, request_headers: &Heade
         if api_key.is_some() && is_auth_header(name_str) {
             continue;
         }
+        // x-request-id is generated by the upstream, not the client.
+        // Do not forward it — Gemini's stateful protocol uses
+        // previous_interaction_id in the request body for continuity.
+        if name_str.eq_ignore_ascii_case("x-request-id") {
+            continue;
+        }
         headers.insert(name.clone(), value.clone());
     }
+
+    // Insert fixed Api-Revision AFTER client header forwarding so client
+    // cannot override it. Gemini requires a specific revision string.
+    headers.insert(
+        HeaderName::from_bytes(b"Api-Revision").unwrap(),
+        HeaderValue::from_static(API_REVISION),
+    );
 
     if let Some(key) = api_key {
         let _ = headers.insert(
@@ -3420,6 +3580,24 @@ If you don't know the answer, say so honestly.";
         );
     }
 
+    // ── 2.1 RED: empty interaction_id hits list endpoint ─────────
+
+    #[test]
+    fn build_interaction_url_empty_id_reaches_list_endpoint() {
+        // Bug: get_interaction("") → build_interaction_url(route, "/")
+        // → GET /v1beta/interactions/ which is the LIST endpoint, not
+        // a specific interaction. Returns 200 → recovery treats it as
+        // "found" instead of "not found".
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_interactions: Some("https://host/v1beta/interactions".into()),
+            ..Default::default()
+        };
+        let result = build_interaction_url(&route, "/");
+        // RED: produces list endpoint URL — used by get_interaction("")
+        assert!(result.ends_with("/v1beta/interactions/"));
+    }
+
     #[test]
     fn build_interaction_url_no_query_params_unchanged() {
         let route = crate::config::RouteTarget {
@@ -3535,7 +3713,25 @@ If you don't know the answer, say so honestly.";
     }
 
     #[tokio::test]
-    async fn resolve_session_id_prefers_x_request_id_over_x_claude_code_session_id() {
+    async fn resolve_session_id_prefers_x_client_request_id_over_all() {
+        let handler = test_interactions_handler();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Client-Request-Id",
+            HeaderValue::from_static("client-req-999"),
+        );
+        headers.insert("x-request-id", HeaderValue::from_static("req-id-123"));
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-456"),
+        );
+        let body = serde_json::json!({});
+        let result = handler.resolve_session_id(&headers, &body);
+        assert_eq!(result, "client-req-999");
+    }
+
+    #[tokio::test]
+    async fn resolve_session_id_prefers_x_claude_code_session_id_over_x_request_id() {
         let handler = test_interactions_handler();
         let mut headers = HeaderMap::new();
         headers.insert("x-request-id", HeaderValue::from_static("req-id-123"));
@@ -3545,7 +3741,8 @@ If you don't know the answer, say so honestly.";
         );
         let body = serde_json::json!({});
         let result = handler.resolve_session_id(&headers, &body);
-        assert_eq!(result, "req-id-123");
+        // x-claude-code-session-id has higher priority than x-request-id
+        assert_eq!(result, "session-456");
     }
 
     #[tokio::test]
@@ -3662,10 +3859,11 @@ If you don't know the answer, say so honestly.";
             &request_headers_with_auth(),
         );
         let req = result.build().expect("build request");
-        assert_eq!(
-            req.headers().get("x-request-id").unwrap(),
-            "trace-12345",
-            "non-auth headers must be forwarded when api_key is set"
+        // x-request-id is excluded — Gemini generates it, client's value is
+        // only used as session identifier via resolve_session_id().
+        assert!(
+            req.headers().get("x-request-id").is_none(),
+            "x-request-id must NOT be forwarded to Gemini upstream"
         );
         assert_eq!(
             req.headers().get("x-custom-trace").unwrap(),
@@ -3677,10 +3875,9 @@ If you don't know the answer, say so honestly.";
         let builder2 = client.get("http://example.com");
         let result2 = build_interactions_headers(builder2, None, &request_headers_with_auth());
         let req2 = result2.build().expect("build request");
-        assert_eq!(
-            req2.headers().get("x-request-id").unwrap(),
-            "trace-12345",
-            "non-auth headers must be forwarded when api_key is None"
+        assert!(
+            req2.headers().get("x-request-id").is_none(),
+            "x-request-id must NOT be forwarded to Gemini upstream when api_key is None"
         );
     }
 
@@ -3698,11 +3895,9 @@ If you don't know the answer, say so honestly.";
         // Client auth stripped
         assert!(map.get("authorization").is_none());
         assert!(map.get("x-api-key").is_none());
-        // Non-auth forwarded
-        assert_eq!(
-            map.get("x-request-id").unwrap().to_str().unwrap(),
-            "trace-12345"
-        );
+        // x-request-id excluded from upstream forwarding
+        assert!(map.get("x-request-id").is_none());
+        // Other non-auth headers forwarded
         assert_eq!(
             map.get("x-custom-trace").unwrap().to_str().unwrap(),
             "custom-value"
@@ -3729,10 +3924,25 @@ If you don't know the answer, say so honestly.";
         );
         // No x-goog-api-key
         assert!(map.get("x-goog-api-key").is_none());
-        // Non-auth forwarded
+        // x-request-id excluded from upstream forwarding
+        assert!(map.get("x-request-id").is_none());
+    }
+
+    // ── 1.3 RED: Api-Revision override ─────────────────────────
+
+    #[test]
+    fn build_interactions_headers_client_api_revision_overwrites_fixed() {
+        // Bug: Api-Revision is inserted BEFORE client header forwarding loop,
+        // so client's Api-Revision header overwrites the fixed value.
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert("Api-Revision", HeaderValue::from_static("2025-01-01"));
+        let map = build_interactions_headers_map(Some("key"), &client_headers);
+        // RED: current code returns "2025-01-01" (client override)
+        // GREEN: should return "2026-05-20" (fixed API_REVISION)
         assert_eq!(
-            map.get("x-request-id").unwrap().to_str().unwrap(),
-            "trace-12345"
+            map.get("Api-Revision").unwrap().to_str().unwrap(),
+            "2026-05-20",
+            "fixed Api-Revision must not be overridden by client headers"
         );
     }
 

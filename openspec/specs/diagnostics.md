@@ -860,3 +860,30 @@ Interactions streaming handlers may finalize the guard with status 499 without r
 - WHEN sending to the client fails before upstream EOF
 - THEN the guard is finalized with status 499
 - AND the implementation comment explains why no response dump is recorded on that early-return path
+
+## Requirement: Interactions Response Header Diagnostics Whitelist
+
+Interactions diagnostics must filter upstream response headers through `is_interactions_response_header_whitelisted` before recording in dumps, matching the pattern used by passthrough response handlers.
+
+### Scenario: Whitelisted headers captured
+- GIVEN interactions upstream returns `x-request-id: abc` and `x-ratelimit-remaining: 100`
+- WHEN diagnostics records response headers
+- THEN both headers are included in the dump
+
+### Scenario: Non-whitelisted headers excluded
+- GIVEN interactions upstream returns `Set-Cookie: session=xyz` header
+- WHEN diagnostics records response headers
+- THEN `Set-Cookie` is not present in the dump
+
+---
+
+## MODIFIED (2026-06-25)
+
+### Requirement: Stats Event Format
+
+Interactions split-send error paths must pass the actual `stream` flag to `finish_with_upstream_error`, not hardcoded `false`.
+
+### Scenario: Streaming flag correct in split-send errors
+- GIVEN client requested `stream: true` and a split-send chunk gets upstream error
+- WHEN stats event is recorded
+- THEN `"streaming": true` is written to the stats line

@@ -64,6 +64,8 @@ impl SessionStore {
     }
 
     /// Persist current sessions to the TOML file atomically.
+    /// Runs blocking filesystem operations inside `spawn_blocking` to
+    /// avoid stalling the async runtime on slow disk.
     pub async fn save_to_disk(&self) -> Result<(), String> {
         let sessions = self.sessions.read().await;
         let toml_str = toml::to_string(&*sessions)
@@ -73,9 +75,14 @@ impl SessionStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        fs::write(&tmp, toml_str).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
-        Ok(())
+        let path = self.path.clone();
+        drop(sessions);
+        tokio::task::spawn_blocking(move || {
+            fs::write(&tmp, toml_str).map_err(|e| e.to_string())?;
+            fs::rename(&tmp, &path).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join error: {e}"))?
     }
 
     /// Get or create a session. Updates last_access_utc.
@@ -274,6 +281,18 @@ mod tests {
         let (start, new_count) = compute_delta(5, 5);
         assert_eq!(start, 5);
         assert_eq!(new_count, 5);
+    }
+
+    #[test]
+    fn compute_delta_zero_zero_indistinguishable_from_replay() {
+        // Bug: compute_delta(0, 0) returns (0, 0) — same as the
+        // "all delivered, exact retry" case (5, 5) → (5, 5).
+        // The handler sees start == incoming_count and tries to replay,
+        // but there's no interaction_id → 500 error.
+        let (start, new_count) = compute_delta(0, 0);
+        assert_eq!(start, 0);
+        assert_eq!(new_count, 0);
+        // start (0) == incoming_count (0) → handler enters replay branch
     }
 
     #[test]

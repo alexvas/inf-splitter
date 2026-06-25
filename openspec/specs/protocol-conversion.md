@@ -1098,3 +1098,311 @@ Session `message_count` updates during split-send track delivered **Content item
 - AND message text contains `"...EXTEND1718571800ENDEXTEND1718571800END..."`
 - WHEN `scan_control_messages` processes the message
 - THEN `ControlAction::ExtendLifetime(1718571800)` is returned
+
+## Requirement: SSE Buffer Has Maximum Line Cap
+
+Interactions streaming must cap the `buffer` that accumulates SSE data lines at `MAX_SSE_BUFFER_BYTES` (1 MiB). If the buffer exceeds this limit before a `\n\n` delimiter is found, the stream is aborted with an error event and `502 Bad Gateway`.
+
+### Scenario: Buffer exceeds cap
+- GIVEN upstream sends SSE data without `\n\n` delimiters
+- WHEN `buffer.len()` exceeds `MAX_SSE_BUFFER_BYTES`
+- THEN an SSE `error` event is sent to the client with type `"upstream_error"`
+- AND the stream is aborted with a 502 diagnostic record
+
+### Scenario: Normal SSE parsing unaffected
+- GIVEN upstream sends valid SSE events with `\n\n` delimiters
+- WHEN each event line is < 1 MiB
+- THEN parsing proceeds as before (no cap hit)
+
+## Requirement: System-Instruction Split Has Per-Chunk Session Checkpoints
+
+Each successful system-instruction chunk must update the session with the new `interaction_id` so that retries don't re-send already-created chunks.
+
+### Scenario: Mid-chain failure doesn't duplicate on retry
+- GIVEN 3 system-instruction chunks, chunks 1 and 2 succeed, chunk 3 fails
+- WHEN the client retries
+- THEN session has `interaction_id` from chunk 2
+- AND already-created chunks are not re-sent
+
+## Requirement: Upstream Stream Error Sends Protocol Error Event
+
+When the interactions upstream stream encounters a read error mid-stream, the proxy must send an SSE `error` event before closing the body.
+
+### Scenario: Stream read error after partial events
+- GIVEN interactions upstream sent some events, then the connection drops
+- WHEN the `Err(e)` branch of the stream loop fires
+- THEN an SSE `error` event is sent before the channel is closed
+- AND the client receives a properly formatted protocol error, not an abrupt body close
+
+## Requirement: Proxy-Limit Check After drop_fields
+
+`proxy_limit` size check must run on the body AFTER `drop_fields` stripping. Checking before stripping causes unnecessary split-send paths when stripped fields would have made the body fit.
+
+### Scenario: Large dropped field doesn't trigger unnecessary split
+- GIVEN route has `drop_fields = ["tools"]` and `proxy_limit = 100KB`
+- AND request body is 110KB, but `tools` field is 30KB
+- WHEN the body is processed
+- THEN `drop_fields_from_value` strips tools first (body → 80KB)
+- AND 80KB fits under 100KB limit → no splitting
+
+## Requirement: get_interaction Guards Against Empty interaction_id
+
+`get_interaction` must return `Ok(false)` immediately when `interaction_id` is empty. An empty ID constructs `GET /v1beta/interactions/` (the list endpoint), which returns 200 and causes recovery to treat the session as found.
+
+### Scenario: Empty interaction_id returns false immediately
+- GIVEN `interaction_id = ""`
+- WHEN `get_interaction("", route)` is called
+- THEN `Ok(false)` is returned without making an HTTP request
+- AND recovery removes the session (no valid interaction to recover)
+
+## Requirement: Zero-Message Requests on New Sessions Return Error
+
+When a client sends an empty `messages` array on a new session (no prior `interaction_id`), the handler must return `400 Bad Request` instead of entering the replay branch.
+
+### Scenario: Empty messages on new session
+- GIVEN session has `{interaction_id: "", message_count: 0}`
+- AND client sends `messages: []`
+- WHEN handler processes the request
+- THEN `400 BadRequest` "empty messages on new session" is returned
+- INSTEAD OF: `500 Internal Server Error` "session has no interaction_id for replay"
+
+## Requirement: Synthetic OpenAI SSE Chunks Use Real Timestamp
+
+Synthetic OpenAI SSE chunks must use the current Unix timestamp for the `created` field, not hardcoded `0`.
+
+### Scenario: Timestamp is current
+- GIVEN a split-send streaming response for OpenAI ingress
+- WHEN `openai_sse_chunk` synthesizes chunks
+- THEN `created` field is the current Unix epoch timestamp
+- AND all chunks in a single response share the same timestamp
+
+## Requirement: Interactions Session Identity Model
+
+The interactions protocol has three distinct identity concepts. Understanding which is generated where and how they flow is critical for correctness.
+
+---
+
+**Session ID** — client-side conversation identifier.
+
+| Property | Value |
+|----------|-------|
+| Source | Client (header or body) |
+| Resolved by | `resolve_session_id()` |
+| Priority | `X-Client-Request-Id` > `x-claude-code-session-id` > `x-request-id` > `request_id` body field > random |
+| Storage | `SessionStore` key |
+| Purpose | Links multiple HTTP requests into one stateful conversation |
+| Sent to Gemini | No — Gemini doesn't know about it |
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Proxy
+    participant SessionStore
+
+    Client->>Proxy: POST /v1/messages<br/>x-request-id: sess-abc<br/>{"messages": [m1, m2, m3]}
+    Proxy->>Proxy: resolve_session_id(headers, body)<br/>→ "sess-abc"
+    Proxy->>SessionStore: get_or_create("sess-abc")
+    SessionStore-->>Proxy: SessionState { interaction_id: "", message_count: 0 }
+```
+
+---
+
+**Interaction ID** — Gemini-generated interaction identifier.
+
+| Property | Value |
+|----------|-------|
+| Source | Gemini upstream (output-only) |
+| Path in response | `Interaction.id` |
+| Example | `"v1_ChdNZkE1YXBQOEZLUzRxdHNQcDZMZzBBdxIXUXZBNWFyWDNCYTZNcXRzUDM4N3E2UVE"` (~80 chars, variable length) |
+| Stored as | `SessionState.interaction_id` |
+| Purpose | Chaining requests: each request references the prior interaction |
+| Sent to Gemini | Yes — as `previous_interaction_id` in request body |
+
+**First request (interaction_id created):**
+
+```mermaid
+sequenceDiagram
+    participant Proxy
+    participant Gemini
+    participant SessionStore
+
+    Note over Proxy: prev_id = None (new interaction)
+    Proxy->>Gemini: POST /v1beta/interactions<br/>{"input": [m1, m2, m3], ...}<br/>(previous_interaction_id absent)
+    Gemini-->>Proxy: HTTP 200<br/>{"id": "int-42", "status": "completed", ...}
+    Proxy->>Proxy: interaction.id → "int-42"
+    Proxy->>SessionStore: update("sess-abc", id="int-42", count=3, pending=false)
+```
+
+**Second request (interaction_id → previous_interaction_id):**
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Proxy
+    participant SessionStore
+    participant Gemini
+
+    Client->>Proxy: POST /v1/messages<br/>x-request-id: sess-abc<br/>{"messages": [m1..m5]}
+    Proxy->>SessionStore: get_or_create("sess-abc")
+    SessionStore-->>Proxy: { interaction_id: "int-42", message_count: 3 }
+    Proxy->>Proxy: compute_delta(3, 5) → (3, 5)<br/>prev_id = Some("int-42")
+    Proxy->>Gemini: POST /v1beta/interactions<br/>{"previous_interaction_id": "int-42",<br/> "input": [m4, m5], ...}
+    Note over Gemini: Appends m4,m5 to int-42 chain, creates new interaction
+    Gemini-->>Proxy: HTTP 200<br/>{"id": "int-99", "status": "completed", ...}
+    Proxy->>SessionStore: update("sess-abc", id="int-99", count=5, pending=false)
+    Proxy-->>Client: translated response
+```
+
+---
+
+**Message count** — how many harness messages have been delivered to Gemini.
+
+| Property | Value |
+|----------|-------|
+| Source | Proxy (computed) |
+| Stored as | `SessionState.message_count` |
+| Purpose | Determines delta: which messages to send next |
+| Sent to Gemini | No — proxy-internal state |
+
+```mermaid
+flowchart LR
+    subgraph "compute_delta(delivered=3, incoming)"
+        A{incoming vs delivered}
+        A -->|"incoming < delivered<br/>context reset"| B["(0, incoming)<br/>prev_id = None<br/>resend all"]
+        A -->|"incoming == delivered<br/>no new messages"| C["(incoming, incoming)<br/>replay_interaction(id)"]
+        A -->|"incoming > delivered<br/>new messages"| D["(delivered, incoming)<br/>prev_id = Some(id)<br/>send [delivered..incoming]"]
+    end
+```
+
+---
+
+**Pending flag** — marker of an in-flight operation for startup recovery.
+
+| Property | Value |
+|----------|-------|
+| Source | Proxy (set) |
+| Stored as | `SessionState.pending` |
+| Purpose | After process crash, recovery knows which sessions to verify |
+| Cleared by | Successful stream completion / all split-send chunks done / `clear_pending` during recovery |
+
+`pending = true` is set when an operation has started but not finished:
+
+- **Streaming, start:** `interaction_id = ""`, `pending = true` — interaction not yet created
+- **Streaming, after `interaction.created`:** `interaction_id = "v1_ChdNZk..."`, `pending = true` — interaction created, stream in progress
+- **Split-send, after each chunk:** `interaction_id = "int-X"`, `pending = true` — partial progress
+
+`pending = false` is set when the operation is fully complete and the response has been sent to the client.
+
+```mermaid
+sequenceDiagram
+    participant Proxy
+    participant SessionStore
+    participant Gemini
+
+    Note over Proxy: ── Streaming ──
+
+    Proxy->>SessionStore: update(sid, id="", count=3, pending=true)
+    Note over SessionStore: ⚠️ Crash here:<br/>pending=true, id=""<br/>→ recovery skips (empty id), removes session
+
+    Proxy->>Gemini: POST (stream=true)
+    Gemini-->>Proxy: SSE: interaction.created {"id":"v1_ChdNZk..."}
+    Proxy->>SessionStore: update(sid, id="v1_ChdNZk...", count=3, pending=true)
+    Note over SessionStore: ⚠️ Crash here:<br/>pending=true, id="v1_ChdNZk..."<br/>→ recovery: GET /v1_ChdNZk... → 200 → session alive
+
+    Gemini-->>Proxy: SSE: step.start, step.delta, step.stop...
+    Gemini-->>Proxy: SSE: interaction.completed
+    Proxy->>SessionStore: update(sid, id="v1_ChdNZk...", count=3, pending=false)
+    Note over SessionStore: Final: pending=false ✓
+
+    Note over Proxy: ── Split-send ──
+
+    Proxy->>SessionStore: update(sid, id="int-1", count=2, pending=true)
+    Note over SessionStore: Chunk 1 accepted
+    Proxy->>SessionStore: update(sid, id="int-2", count=5, pending=true)
+    Note over SessionStore: Chunk 2 accepted
+    Proxy->>SessionStore: update(sid, id="int-2", count=5, pending=false)
+    Note over SessionStore: All chunks done, final ✓
+```
+
+## Requirement: Interactions Header Forwarding Maps Correlation IDs Correctly
+
+`x-request-id` is generated by the upstream — it must not be forwarded to any upstream. The proxy maps **client request headers** to **upstream request headers** according to the upstream protocol:
+
+**Gemini upstream** (interactions API): Stateful protocol. Session continuity is via `previous_interaction_id` in request body, not HTTP correlation headers.
+
+**OpenAI upstream**:
+
+| Client header | Upstream header |
+|--------------|-----------------|
+| `x-request-id` | `X-Client-Request-Id` |
+| `x-claude-code-session-id` | `X-Client-Request-Id` |
+| `X-Client-Request-Id` | `X-Client-Request-Id` (passthrough) |
+
+**Anthropic upstream**:
+
+| Client header | Upstream header |
+|--------------|-----------------|
+| `x-request-id` | `x-claude-code-session-id` |
+| `X-Client-Request-Id` | `x-claude-code-session-id` |
+| `x-claude-code-session-id` | `x-claude-code-session-id` (passthrough) |
+
+### Scenario: x-request-id excluded from Gemini upstream
+- GIVEN client sends `x-request-id: req-abc`
+- WHEN `build_interactions_headers_map` builds headers for Gemini
+- THEN `x-request-id` is NOT present in upstream headers
+
+### Scenario: x-request-id mapped to X-Client-Request-Id for OpenAI
+- GIVEN client sends `x-request-id: req-abc`
+- WHEN forwarding to OpenAI upstream
+- THEN `X-Client-Request-Id: req-abc` is set
+
+### Scenario: X-Client-Request-Id mapped to x-claude-code-session-id for Anthropic
+- GIVEN client sends `X-Client-Request-Id: client-1` (no `x-claude-code-session-id`)
+- WHEN forwarding to Anthropic upstream
+- THEN `x-claude-code-session-id: client-1` is set
+- AND `X-Client-Request-Id` is NOT forwarded as-is
+
+## Requirement: Replay Requests Use Standard Header Construction
+
+`replay_interaction` must use `build_interactions_headers` for header construction and record an egress dump, matching non-replay request paths.
+
+### Scenario: Replay forwards client headers and records egress dump
+- GIVEN exact retry triggers `replay_interaction`
+- WHEN GET request is built
+- THEN `build_interactions_headers` is used (same as non-replay paths)
+- AND `guard.egress_dump(...)` records the replay request
+
+## Requirement: Api-Revision Cannot Be Overridden by Client
+
+`build_interactions_headers_map` must insert the fixed `Api-Revision` header **after** forwarding client headers, so the fixed value wins.
+
+### Scenario: Client Api-Revision ignored
+- GIVEN client sends `Api-Revision: 2025-01-01`
+- WHEN `build_interactions_headers_map` builds headers
+- THEN upstream receives `Api-Revision: 2026-05-20` (fixed value)
+
+## Requirement: Session Persistence Uses spawn_blocking
+
+`SessionStore::save_to_disk` must wrap `fs::write` + `fs::rename` in `tokio::task::spawn_blocking` to avoid stalling async workers on slow disk.
+
+### Scenario: Slow disk doesn't block request processing
+- GIVEN disk is slow
+- WHEN concurrent requests call `session_store.update`
+- THEN each `save_to_disk` runs in `spawn_blocking`
+- AND other async tasks are not stalled
+
+---
+
+## MODIFIED (2026-06-25)
+
+### Requirement: Split-Send Session Progress Uses Content Index
+
+Session `message_count` updates during split-send must happen **immediately after successful HTTP response** (status 200), before body read/validation/deserialization. Previously the update was after deserialization; if deserialization failed, the session was stale and retry duplicated content.
+
+### Requirement: Split-Send Error Stats Use Actual Stream Flag
+
+All calls to `finish_with_upstream_error` in `handle_split_send` and `send_split_system_instruction` must pass the `stream` parameter instead of hardcoded `false`.
+
+### Requirement: max_tokens is a Cap, Not an Override
+
+*(Unchanged from previous spec.)*

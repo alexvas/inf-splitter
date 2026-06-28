@@ -1319,6 +1319,7 @@ impl InteractionsHandler {
                         session_id,
                         &chunks,
                         harness_hashes,
+                        params.previous_interaction_id.clone(),
                         sys_limit,
                         model,
                         upstream_label,
@@ -1728,7 +1729,8 @@ impl InteractionsHandler {
         route: &RouteTarget,
         session_id: &str,
         chunks: &[Vec<crate::interactions_types::Content>],
-        _harness_hashes: Vec<u64>,
+        harness_hashes: Vec<u64>,
+        prev_interaction_id: Option<String>,
         limit: usize,
         model: &str,
         upstream_label: &str,
@@ -1762,6 +1764,7 @@ impl InteractionsHandler {
         let mut last_id: Option<String> = None;
         let mut last_interaction: Option<Interaction> = None;
         let mut current_prev: Option<String> = None;
+        let mut all_int_ids: Vec<String> = Vec::new();
 
         // Send empty interactions with system_instruction chunks
         for (i, part) in sys_parts.iter().enumerate() {
@@ -1888,6 +1891,7 @@ impl InteractionsHandler {
                 )
             })?;
             let int_id = interaction.id.clone();
+            all_int_ids.push(int_id.clone());
             current_prev = Some(int_id.clone());
             last_id = Some(int_id.clone());
             last_interaction = Some(interaction);
@@ -1999,7 +2003,55 @@ impl InteractionsHandler {
                     })?;
                 current_prev = Some(interaction.id.clone());
                 last_id = Some(interaction.id.clone());
+                all_int_ids.push(interaction.id.clone());
                 last_interaction = Some(interaction);
+            }
+        }
+
+        // Persist interaction chain in v2 store so frontier can find it on replay.
+        {
+            let mut store = self.v2_store.write().await;
+            let now = crate::session::unix_now();
+            let mut prev_upstream = prev_interaction_id.clone();
+            for upstream_id in &all_int_ids {
+                store
+                    .interactions
+                    .insert_upstream(crate::session::UpstreamInteractionNode {
+                        id: upstream_id.clone(),
+                        prev_id: prev_upstream.clone(),
+                        client_id: session_id.to_string(),
+                        last_seen_utc: now,
+                        expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
+                    });
+                prev_upstream = Some(upstream_id.clone());
+            }
+            if let Some(final_id) = last_id.as_ref() {
+                store
+                    .interactions
+                    .insert_client(crate::session::ClientInteractionNode {
+                        id: final_id.clone(),
+                        prev_id: prev_interaction_id.clone(),
+                        message_hashes: harness_hashes.clone(),
+                        system_instruction_hash: None,
+                        upstream_ids: all_int_ids.clone(),
+                        last_seen_utc: now,
+                    });
+                store
+                    .sessions
+                    .entry(session_id.to_string())
+                    .and_modify(|s| {
+                        s.last_interaction_id = Some(final_id.clone());
+                        s.last_seen_utc = now;
+                    })
+                    .or_insert_with(|| crate::session::SessionInfo {
+                        client_session_id: session_id.to_string(),
+                        last_interaction_id: Some(final_id.clone()),
+                        last_seen_utc: now,
+                        expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
+                    });
+            }
+            if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                tracing::warn!(error = %e, "v2 store save failed after system-instruction split");
             }
         }
 

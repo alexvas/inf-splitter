@@ -50,10 +50,11 @@ Session persistence changes from old count-based `SessionState` to a versioned v
 Startup recovery:
 - Load v2 document atomically.
 - Ignore old v1 count-based files with a warning.
-- Rebuild `hash_index` from persisted `ClientInteractionNode.message_hashes`.
+- Rebuild `hash_index` from persisted `ClientInteractionNode.message_hashes` and `upstream_to_clients` from persisted `ClientInteractionNode.upstream_ids`.
 - For each in-flight batch:
   - `Acked` pieces are trusted.
-  - `Sent` pieces are verified by stored interaction id when available; otherwise they are treated as indeterminate and failed with a retryable error.
+  - `Sent { interaction_id }` pieces are verified by stored interaction id.
+  - `ResponseStarted` pieces have no interaction id to probe, so they are treated as indeterminate and failed with a retryable error.
   - `Pending` pieces are resent from persisted `request_body`.
   - complete batches insert their `UpstreamInteractionNode`s and `ClientInteractionNode`.
   - failed batches are retained until clean-all or future expiration cleanup.
@@ -97,9 +98,9 @@ Control messages MUST be stripped before harness-message filtering and hashing.
 
 Clean-all MUST:
 - cancel/delete known terminal upstream interactions best-effort (iterate all `ClientInteractionNode.upstream_ids`, cancel/delete each);
-- after processing all `ClientInteractionNode`s, iterate remaining `UpstreamInteractionNode`s not referenced by any `ClientInteractionNode` (orphaned from failed batches where cancel failed) and DELETE them best-effort;
+- after processing all `ClientInteractionNode`s, use `InteractionStore.upstream_to_clients` to find `UpstreamInteractionNode`s not referenced by any `ClientInteractionNode` (orphaned from failed batches where cancel failed) and DELETE them best-effort;
 - cancel ACKed in-flight piece interactions best-effort;
-- clear `SessionInfo`, `ClientInteractionNode`, `UpstreamInteractionNode`, `hash_index`, and `InFlightStore`.
+- clear `SessionInfo`, `ClientInteractionNode`, `UpstreamInteractionNode`, `hash_index`, `upstream_to_clients`, and `InFlightStore`.
 
 Extend-lifetime MUST update current `SessionInfo` and the matched current `ClientInteractionNode` when one exists. It MUST NOT create a routing dependency on `SessionInfo.last_interaction_id`.
 

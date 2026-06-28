@@ -94,19 +94,24 @@ struct InteractionStore {
     /// message_hash → client interaction positions.
     /// Multi-valued: duplicate content and branch collisions are valid.
     hash_index: HashMap<u64, Vec<ClientInteractionPosition>>,
+    /// upstream_id → client ids referencing it.
+    /// Used for clean-all/orphan detection and diagnostics.
+    upstream_to_clients: HashMap<String, Vec<String>>,
 }
 ```
 
 Key invariants:
 - `ClientInteractionNode` is created ONLY after ALL `upstream_ids` nodes are persisted in `upstreams`.
 - `hash_index` references ONLY `ClientInteractionNode.message_hashes` — never piece hashes, never upstream nodes.
+- `upstream_to_clients` is maintained from `ClientInteractionNode.upstream_ids`; clean-all uses it to find upstream nodes not referenced by any client node.
 - `UpstreamInteractionNode.client_id` is diagnostic-only. The mapping client→upstream lives exclusively in `ClientInteractionNode.upstream_ids`.
 - `UpstreamInteractionNode.last_seen_utc` is updated on creation AND on every GET replay that traverses this node.
 - `ClientInteractionNode.system_instruction_hash` is set to `Some(hash)` on the first interaction of a chain (when `prev_id` is `None`), and `None` on follow-ups. If a follow-up request has `prev_id=Some(...)` but the client's current `system_instruction` xxh3 hash differs from the root interaction's stored `system_instruction_hash`, the handler MUST log an error and fork (`prev_id=None`).
+- `system_instruction_hash` is `xxh3-64(serde_json::to_vec(system_instruction_value))` over the final Gemini `system_instruction` value that would be sent upstream, not over a chat message. Anthropic hashes the converted `system` field value. OpenAI hashes the converted value built from `system` + `developer` messages joined with newline. Missing system instruction is `None`.
 
 Operations:
 - `insert_upstream(node)` — adds upstream node.
-- `insert_client(node)` — adds client node and indexes every `message_hashes` position into `hash_index`.
+- `insert_client(node)` — adds client node, indexes every `message_hashes` position into `hash_index`, and indexes every `upstream_ids` entry into `upstream_to_clients`.
 - `get_client(id) -> Option<&ClientInteractionNode>`.
 - `get_upstream(id) -> Option<&UpstreamInteractionNode>`.
 - `lookup_hash(hash) -> &[ClientInteractionPosition]`.
@@ -114,6 +119,12 @@ Operations:
 - `walk_upstream_chain(id) -> Vec<&UpstreamInteractionNode>` from leaf to root.
 
 Expiration cleanup is out of scope for this change and will be specified by a dependent change.
+
+Concurrency requirements:
+- `InteractionStore`, `InFlightStore`, and `SessionInfo` persistence MUST be owned by one shared store document protected by an async-aware lock (`Arc<RwLock<...>>` or stricter).
+- In-flight batch match/create MUST be atomic under a write lock: check `(session_id, prev_interaction_id, message_hashes)` and insert placeholder batch before any upstream send.
+- Network I/O MUST NOT run while holding the store lock; piece status transitions reacquire write lock and persist.
+- Concurrent identical split requests MUST converge on one `InFlightBatch`; later requests wait for or observe existing batch state.
 
 #### Scenario: Single upstream — single client
 - GIVEN no split, one upstream call creates `int-A`
@@ -201,10 +212,12 @@ Algorithm requirements:
 
 ### Requirement: Durable InFlightStore
 
-`InFlightStore` MUST persist split-send progress via `save_to_disk()` after every piece status transition (Pending→Sent, Sent→Acked, any→Failed) and on batch creation/completion.
+`InFlightStore` MUST persist split-send progress via `save_to_disk()` after every piece status transition (Pending→ResponseStarted, ResponseStarted→Sent, Sent→Acked, any→Failed) and on batch creation/completion.
 
 #### Scenario: Persistence after every piece status change
 - GIVEN an InFlightBatch with piece P0 Pending
+- WHEN P0 transitions to ResponseStarted
+- THEN `save_to_disk()` is called immediately
 - WHEN P0 transitions to Sent
 - THEN `save_to_disk()` is called immediately
 - WHEN P0 transitions to Acked
@@ -230,18 +243,18 @@ struct InFlightPiece {
 
 enum InFlightStatus {
     Pending,
-    /// HTTP 200 received, SSE stream in progress or completed but not fully drained.
-    /// On recovery, proxy MUST re-fetch interaction via GET to verify completion
-    /// and re-drain content rather than re-sending. If GET fails or interaction
-    /// is gone, treat as Failed.
-    Sent { request_hash: u64, interaction_id: Option<String> },
+    /// HTTP 200 received from upstream, but no interaction id has been observed yet.
+    ResponseStarted,
+    /// Upstream interaction id observed; SSE stream may still be in progress or not fully drained.
+    /// On recovery, proxy MUST re-fetch interaction via GET and re-drain content rather than re-sending.
+    Sent { interaction_id: String },
     /// SSE stream fully consumed, all response content collected, no more events expected.
     Acked { interaction_id: String },
     Failed { error: String },
 }
 ```
 
-`message_hashes` are original harness-message hashes. `content_hash` identifies a split piece only. `request_body` is persisted before send so Pending pieces can be resent during startup recovery.
+`message_hashes` are original harness-message hashes. `content_hash` identifies a split piece only and is reserved for future integrity/deduplication work; current routing and recovery MUST NOT depend on it. `request_body` is persisted before send so Pending pieces can be resent during startup recovery.
 
 A batch is complete when every piece is `Acked`. On completion:
 1. Insert all `UpstreamInteractionNode`s for each `Acked { interaction_id }` in piece order, linked by `prev_id` (first piece's `prev_id = batch.prev_interaction_id`).
@@ -276,8 +289,8 @@ When a subsequent client request hits the same `message_hashes` and frontier sel
 - WHEN P1 fails
 - THEN the handler calls `POST /int-A/cancel`, marks batch failed, and does not insert an `InteractionNode`
 
-#### Scenario: Recovery — Sent piece with interaction_id re-fetched via GET
-- GIVEN persisted batch has P0 Acked `int-A`, P1 Sent `{ request_hash, interaction_id: Some("int-B") }`
+#### Scenario: Recovery — Sent piece re-fetched via GET
+- GIVEN persisted batch has P0 Acked `int-A`, P1 Sent `{ interaction_id: "int-B" }`
 - WHEN proxy starts and recovers
 - THEN P0 is trusted
 - AND proxy calls `GET /v1beta/interactions/int-B`
@@ -285,8 +298,8 @@ When a subsequent client request hits the same `message_hashes` and frontier sel
 - AND if 404: marks P1 Failed, cancels P0's `int-A`, batch failed
 - AND if GET fails (network error): keeps P1 as Sent for next recovery attempt
 
-#### Scenario: Recovery — Sent piece without interaction_id
-- GIVEN persisted batch has P0 Acked `int-A`, P1 Sent `{ request_hash, interaction_id: None }`
+#### Scenario: Recovery — ResponseStarted piece without interaction_id
+- GIVEN persisted batch has P0 Acked `int-A`, P1 ResponseStarted
 - WHEN proxy starts and recovers
 - THEN P1 is indeterminate — no interaction_id to probe
 - AND P1 is marked Failed (duplicate-send prevention)
@@ -307,6 +320,8 @@ version = 2
 
 [interactions.upstreams]
 # id = UpstreamInteractionNode
+
+# hash_index and upstream_to_clients are derived indexes rebuilt from clients on load.
 
 [in_flight]
 # batch_id = InFlightBatch

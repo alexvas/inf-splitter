@@ -68,14 +68,15 @@ struct InteractionStore {
     clients: HashMap<String, ClientInteractionNode>,
     upstreams: HashMap<String, UpstreamInteractionNode>,
     hash_index: HashMap<u64, Vec<ClientInteractionPosition>>,
+    upstream_to_clients: HashMap<String, Vec<String>>,
 }
 ```
 
 Key properties:
-- `UpstreamInteractionNode.client_id` is diagnostic-only. The mapping client→upstream lives exclusively in `ClientInteractionNode.upstream_ids`.
+- `UpstreamInteractionNode.client_id` is diagnostic-only. The mapping client→upstream lives exclusively in `ClientInteractionNode.upstream_ids`; `upstream_to_clients` is derived index for cleanup/diagnostics.
 - `UpstreamInteractionNode.last_seen_utc` is updated on creation and on every GET replay that traverses this node.
 - `ClientInteractionNode` is created AFTER all upstream pieces complete. It's a denormalized view — `upstream_ids` lists all backing upstream nodes in chain order.
-- `ClientInteractionNode.system_instruction_hash` stores the xxh3 hash of system_instruction from the first interaction in chain (when `prev_id` is `None`). Follow-up interactions set it to `None`. If a follow-up request's system_instruction hash differs from the root node's stored hash, the handler forks.
+- `ClientInteractionNode.system_instruction_hash` stores `xxh3-64(serde_json::to_vec(system_instruction_value))` over the final Gemini `system_instruction` value from the first interaction in chain (when `prev_id` is `None`). Anthropic hashes converted `system`; OpenAI hashes converted `system` + `developer` joined by newline. Follow-up interactions set it to `None`. If a follow-up request's system_instruction hash differs from the root node's stored hash, the handler forks.
 - `hash_index` indexes only `ClientInteractionNode.message_hashes` — never piece hashes or upstream nodes. Multi-valued: duplicate content and branch collisions are valid.
 - Frontier works exclusively with client nodes. Upstream nodes are never consulted for routing.
 
@@ -119,13 +120,14 @@ struct InFlightPiece {
 
 enum InFlightStatus {
     Pending,
-    Sent { request_hash: u64, interaction_id: Option<String> },
-    Acked { interaction_id: String },
+    ResponseStarted,                      // HTTP 200 received; no interaction id observed yet
+    Sent { interaction_id: String },       // interaction id observed; stream may still be draining
+    Acked { interaction_id: String },      // stream fully consumed
     Failed { error: String },
 }
 ```
 
-`message_hashes` are original harness-message hashes. `content_hash` is piece identity only. `request_body` is persisted before send so Pending pieces can be resent during startup recovery. Intermediate split pieces create upstream interactions but do not own harness-message hashes in `InteractionStore`.
+`message_hashes` are original harness-message hashes. `content_hash` is piece identity only and reserved for future integrity/deduplication work; current routing and recovery do not depend on it. `request_body` is persisted before send so Pending pieces can be resent during startup recovery. Intermediate split pieces create upstream interactions but do not own harness-message hashes in `InteractionStore`.
 
 When all pieces are `Acked`, the batch completes:
 1. Insert all `UpstreamInteractionNode`s for each `Acked { interaction_id }` in piece order, linked by `prev_id`.
@@ -134,7 +136,11 @@ When all pieces are `Acked`, the batch completes:
 
 When a client retries with same `message_hashes` and frontier hits a client node with multiple `upstream_ids`, the handler fetches all upstream interactions via GET, merges their content into one composite response, and returns it with the client node's `id`. Only the terminal upstream id is ever visible to the client.
 
-If a client retries while a batch is incomplete, matching is by `session_id + message_hashes + prev_interaction_id`. The handler waits for completion when possible.
+If a client retries while a batch is incomplete, matching is by `session_id + message_hashes + prev_interaction_id`. Match/create is atomic under the shared store write lock, so concurrent identical split requests converge on one `InFlightBatch`; network I/O runs after releasing the lock. The handler waits for completion when possible.
+
+### Store concurrency
+
+The versioned store document is shared via an async-aware lock (`Arc<RwLock<...>>` or stricter). Read-only frontier lookup may use read lock. In-flight batch match/create, piece status transitions, interaction insertion, reverse-index maintenance, and persistence snapshots use write lock. No upstream HTTP/SSE I/O happens while holding the lock.
 
 ### Deterministic split packing
 
@@ -152,7 +158,7 @@ Existing full-body `proxy_limit` semantics are preserved:
 
 For `stream: true` split-send, all upstream piece SSE streams are buffered until the final interaction id is known. The proxy substitutes every upstream `interaction.id` / client-visible message id from intermediate pieces with the final id, then drains one coherent translated SSE stream to the client.
 
-Initial buffer implementation is memory-backed with a 100 MB cap. On overflow, the handler cancels ACKed pieces, marks the batch failed, and returns an error. Disk-backed buffering remains out of scope.
+Initial buffer implementation is memory-backed with a 100 MB cap counted as total raw SSE bytes pushed into the buffer after upstream reads and before client translation. On overflow, the handler cancels ACKed pieces best-effort/asynchronously, marks the batch failed, and returns an error. Disk-backed buffering remains out of scope.
 
 ### Negative scenarios
 
@@ -161,7 +167,7 @@ Initial buffer implementation is memory-backed with a 100 MB cap. On overflow, t
 | Piece N fails or times out | Cancel ACKed piece interactions via `POST /{id}/cancel`, mark batch failed, do not insert ClientInteractionNode, return error. |
 | Client disconnects mid-split | Continue batch to completion. Insert `UpstreamInteractionNode`s + `ClientInteractionNode`. Retry fetches via `upstream_ids`, merges, returns. |
 | Client resends same in-flight split | Find matching batch. If running, wait. If completed, fetch via `ClientInteractionNode.upstream_ids`, merge, return. |
-| Crash mid-split | Load persisted InFlightStore; ACKed pieces are trusted. Sent pieces with interaction_id trigger GET to re-fetch the interaction from upstream — if it exists, drain and transition to Acked; if 404 or error, mark Failed. Pending pieces are resent. Failed batches remain until clean-all or future expiration cleanup. |
+| Crash mid-split | Load persisted InFlightStore; ACKed pieces are trusted. Sent pieces trigger GET to re-fetch the interaction from upstream — if it exists, drain and transition to Acked; if 404 or error, mark Failed. ResponseStarted pieces have no interaction id to probe and fail for duplicate-send prevention. Pending pieces are resent. Failed batches remain until clean-all or future expiration cleanup. |
 | SSE buffer overflow | Cancel ACKed piece interactions, mark batch failed, return error. |
 | Hash collision or duplicate content | `hash_index` returns candidates; chain order validation chooses valid longest prefix, never single hash alone. |
 
@@ -176,7 +182,9 @@ The existing `interactions_session_store` config path remains the persistence lo
 
 Old version-1 files are not migrated because they lack content hashes. On startup, the proxy logs a warning, ignores old count-based sessions, and overwrites with the v2 format on next save.
 
-Clean-all control cancels/deletes known terminal interactions, cancels ACKed in-flight pieces, and clears all three stores. Expiration cleanup for sessions, interaction nodes, hash-index positions, and in-flight batches is out of scope for this change and should be specified by a dependent change.
+On load, derived indexes (`hash_index`, `upstream_to_clients`) are rebuilt from persisted client nodes.
+
+Clean-all control cancels/deletes known terminal interactions, uses `upstream_to_clients` to find orphan upstream nodes, cancels ACKed in-flight pieces, and clears all three stores plus derived indexes. Expiration cleanup for sessions, interaction nodes, hash-index positions, and in-flight batches is out of scope for this change and should be specified by a dependent change.
 
 ## Scope
 

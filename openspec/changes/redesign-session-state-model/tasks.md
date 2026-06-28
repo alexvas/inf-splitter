@@ -71,6 +71,7 @@
 - `HashMap<String, UpstreamInteractionNode>`
 - `HashMap<String, ClientInteractionNode>`
 - `HashMap<u64, Vec<ClientInteractionPosition>>`
+- `HashMap<String, Vec<String>>` reverse index: `upstream_id -> client_ids`
 - `find_frontier(hashes) -> Frontier { index, previous_interaction_id }`
 - Expiration cleanup is out of scope for this change; dependent change will define node/in-flight expiration removal
 
@@ -108,7 +109,7 @@
 ## Phase 4: InFlightStore State Machine
 
 ### 4.1 RED — Piece state transitions persist
-- Pending -> Sent -> Acked
+- Pending -> ResponseStarted -> Sent -> Acked
 - THEN each transition is saved to store document
 
 ### 4.2 RED — Complete batch inserts upstream nodes and one client node
@@ -127,14 +128,17 @@
 ### 4.4 RED — Retry reuses matching in-flight batch
 - Same `session_id + prev_interaction_id + message_hashes` arrives during incomplete split
 - THEN no duplicate batch is created
+- AND match/create is atomic under the shared store write lock
 
 ### 4.5 GREEN — Implement InFlightStore
 - `create_batch`
+- `mark_response_started`
 - `mark_sent`
 - `ack_piece`
 - `fail_batch`
 - `complete_batch`
 - `find_matching_batch`
+- Keep `content_hash` as reserved future-use piece identity; current routing/recovery must not depend on it
 
 **Quality Gate:** `cargo test --locked` — Phase 4 tests pass
 
@@ -229,13 +233,14 @@
 ## Phase 7: Streaming Split-Send Buffer
 
 ### 7.1 RED — MemSseBuffer push/substitute/drain
-- Push SSE bytes with intermediate ids
+- Push raw upstream SSE bytes with intermediate ids and piece index
+- Count buffered raw bytes toward 100 MB limit
 - Substitute ids with final id
-- Drain returns only final id references
+- Drain returns piece buffers in order with only final id references
 
 ### 7.2 RED — Buffer overflow fails safely
-- Buffer exceeds 100 MB
-- THEN error is returned and ACKed pieces are cancelled
+- Buffer exceeds 100 MB of raw upstream SSE bytes
+- THEN error is returned, batch is failed, and ACKed pieces are cancelled best-effort/asynchronously
 
 ### 7.3 RED — Anthropic split streaming emits one coherent final-id stream
 - P0 -> `int-A`, P1 -> `int-B`
@@ -246,7 +251,7 @@
 - OpenAI client receives chat-completion chunks derived after substitution
 
 ### 7.5 GREEN — Implement buffered streaming split-send
-- Add `SseBuffer`/`MemSseBuffer`
+- Add `SseBuffer`/`MemSseBuffer` with `push(piece_index, bytes)`, `substitute_id(from, to)`, `drain()`, `len_bytes()`
 - Buffer every piece SSE until final id known
 - Substitute intermediate ids
 - Translate/drain one client-visible stream
@@ -257,19 +262,21 @@
 
 ## Phase 8: Startup Recovery and Control Messages
 
-### 8.1 RED — Startup rebuilds hash index from persisted interactions
-- Persist nodes without runtime hash index
+### 8.1 RED — Startup rebuilds derived indexes from persisted interactions
+- Persist nodes without runtime `hash_index` or `upstream_to_clients`
 - Load store
 - THEN hash lookup works
+- AND reverse upstream lookup works
 
 ### 8.2 RED — Startup resumes pending in-flight piece
 - Persist batch with P0 Acked and P1 Pending plus request data
 - Startup resends P1 with previous id from P0
 
 ### 8.3 RED — Clean-all clears all new stores
-- Sessions, interaction nodes, hash index, and in-flight batches exist
+- Sessions, interaction nodes, hash index, reverse upstream index, and in-flight batches exist
 - Clean-all processed
-- THEN all local stores are empty after best-effort upstream cleanup
+- THEN referenced upstreams and reverse-index orphan upstreams are cancelled/deleted best-effort
+- AND all local stores are empty after best-effort upstream cleanup
 
 ### 8.4 RED — Extend-lifetime updates metadata and current interaction node
 - Current request matches known client node

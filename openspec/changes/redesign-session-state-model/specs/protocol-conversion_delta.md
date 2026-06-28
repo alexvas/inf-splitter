@@ -18,6 +18,7 @@ Rules:
 - `system_instruction`, `tools`, `tool_choice`, and `generation_config` are included only when `previous_interaction_id` is `None`.
 - If all incoming harness messages are known, handler fetches the existing interaction from upstream (`GET /v1beta/interactions/{id}`) and translates its response — no `POST` call is made.
 - When `previous_interaction_id` is `Some(...)` but the client's current `system` field differs from what was sent in the first interaction, the proxy MUST log an error-level message and treat the mismatch as a fork: discard `previous_interaction_id`, treat `prev_id = None`, include `system_instruction`, `tools`, and `generation_config`. Upstream Gemini does not accept `system_instruction` mid-chain.
+- Anthropic `system_instruction_hash` is `xxh3-64(serde_json::to_vec(system_instruction_value))` over the converted Gemini `system_instruction` value built from Anthropic `system`; it is not a harness message hash.
 
 #### Scenario: Subsequent request — hash delta + chain
 - GIVEN known Anthropic harness hashes `[0xA, 0xB]` ending at `int-2`
@@ -57,6 +58,7 @@ Rules:
 - `system_instruction`, `tools`, `tool_choice`, and `generation_config` are included only when `previous_interaction_id` is `None`.
 - If all incoming harness messages are known, handler fetches the existing interaction from upstream (`GET /v1beta/interactions/{id}`) and translates its response — no `POST` call is made.
 - When `previous_interaction_id` is `Some(...)` but the client's current `system`/`developer` messages produce a system_instruction whose xxh3 hash differs from the root `ClientInteractionNode.system_instruction_hash`, the proxy MUST log an error-level message and treat the mismatch as a fork: discard `previous_interaction_id`, treat `prev_id = None`, include `system_instruction`, `tools`, and `generation_config`. Upstream Gemini does not accept `system_instruction` mid-chain.
+- OpenAI `system_instruction_hash` is `xxh3-64(serde_json::to_vec(system_instruction_value))` over the converted Gemini `system_instruction` value built from `system` + `developer` messages joined with newline; it is not a harness message hash.
 
 **Limitation:** Only harness messages participate in frontier selection. Client-resubmitted `assistant` messages (Anthropic) and `assistant` role (OpenAI) are invisible to frontier. If the client modifies history in a way that affects only assistant messages while keeping harness messages identical, the proxy will NOT detect the change and will replay the cached interaction chain. This is by design: assistant messages are LLM-generated and the client cannot meaningfully alter them without also altering the subsequent harness context.
 
@@ -164,7 +166,22 @@ When original ingress has `stream: true` and split-send is required, the handler
 For Anthropic clients, buffered interactions SSE is translated to Anthropic `StreamEvent` SSE after substitution.
 For OpenAI clients, the substituted Anthropic-style stream is passed through `ReverseStreamingTranslator` to produce OpenAI chat-completion chunks.
 
-The initial buffer is memory-backed with 100 MB limit. On overflow, ACKed piece interactions are cancelled best-effort and the batch is marked failed.
+The initial buffer is memory-backed with 100 MB limit counted as total raw SSE bytes pushed into the buffer after upstream reads and before client translation. On overflow, ACKed piece interactions are cancelled best-effort/asynchronously and the batch is marked failed.
+
+```rust
+trait SseBuffer {
+    fn push(&mut self, piece_index: usize, bytes: &[u8]) -> Result<(), SseBufferError>;
+    fn substitute_id(&mut self, from: &str, to: &str);
+    fn drain(self) -> Vec<u8>;
+    fn len_bytes(&self) -> usize;
+}
+
+struct MemSseBuffer {
+    limit_bytes: usize, // default: 100 * 1024 * 1024
+}
+```
+
+`push` stores serialized upstream SSE bytes exactly as received for each piece. `substitute_id` rewrites buffered bytes before protocol-specific client translation. `drain` emits piece buffers in piece order.
 
 #### Scenario: Two-piece streaming response uses final id
 - GIVEN P0 creates `int-A` and P1 creates `int-B`
@@ -173,9 +190,10 @@ The initial buffer is memory-backed with 100 MB limit. On overflow, ACKed piece 
 - AND no event exposes `int-A`
 
 #### Scenario: Buffer overflow fails safely
-- GIVEN buffered split-send SSE exceeds 100 MB
-- WHEN overflow is detected
-- THEN ACKed pieces are cancelled best-effort
+- GIVEN buffered raw upstream SSE bytes exceed 100 MB
+- WHEN `MemSseBuffer::push` detects overflow
+- THEN ACKed pieces are cancelled best-effort/asynchronously
+- AND the batch is marked failed
 - AND the client receives an error response/event
 
 ---
@@ -319,12 +337,12 @@ sequenceDiagram
 
     Proxy->>Upstream: POST {previous_interaction_id: null, input: chunk0}
     Upstream-->>Proxy: 200 {id: "int-A", output: {steps: [text:"Hello"]}}
-    Proxy->>Proxy: P0: Pending → Sent → Acked{int-A}
+    Proxy->>Proxy: P0: Pending → ResponseStarted → Sent{int-A} → Acked{int-A}
     Proxy->>Proxy: save_to_disk()
 
     Proxy->>Upstream: POST {previous_interaction_id: "int-A", input: chunk1}
     Upstream-->>Proxy: 200 {id: "int-B", output: {steps: [text:" world"]}}
-    Proxy->>Proxy: P1: Pending → Sent → Acked{int-B}
+    Proxy->>Proxy: P1: Pending → ResponseStarted → Sent{int-B} → Acked{int-B}
     Proxy->>Proxy: save_to_disk()
 
     Proxy->>Proxy: complete_batch():
@@ -387,7 +405,7 @@ sequenceDiagram
 
     Proxy->>Upstream: POST chunk0
     Upstream-->>Proxy: 200 {id: "int-A", output: "Hello"}
-    Proxy->>Proxy: P0: Pending → Sent → Acked{int-A}
+    Proxy->>Proxy: P0: Pending → ResponseStarted → Sent{int-A} → Acked{int-A}
     Proxy->>Proxy: save_to_disk()
 
     Proxy->>Upstream: POST chunk1 {previous: "int-A"}

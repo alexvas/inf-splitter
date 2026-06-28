@@ -216,7 +216,7 @@ impl InteractionsHandler {
         let system_instruction_hash = if prev_id.is_none() {
             system
                 .as_ref()
-                .map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+                .map(|s| crate::interactions::hash_system_instruction(s))
         } else {
             None
         };
@@ -520,7 +520,7 @@ impl InteractionsHandler {
                 params
                     .system_instruction
                     .as_ref()
-                    .map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+                    .map(|s| crate::interactions::hash_system_instruction(s))
             } else {
                 None
             },
@@ -1443,7 +1443,7 @@ impl InteractionsHandler {
             params
                 .system_instruction
                 .as_ref()
-                .map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+                .map(|s| crate::interactions::hash_system_instruction(s))
         } else {
             None
         };
@@ -2023,7 +2023,7 @@ impl InteractionsHandler {
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
         let system_instruction_hash = if prev_interaction_id.is_none() {
-            Some(xxhash_rust::xxh3::xxh3_64(sys.as_bytes()))
+            Some(crate::interactions::hash_system_instruction(sys))
         } else {
             None
         };
@@ -2793,7 +2793,7 @@ impl InteractionsHandler {
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
         let system_instruction_hash = if prev_interaction_id.is_none() {
-            Some(xxhash_rust::xxh3::xxh3_64(sys.as_bytes()))
+            Some(crate::interactions::hash_system_instruction(sys))
         } else {
             None
         };

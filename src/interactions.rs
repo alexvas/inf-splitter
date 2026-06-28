@@ -904,6 +904,14 @@ pub fn hash_harness_message(message: &serde_json::Value) -> u64 {
     xxhash_rust::xxh3::xxh3_64(&bytes)
 }
 
+/// Hash a system_instruction value for dedup/frontier matching.
+/// Spec: xxh3-64(serde_json::to_vec(value)) — serde adds JSON quotes
+/// around strings, producing different hash than raw bytes.
+pub fn hash_system_instruction(value: &str) -> u64 {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    xxhash_rust::xxh3::xxh3_64(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1970,5 +1978,42 @@ mod tests {
             true,
         );
         assert_eq!(req.previous_interaction_id.as_deref(), Some("prev-123"));
+    }
+
+    /// Spec says xxh3(serde_json::to_vec(system_instruction)), code uses it.
+    /// serde adds JSON quotes around strings — different from raw as_bytes.
+    #[test]
+    fn system_instruction_hash_uses_serde_json_serialization() {
+        let sys = "You are helpful";
+
+        // Code: hash_system_instruction uses serde_json::to_vec
+        let code_hash = crate::interactions::hash_system_instruction(sys);
+
+        // Spec: xxh3_64(serde_json::to_vec(value))
+        let spec_hash = xxhash_rust::xxh3::xxh3_64(&serde_json::to_vec(sys).unwrap());
+
+        assert_eq!(
+            code_hash, spec_hash,
+            "GREEN: hash_system_instruction matches spec (serde_json::to_vec)"
+        );
+
+        // as_bytes hash is different (confirms serde adds JSON quotes)
+        let as_bytes_hash = xxhash_rust::xxh3::xxh3_64(sys.as_bytes());
+        assert_ne!(as_bytes_hash, spec_hash);
+    }
+
+    /// System instruction hash must be consistent: same input → same hash.
+    /// Reguardless of whether as_bytes or serde_json::to_vec is used,
+    /// the chosen algorithm must produce identical results for identical input.
+    #[test]
+    fn system_instruction_hash_produces_same_hash_for_same_input() {
+        let sys = "You are helpful";
+        let h1 = xxhash_rust::xxh3::xxh3_64(sys.as_bytes());
+        let h2 = xxhash_rust::xxh3::xxh3_64(sys.as_bytes());
+        assert_eq!(h1, h2, "same input → same hash (as_bytes)");
+
+        let serde_h1 = xxhash_rust::xxh3::xxh3_64(&serde_json::to_vec(sys).unwrap());
+        let serde_h2 = xxhash_rust::xxh3::xxh3_64(&serde_json::to_vec(sys).unwrap());
+        assert_eq!(serde_h1, serde_h2, "same input → same hash (serde)");
     }
 }

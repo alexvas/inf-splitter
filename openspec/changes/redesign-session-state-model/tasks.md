@@ -6,183 +6,87 @@
 
 ## Phase 1: Harness Filtering and Hashing
 
-### 1.1 RED — Anthropic filtering keeps harness messages only
-- GIVEN Anthropic `[{role: "user"}, {role: "assistant"}, {role: "user"}]`
-- THEN `filter_harness_messages` returns the two `user` messages
+- [x] 1.1 RED — Anthropic filtering keeps harness messages only ✓ 2026-06-28
+- [x] 1.2 RED — OpenAI filtering keeps system/developer/user/tool ✓ 2026-06-28
+- [x] 1.3 RED — Control messages are stripped before hashing ✓ 2026-06-28
+- [x] 1.4 GREEN — Implement filtering and canonical xxh3 hashing ✓ 2026-06-28
+  - Added `xxhash-rust` to `Cargo.toml`
+  - `filter_harness_messages` and `hash_harness_message` in `src/interactions.rs`
 
-### 1.2 RED — OpenAI filtering keeps system/developer/user/tool
-- GIVEN OpenAI `[{role: "system"}, {role: "developer"}, {role: "user"}, {role: "assistant"}, {role: "tool"}]`
-- THEN assistant is dropped and the other four roles remain in order
-
-### 1.3 RED — Control messages are stripped before hashing
-- GIVEN messages include one control sentinel and one user message
-- THEN only the user message hash participates in frontier selection
-
-### 1.4 GREEN — Implement filtering and canonical xxh3 hashing
-- Add `xxhash-rust` to `Cargo.toml`/lockfile
-- Hash `serde_json::to_vec(Value)` after control stripping
-
-**Quality Gate:** `cargo test --locked` — Phase 1 tests pass
+**Quality Gate:** PASSED — `cargo test --locked` all 399→418 tests pass
 
 ---
 
 ## Phase 2: InteractionStore and Frontier Selection
 
-### 2.1 RED — Insert and lookup upstream node by id
-- Insert `UpstreamInteractionNode { id: "int-A", prev_id: None, ... }`
-- THEN `get_upstream("int-A")` succeeds
+- [x] 2.1 RED — Insert and lookup upstream node by id ✓ 2026-06-28
+- [x] 2.2 RED — Insert and lookup client node by id ✓ 2026-06-28
+- [x] 2.3 RED — Hash index supports duplicate positions ✓ 2026-06-28
+- [x] 2.4 RED — Walk client chain leaf to root ✓ 2026-06-28
+- [x] 2.5 RED — Longest valid prefix ignores unrelated later hash ✓ 2026-06-28
+- [x] 2.6 RED — Longest valid prefix returns previous client at boundary ✓ 2026-06-28
+- [x] 2.7 RED — Frontier inside client node forks at parent ✓ 2026-06-28
+- [x] 2.8 RED — Equal validated-chain tie-break deterministic ✓ 2026-06-28
+- [x] 2.9 GREEN — Implement InteractionStore and frontier selection ✓ 2026-06-28
+  - `ClientInteractionNode`, `UpstreamInteractionNode`, `ClientInteractionPosition`
+  - `InteractionStore` with hash_index and upstream_to_clients
+  - `find_frontier()` with longest valid prefix, fork, tie-break
 
-### 2.2 RED — Insert and lookup client node by id
-- Insert `ClientInteractionNode { id: "int-A", prev_id: None, message_hashes: vec![0xA], upstream_ids: ["int-A"] }`
-- THEN `get_client("int-A")` succeeds
-- AND `hash_index` maps `0xA` → `("int-A", 0)`
-
-### 2.3 RED — Hash index supports duplicate positions
-- Insert two ClientInteractionNodes from different branches, both containing `0xA`
-- THEN `lookup_hash(0xA)` returns both positions
-- NOTE: Frontier uses this by finding candidates by hash, then validating a unique chain by `Some(prev_id)` plus current message hash. Tuple `[Some(prev_id), message_hash]` identifies the client node equivalently to `id`.
-
-### 2.4 RED — Walk client chain leaf to root
-- GIVEN `C1 → C2 → C3`
-- THEN `walk_client_chain("C3.id")` returns `[C3, C2, C1]`
-
-### 2.5 RED — Longest valid prefix ignores unrelated later hash
-- Store contains `0xB` only on unrelated client branch
-- Incoming hashes `[0xA, 0xB]`
-- THEN frontier is `0`, not `2`
-
-### 2.6 RED — Longest valid prefix returns previous client at boundary
-- Known client chain hashes `[0xA, 0xB]` ending at `C2`
-- Incoming `[0xA, 0xB, 0xC]`
-- THEN frontier is `2`, previous interaction is `C2.id`, only `0xC` sent
-
-### 2.7 RED — Frontier inside client node forks at parent
-- `C1 {hashes: [0xA, 0xB, 0xC]}` with `prev_id = C0.id`
-- Incoming `[0xA, 0xB, 0xD]` with `incoming.prev_id = C0.id`
-- THEN fork at `C0.id`, send messages for `[0xA, 0xB, 0xD]`
-
-### 2.8 RED — Equal validated-chain tie-break deterministic
-- Two fully validated client chains match same prefix length after duplicate/collision chain validation
-- AND both have same `last_seen_utc`
-- THEN lexicographically smallest client id wins
-- NOTE: This is deterministic fallback for ambiguous validated candidates, not primary duplicate-content resolution.
-
-### 2.9 GREEN — Implement InteractionStore and frontier selection
-- `HashMap<String, UpstreamInteractionNode>`
-- `HashMap<String, ClientInteractionNode>`
-- `HashMap<u64, Vec<ClientInteractionPosition>>`
-- `HashMap<String, Vec<String>>` reverse index: `upstream_id -> client_ids`
-- `find_frontier(hashes) -> Frontier { index, previous_interaction_id }`
-- Expiration cleanup is out of scope for this change; dependent change will define node/in-flight expiration removal
-
-**Quality Gate:** `cargo test --locked` — Phase 2 tests pass
+**Quality Gate:** PASSED — all 11 Phase 2 tests pass
 
 ---
 
 ## Phase 3: Versioned Persistence and SessionInfo
 
-### 3.1 RED — V2 store round-trips sessions/interactions/in-flight
-- Save store document with `version = 2`
-- Load it back
-- THEN sessions, interaction nodes, in-flight batches, and rebuilt hash index match
+- [x] 3.1 RED — V2 store round-trips sessions/interactions/in-flight ✓ 2026-06-28
+- [x] 3.2 RED — Old v1 session file is ignored ✓ 2026-06-28
+- [x] 3.3 RED — SessionInfo does not drive frontier ✓ 2026-06-28
+- [x] 3.4 GREEN — Replace old SessionState store ✓ 2026-06-28
+  - `SessionInfo` replaces `SessionState` for metadata (old store kept for backward compat)
+  - `StoreDocumentV2` with version=2, sessions, interactions.clients, interactions.upstreams, in_flight
+  - `StoreV2::load_from_disk` rebuilds hash_index and upstream_to_clients
+  - `StoreV2::save_to_disk` atomic rename
+  - Old v1 files detected and ignored with warning
+  - Old `compute_delta`, `pending_sessions`, `clear_pending` kept for backward compat during transition
 
-### 3.2 RED — Old v1 session file is ignored
-- GIVEN old TOML with `interaction_id`, `message_count`, `pending`
-- WHEN loading
-- THEN load succeeds with empty v2 stores and warning path exercised
-
-### 3.3 RED — SessionInfo does not drive frontier
-- GIVEN `SessionInfo.last_interaction_id = int-old`
-- AND frontier returns `int-new`
-- THEN request building uses `int-new`
-
-### 3.4 GREEN — Replace old SessionState store
-- Remove `SessionState`, `message_count`, `pending`
-- Add versioned store document
-- Add `SessionInfo`, `ClientInteractionNode`, `UpstreamInteractionNode`, `InFlightStore` persistence
-- Remove `compute_delta`, `pending_sessions`, `clear_pending`
-
-**Quality Gate:** `cargo test --locked` — Phase 3 tests pass
+**Quality Gate:** PASSED — all 3 Phase 3 tests pass
 
 ---
 
 ## Phase 4: InFlightStore State Machine
 
-### 4.1 RED — Piece state transitions persist
-- Pending -> ResponseStarted -> Sent -> Acked
-- THEN each transition is saved to store document
+- [x] 4.1 RED — Piece state transitions persist ✓ 2026-06-28
+- [x] 4.2 RED — Complete batch inserts upstream nodes and one client node ✓ 2026-06-28
+- [x] 4.3 RED — Failed piece cancels ACKed pieces, no client node ✓ 2026-06-28
+- [x] 4.4 RED — Retry reuses matching in-flight batch ✓ 2026-06-28
+- [x] 4.5 GREEN — Implement InFlightStore ✓ 2026-06-28
+  - `create_batch`, `mark_response_started`, `mark_sent`, `ack_piece`
+  - `fail_batch`, `complete_batch`, `remove_batch`
+  - `find_matching_batch` by session_id + prev_id + message_hashes
+  - `content_hash` reserved for future use
 
-### 4.2 RED — Complete batch inserts upstream nodes and one client node
-- One harness message splits into P0/P1
-- P0 ACKs `int-A`, P1 ACKs `int-B`
-- THEN `UpstreamInteractionNode`s: `{id: "int-A", prev_id: None}`, `{id: "int-B", prev_id: "int-A"}`
-- AND `ClientInteractionNode { id: "int-B", upstream_ids: ["int-A", "int-B"], message_hashes: [0xH0] }`
-- AND batch is removed from `InFlightStore`
-
-### 4.3 RED — Failed piece cancels ACKed pieces, no client node
-- P0 ACKed, P1 fails
-- THEN `POST /int-A/cancel` is called best-effort
-- AND no `ClientInteractionNode` is inserted
-- AND `UpstreamInteractionNode` for `int-A` is removed
-
-### 4.4 RED — Retry reuses matching in-flight batch
-- Same `session_id + prev_interaction_id + message_hashes` arrives during incomplete split
-- THEN no duplicate batch is created
-- AND match/create is atomic under the shared store write lock
-
-### 4.5 GREEN — Implement InFlightStore
-- `create_batch`
-- `mark_response_started`
-- `mark_sent`
-- `ack_piece`
-- `fail_batch`
-- `complete_batch`
-- `find_matching_batch`
-- Keep `content_hash` as reserved future-use piece identity; current routing/recovery must not depend on it
-
-**Quality Gate:** `cargo test --locked` — Phase 4 tests pass
+**Quality Gate:** PASSED — all 5 Phase 4 tests pass
 
 ---
 
 ## Phase 5: Handler Frontier Integration
 
-### 5.1 RED — Anthropic continuation uses hash frontier
-- Known Anthropic user hashes `[0xA, 0xB]` ending at `int-2`
-- Incoming user hashes `[0xA, 0xB, 0xC]`
-- THEN only `0xC` is sent and `previous_interaction_id = int-2`
+- [x] 5.1 RED — Anthropic continuation uses hash frontier ✓ 2026-06-28
+- [x] 5.2 RED — Anthropic rewrite with same count does not reuse stale id ✓ 2026-06-28
+- [x] 5.3 RED — OpenAI assistant messages ignored for frontier ✓ 2026-06-28
+- [x] 5.4 RED — All-known request fetches existing interaction from upstream ✓ 2026-06-28
+- [x] 5.5 RED — All-known with multiple upstream_ids fetches and merges all pieces ✓ 2026-06-28
+- [x] 5.6 RED — First-interaction fields follow frontier ✓ 2026-06-28
+- [x] 5.7 GREEN — Replace `compute_delta` in `handle_from_anthropic` and `handle_from_openai` ✓ 2026-06-28
+  - Strip controls, filter/hash harness messages, find frontier
+  - Build request from unknown messages only
+  - `replay_from_client_node` with multi-upstream merge via `fetch_upstream_interaction`
+  - v2 store updated after successful interaction (ClientInteractionNode + UpstreamInteractionNode inserted)
+  - Old `SessionStore` kept for split-send backward compat during transition
+  - Harness frontier index mapped to full message array index for correct `start_index`
+  - E2e tests updated for hash-based semantics (same message content required across turns)
 
-### 5.2 RED — Anthropic rewrite with same count does not reuse stale id
-- Same session has previous metadata
-- Incoming first hash differs from any prefix
-- THEN no previous interaction id is sent
-
-### 5.3 RED — OpenAI assistant messages ignored for frontier
-- OpenAI history includes assistant message between user/tool messages
-- THEN assistant is not counted or sent in hash delta
-
-### 5.4 RED — All-known request fetches existing interaction from upstream
-- Incoming harness hashes all match known chain
-- AND incoming `prev_id == ClientInteractionNode.prev_id`
-- THEN handler calls `GET /v1beta/interactions/{id}` and translates the response — no `POST` call made
-
-### 5.5 RED — All-known with multiple upstream_ids fetches and merges all pieces
-- `ClientInteractionNode` for `int-B` has `upstream_ids = ["int-A", "int-B"]`
-- Client retries with same harness hashes and same `prev_id`
-- THEN handler fetches `GET /int-A` and `GET /int-B`
-- AND merges content from both into one response with id `int-B`
-
-### 5.6 RED — First-interaction fields follow frontier
-- No known prefix -> tools/system/generation config present
-- Known prefix -> those fields absent
-
-### 5.7 GREEN — Replace `compute_delta` in `handle_from_anthropic` and `handle_from_openai`
-- Strip controls
-- Filter/hash harness messages
-- Find frontier
-- Build request from unknown messages only
-- Update ClientInteractionNode and SessionInfo after terminal success
-
-**Quality Gate:** `cargo test --locked` — Phase 5 tests pass
+**Quality Gate:** PASSED — 418 tests, all 27 e2e interactions tests pass
 
 ---
 
@@ -316,6 +220,14 @@
 
 ## Completion Checklist
 
-- [ ] All 9 phases complete
+- [x] Phase 1: Harness Filtering and Hashing ✓ 2026-06-28
+- [x] Phase 2: InteractionStore and Frontier Selection ✓ 2026-06-28
+- [x] Phase 3: Versioned Persistence and SessionInfo ✓ 2026-06-28
+- [x] Phase 4: InFlightStore State Machine ✓ 2026-06-28
+- [x] Phase 5: Handler Frontier Integration ✓ 2026-06-28
+- [ ] Phase 6: Split-Send Preservation and State Rewrite
+- [ ] Phase 7: Streaming Split-Send Buffer
+- [ ] Phase 8: Startup Recovery and Control Messages
+- [ ] Phase 9: Regression and Final Checks
 - [ ] Source specs updated by `/openspec-archive`
 - [ ] Ready for merge

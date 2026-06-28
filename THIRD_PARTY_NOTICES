@@ -115,6 +115,13 @@ SPDX-License-Identifier: BSD-3-Clause/MIT
   - brotli-decompressor 5.0.0
 
 ---
+SPDX-License-Identifier: BSL-1.0
+
+(1 crates)
+
+  - xxhash-rust 0.8.15
+
+---
 SPDX-License-Identifier: bzip2-1.0.6
 
 (1 crates)

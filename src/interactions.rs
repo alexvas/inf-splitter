@@ -854,6 +854,55 @@ fn extract_openai_system(messages: &[serde_json::Value]) -> Option<String> {
         })
 }
 
+/// Filter harness-originated messages from the full message list.
+///
+/// Stateless protocols (Anthropic Messages, OpenAI Chat Completions) resend
+/// both harness-originated and LLM-originated history. Only harness-originated
+/// messages drive upstream deltas.
+///
+/// | Protocol | Kept | Discarded |
+/// |----------|------|-----------|
+/// | Anthropic Messages | `user` role, including `tool_result` blocks | `assistant` |
+/// | OpenAI Chat Completions | `system`, `developer`, `user`, `tool` | `assistant` |
+pub fn filter_harness_messages(
+    messages: &[serde_json::Value],
+    protocol: Protocol,
+) -> Vec<serde_json::Value> {
+    match protocol {
+        Protocol::Anthropic => messages
+            .iter()
+            .filter(|m| {
+                m.get("role")
+                    .and_then(|r| r.as_str())
+                    .map(|r| r == "user")
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect(),
+        Protocol::OpenAi => messages
+            .iter()
+            .filter(|m| {
+                m.get("role")
+                    .and_then(|r| r.as_str())
+                    .map(|r| matches!(r, "system" | "developer" | "user" | "tool"))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Compute the xxh3-64 hash of a harness message.
+///
+/// Hash input is `serde_json::to_vec(message)` from the parsed
+/// `serde_json::Value` — the **full** message `Value` (all fields
+/// including `role`, `content`, nested `tool_result` blocks) is
+/// serialized and hashed, not extracted text.
+pub fn hash_harness_message(message: &serde_json::Value) -> u64 {
+    let bytes = serde_json::to_vec(message).unwrap_or_default();
+    xxhash_rust::xxh3::xxh3_64(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1676,5 +1725,78 @@ mod tests {
             Content::TextContent(tc) => assert_eq!(tc.text, "a\nb"),
             other => panic!("expected TextContent, got {:?}", other),
         }
+    }
+
+    // --- Phase 1: Harness filtering and hashing ---
+
+    #[test]
+    fn filter_harness_messages_anthropic_keeps_user_only() {
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({"role": "assistant", "content": "Hi there"}),
+            serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "result"}]}),
+        ];
+        let filtered = filter_harness_messages(&msgs, Protocol::Anthropic);
+        assert_eq!(filtered.len(), 2, "must keep two user messages");
+        assert_eq!(filtered[0]["role"], "user");
+        assert_eq!(filtered[1]["role"], "user");
+    }
+
+    #[test]
+    fn filter_harness_messages_openai_keeps_harness_roles() {
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "Be helpful"}),
+            serde_json::json!({"role": "developer", "content": "Use tools"}),
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({"role": "assistant", "content": "Hi"}),
+            serde_json::json!({"role": "tool", "content": "result"}),
+        ];
+        let filtered = filter_harness_messages(&msgs, Protocol::OpenAi);
+        assert_eq!(filtered.len(), 4, "must keep system, developer, user, tool");
+        let roles: Vec<&str> = filtered.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["system", "developer", "user", "tool"]);
+        // assistant must not be present
+        assert!(!filtered.iter().any(|m| m["role"] == "assistant"));
+    }
+
+    #[test]
+    fn hash_harness_message_is_deterministic() {
+        let msg = serde_json::json!({"role": "user", "content": "hello"});
+        let h1 = hash_harness_message(&msg);
+        let h2 = hash_harness_message(&msg);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_harness_message_different_content_different_hash() {
+        let a = serde_json::json!({"role": "user", "content": "hello"});
+        let b = serde_json::json!({"role": "user", "content": "world"});
+        assert_ne!(hash_harness_message(&a), hash_harness_message(&b));
+    }
+
+    #[test]
+    fn hash_harness_message_includes_all_fields() {
+        // Two messages with same text but different role must differ
+        let a = serde_json::json!({"role": "user", "content": "hello"});
+        let b = serde_json::json!({"role": "system", "content": "hello"});
+        assert_ne!(hash_harness_message(&a), hash_harness_message(&b));
+    }
+
+    #[test]
+    fn control_stripped_before_hashing() {
+        // Given: one control-like message and one user message
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "control message"}),
+            serde_json::json!({"role": "user", "content": "real message"}),
+        ];
+        // Simulate control stripping: only the second message remains
+        let filtered: Vec<_> = msgs.iter().skip(1).cloned().collect();
+        let hashes: Vec<u64> = filtered.iter().map(|m| hash_harness_message(m)).collect();
+        assert_eq!(hashes.len(), 1);
+        // The stripped message must NOT participate in hashing
+        assert_eq!(
+            hashes[0],
+            hash_harness_message(&serde_json::json!({"role": "user", "content": "real message"}))
+        );
     }
 }

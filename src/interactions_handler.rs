@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -15,6 +16,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
+use tokio::sync::RwLock;
 
 use crate::auth::{is_auth_header, should_forward_request_header};
 use crate::config::{Config, Protocol, RouteTarget};
@@ -26,7 +28,7 @@ use crate::interactions_types::{
     CreateModelInteractionParams, Interaction, InteractionSseEvent, InteractionsInput, Step,
     StepDeltaData,
 };
-use crate::session::SessionStore;
+use crate::session::{self, SessionStore, StoreV2};
 use crate::sse;
 use anyllm_translate::anthropic::{ContentBlock, MessageResponse, Role, StopReason, Usage};
 use anyllm_translate::openai::{
@@ -57,6 +59,8 @@ pub struct InteractionsHandler {
     clients: HashMap<String, HttpClient>,
     diagnostics: Diagnostics,
     session_store: Arc<SessionStore>,
+    v2_store: Arc<RwLock<StoreV2>>,
+    v2_path: Arc<PathBuf>,
     error_translation: Arc<[crate::config::ErrorTranslationRule]>,
 }
 
@@ -65,11 +69,15 @@ impl InteractionsHandler {
         config: &Config,
         diagnostics: Diagnostics,
         session_store: Arc<SessionStore>,
+        v2_store: Arc<RwLock<StoreV2>>,
+        v2_path: PathBuf,
     ) -> Result<Self, AppError> {
         Ok(Self {
             clients: crate::build_client_map(config)?,
             diagnostics,
             session_store,
+            v2_store,
+            v2_path: Arc::new(v2_path),
             error_translation: config.error_translation.clone().into(),
         })
     }
@@ -124,18 +132,49 @@ impl InteractionsHandler {
                 .await;
         }
 
-        // Get session state for delta computation (Anthropic ingress)
-        let session = self.session_store.get_or_create(&session_id).await;
-        let delivered = session.message_count;
-        let incoming_count = messages.len() - control_result.stripped_count;
-        let (start_index, new_count) = crate::session::compute_delta(delivered, incoming_count);
-
-        // Use cleaned messages (control messages removed) for the upstream request
+        // Get session state via v2 frontier (Anthropic ingress)
         let cleaned_messages = if control_result.stripped_count > 0 {
             control_result.cleaned_messages
         } else {
             messages
         };
+
+        // Ensure session exists in old store for backward compat
+        let _ = self.session_store.get_or_create(&session_id).await;
+
+        // Filter harness messages (Anthropic: user only) and hash them
+        let harness = interactions_lib::filter_harness_messages(&cleaned_messages, Protocol::Anthropic);
+        let hashes: Vec<u64> = harness
+            .iter()
+            .map(|m| interactions_lib::hash_harness_message(m))
+            .collect();
+
+        let frontier = {
+            let store = self.v2_store.read().await;
+            session::find_frontier(&hashes, None, &store.interactions)
+        };
+
+        // If all messages are known, replay from upstream
+        if frontier.all_known {
+            if let Some(ref client_id) = frontier.matched_client_id {
+                let guard2 =
+                    crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, &model);
+                return self
+                    .replay_from_client_node(
+                        client_id,
+                        route,
+                        &session_id,
+                        &model,
+                        Protocol::Anthropic,
+                        request_headers,
+                        guard2,
+                    )
+                    .await;
+            }
+        }
+
+        // Build prev_id from frontier
+        let prev_id = frontier.previous_interaction_id.as_deref();
 
         // Extract typed scalars from ingress body
         let stream = body_val
@@ -150,48 +189,31 @@ impl InteractionsHandler {
         let system = interactions_lib::extract_anthropic_system(&body_val);
         let (tools, tool_choice) = interactions_lib::extract_anthropic_tools(&body_val);
 
-        let prev_id = if start_index == 0 {
-            // Context reset — client started fresh conversation.
-            // Clear previous_interaction_id so the upstream creates a new interaction.
-            None
-        } else if session.interaction_id.is_empty() {
-            None
-        } else {
-            Some(session.interaction_id.as_str())
-        };
-
-        // Zero messages on a new session: nothing to send and no
-        // interaction to replay. Sending empty input upstream is invalid.
-        if incoming_count == 0 && prev_id.is_none() {
+        // Zero harness messages on a new chain: nothing to send
+        if harness.is_empty() && prev_id.is_none() {
             return Err(AppError::BadRequest(
                 "empty messages on new session".to_string(),
             ));
         }
 
-        // Exact retry — all messages already delivered. Replay existing interaction.
-        if start_index == incoming_count {
-            if let Some(pid) = prev_id {
-                return self
-                    .replay_interaction(
-                        pid,
-                        route,
-                        &session_id,
-                        &model,
-                        Protocol::Anthropic,
-                        request_headers,
-                        guard,
-                    )
-                    .await;
+        // Map harness frontier index to full message array index
+        let start_index = {
+            let mut harness_count = 0usize;
+            let mut full_idx = 0usize;
+            for (i, msg) in cleaned_messages.iter().enumerate() {
+                if harness_count >= frontier.index {
+                    full_idx = i;
+                    break;
+                }
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role == "user" {
+                    harness_count += 1;
+                }
+                full_idx = i + 1;
             }
-            // All messages delivered but no interaction_id to replay —
-            // session state was lost or never persisted. Sending an empty
-            // ContentList upstream is invalid.
-            return Err(AppError::Internal(
-                "session has no interaction_id for replay".to_string(),
-            ));
-        }
-
-        // Build the request (Anthropic ingress)
+            full_idx
+        };
+        let new_count = harness.len(); // total harness messages (for split-send compatibility)
         let params = interactions_lib::build_interactions_request_anthropic(
             &cleaned_messages,
             start_index,
@@ -277,6 +299,7 @@ impl InteractionsHandler {
             route,
             &session_id,
             new_count,
+            hashes.clone(),
             stream,
             &model,
             endpoint,
@@ -331,17 +354,49 @@ impl InteractionsHandler {
                 .await;
         }
 
-        let session = self.session_store.get_or_create(&session_id).await;
-        let delivered = session.message_count;
-        let incoming_count = messages.len() - control_result.stripped_count;
-        let (start_index, new_count) = crate::session::compute_delta(delivered, incoming_count);
-
-        // Use cleaned messages (control messages removed) for the upstream request
+        // Get session state via v2 frontier (OpenAI ingress)
         let cleaned_messages = if control_result.stripped_count > 0 {
             control_result.cleaned_messages
         } else {
             messages
         };
+
+        // Ensure session exists in old store for backward compat
+        let _ = self.session_store.get_or_create(&session_id).await;
+
+        // Filter harness messages (OpenAI: system, developer, user, tool) and hash them
+        let harness = interactions_lib::filter_harness_messages(&cleaned_messages, Protocol::OpenAi);
+        let hashes: Vec<u64> = harness
+            .iter()
+            .map(|m| interactions_lib::hash_harness_message(m))
+            .collect();
+
+        let frontier = {
+            let store = self.v2_store.read().await;
+            session::find_frontier(&hashes, None, &store.interactions)
+        };
+
+        // If all messages are known, replay from upstream
+        if frontier.all_known {
+            if let Some(ref client_id) = frontier.matched_client_id {
+                let guard2 =
+                    crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, &model);
+                return self
+                    .replay_from_client_node(
+                        client_id,
+                        route,
+                        &session_id,
+                        &model,
+                        Protocol::OpenAi,
+                        request_headers,
+                        guard2,
+                    )
+                    .await;
+            }
+        }
+
+        // Build prev_id from frontier
+        let prev_id = frontier.previous_interaction_id.as_deref();
 
         // Extract typed scalars from ingress body
         let stream = body_val
@@ -356,43 +411,31 @@ impl InteractionsHandler {
             .map(clamp_max_tokens);
         let (tools, tool_choice) = interactions_lib::extract_openai_tools(&body_val);
 
-        let prev_id = if start_index == 0 {
-            // Context reset — client started fresh conversation.
-            None
-        } else if session.interaction_id.is_empty() {
-            None
-        } else {
-            Some(session.interaction_id.as_str())
-        };
-
-        // Zero messages on a new session: nothing to send and no
-        // interaction to replay.
-        if incoming_count == 0 && prev_id.is_none() {
+        // Zero harness messages on a new chain: nothing to send
+        if harness.is_empty() && prev_id.is_none() {
             return Err(AppError::BadRequest(
                 "empty messages on new session".to_string(),
             ));
         }
 
-        // Exact retry — all messages already delivered. Replay existing interaction.
-        if start_index == incoming_count {
-            if let Some(pid) = prev_id {
-                return self
-                    .replay_interaction(
-                        pid,
-                        route,
-                        &session_id,
-                        &model,
-                        Protocol::OpenAi,
-                        request_headers,
-                        guard,
-                    )
-                    .await;
+        // Map harness frontier index to full message array index
+        let start_index = {
+            let mut harness_count = 0usize;
+            let mut full_idx = 0usize;
+            for (i, msg) in cleaned_messages.iter().enumerate() {
+                if harness_count >= frontier.index {
+                    full_idx = i;
+                    break;
+                }
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if matches!(role, "system" | "developer" | "user" | "tool") {
+                    harness_count += 1;
+                }
+                full_idx = i + 1;
             }
-            return Err(AppError::Internal(
-                "session has no interaction_id for replay".to_string(),
-            ));
-        }
-
+            full_idx
+        };
+        let new_count = harness.len();
         let params = interactions_lib::build_interactions_request_openai(
             &cleaned_messages,
             start_index,
@@ -463,6 +506,7 @@ impl InteractionsHandler {
             route,
             &session_id,
             new_count,
+            hashes.clone(),
             stream,
             &model,
             endpoint,
@@ -473,6 +517,134 @@ impl InteractionsHandler {
             guard,
         )
         .await
+    }
+
+    /// Fetch and translate existing interaction(s) via client node.
+    /// Handles both single upstream and multi-upstream (split-send) replays.
+    async fn replay_from_client_node(
+        &self,
+        client_id: &str,
+        route: &RouteTarget,
+        session_id: &str,
+        model: &str,
+        ingress: Protocol,
+        _request_headers: &HeaderMap,
+        guard: crate::diagnostics::RequestDiagnostics,
+    ) -> Result<Response, AppError> {
+        let client_node = {
+            let store = self.v2_store.read().await;
+            store.interactions.get_client(client_id).cloned()
+        };
+        let client_node = match client_node {
+            Some(n) => n,
+            None => {
+                return Err(guard.abort_internal(
+                    0, 0, "replay-from-client", "replay", false,
+                    format!("client node {client_id} not found"),
+                ));
+            }
+        };
+
+        let upstream_ids = client_node.upstream_ids.clone();
+
+        // Fetch all upstream interactions and collect steps
+        let mut all_steps: Vec<Step> = Vec::new();
+        let mut final_id = String::new();
+        let mut total_input_tokens: i64 = 0;
+        let mut total_output_tokens: i64 = 0;
+
+        for upstream_id in &upstream_ids {
+            let interaction = self
+                .fetch_upstream_interaction(upstream_id, route, model, &guard)
+                .await?;
+            if let Some(steps) = &interaction.steps {
+                all_steps.extend(steps.clone());
+            }
+            final_id = interaction.id.clone();
+            if let Some(ref usage) = interaction.usage {
+                total_input_tokens = usage.total_input_tokens.unwrap_or(0);
+                total_output_tokens = usage.total_output_tokens.unwrap_or(0);
+            }
+        }
+
+        // Build merged interaction
+        let merged = Interaction {
+            id: final_id.clone(),
+            status: "completed".to_string(),
+            created: None,
+            updated: None,
+            steps: Some(all_steps),
+            model: Some(model.to_string()),
+            usage: Some(crate::interactions_types::Usage {
+                total_tokens: Some(total_input_tokens + total_output_tokens),
+                total_input_tokens: Some(total_input_tokens),
+                total_output_tokens: Some(total_output_tokens),
+                cached_tokens_by_modality: None,
+                grounding_tool_count: None,
+                input_tokens_by_modality: None,
+                output_tokens_by_modality: None,
+                tool_use_tokens_by_modality: None,
+                total_cached_tokens: None,
+                total_thought_tokens: None,
+                total_tool_use_tokens: None,
+            }),
+            ..Default::default()
+        };
+
+        let response_json =
+            interactions_lib::build_response_from_interaction(&merged, model, ingress)
+                .map_err(|e| guard.abort_internal(0, 0, "replay-from-client", "replay", false, e))?;
+        guard.finish(200, 0, 0, None, "replay-from-client", "replay", false);
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(Self::session_header_name(ingress), session_id)
+            .body(Body::from(
+                serde_json::to_vec(&response_json)
+                    .map_err(|e| AppError::Internal(e.to_string()))?,
+            ))
+            .map_err(|err| AppError::Internal(err.to_string()))
+    }
+
+    /// Fetch a single upstream interaction via GET.
+    async fn fetch_upstream_interaction(
+        &self,
+        interaction_id: &str,
+        route: &RouteTarget,
+        _model: &str,
+        guard: &crate::diagnostics::RequestDiagnostics,
+    ) -> Result<Interaction, AppError> {
+        let url = build_interaction_url(route, &format!("/{interaction_id}"));
+        let start = std::time::Instant::now();
+        let builder = build_interactions_headers(
+            self.get_client(route.proxy.as_deref()).get(&url),
+            route.api_key.as_deref(),
+            &HeaderMap::new(),
+        );
+        let upstream = builder.send().await.map_err(|e| {
+            let dur = start.elapsed().as_millis() as u64;
+            guard.abort_upstream(dur, 0, &url, "fetch-interaction", false, e)
+        })?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        if !upstream.status().is_success() {
+            let status = upstream.status();
+            let error_body = upstream.text().await.unwrap_or_default();
+            return Err(guard.abort_upstream(
+                duration_ms, 0, &url, "fetch-interaction", false,
+                format!("HTTP {} fetching interaction {}: {}", status.as_u16(), interaction_id, error_body),
+            ));
+        }
+
+        let body_bytes = upstream.bytes().await.map_err(|e| {
+            guard.abort_upstream(duration_ms, 0, &url, "fetch-interaction", false, e)
+        })?;
+        let validated = crate::validate_upstream_body(body_bytes, guard.request_id())
+            .map_err(|(e, _)| {
+                guard.abort_upstream(duration_ms, 0, &url, "fetch-interaction", false, e)
+            })?;
+        serde_json::from_str(&validated.text)
+            .map_err(|e| guard.abort_internal(duration_ms, 0, &url, "fetch-interaction", false, e))
     }
 
     /// Fetch and translate an existing interaction (exact retry recovery).
@@ -578,6 +750,7 @@ impl InteractionsHandler {
         route: &RouteTarget,
         session_id: &str,
         new_count: usize,
+        harness_hashes: Vec<u64>,
         stream: bool,
         model: &str,
         upstream_label: &str,
@@ -701,10 +874,10 @@ impl InteractionsHandler {
             }
         };
 
-        // Update session
+        // Update session (old store for backward compat)
         let interaction_id = interaction.id.clone();
         self.session_store
-            .update(session_id, interaction_id, new_count, false)
+            .update(session_id, interaction_id.clone(), new_count, false)
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -714,6 +887,45 @@ impl InteractionsHandler {
                 );
                 AppError::Internal(format!("session update failed: {e}"))
             })?;
+
+        // Store in v2 interaction tree
+        {
+            let mut store = self.v2_store.write().await;
+            let now = crate::session::unix_now();
+            store.interactions.insert_upstream(
+                crate::session::UpstreamInteractionNode {
+                    id: interaction_id.clone(),
+                    prev_id: None, // The caller's prev_id drives this in the full rewrite
+                    client_id: session_id.to_string(),
+                    last_seen_utc: now,
+                    expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
+                },
+            );
+            store.interactions.insert_client(
+                crate::session::ClientInteractionNode {
+                    id: interaction_id.clone(),
+                    prev_id: None,
+                    message_hashes: harness_hashes.clone(),
+                    system_instruction_hash: None,
+                    upstream_ids: vec![interaction_id.clone()],
+                    last_seen_utc: now,
+                },
+            );
+            store.sessions.entry(session_id.to_string())
+                .and_modify(|s| {
+                    s.last_interaction_id = Some(interaction_id.clone());
+                    s.last_seen_utc = now;
+                })
+                .or_insert_with(|| crate::session::SessionInfo {
+                    client_session_id: session_id.to_string(),
+                    last_interaction_id: Some(interaction_id.clone()),
+                    last_seen_utc: now,
+                    expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
+                });
+            if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                tracing::warn!(error = %e, "v2 store save failed after successful interaction");
+            }
+        }
 
         // Translate response back to ingress protocol
         let resp =
@@ -3696,10 +3908,11 @@ If you don't know the answer, say so honestly.";
         )
         .expect("test config");
         let diagnostics = Diagnostics::new(DiagnosticsConfig::default());
-        let session_store = Arc::new(SessionStore::new(
-            std::env::temp_dir().join("test-resolve-session-id.toml"),
-        ));
-        InteractionsHandler::new(&config, diagnostics, session_store).expect("build handler")
+        let tmp_path = std::env::temp_dir().join("test-resolve-session-id.toml");
+        let session_store = Arc::new(SessionStore::new(tmp_path.clone()));
+        let v2_store = Arc::new(tokio::sync::RwLock::new(StoreV2::new()));
+        InteractionsHandler::new(&config, diagnostics, session_store, v2_store, tmp_path)
+            .expect("build handler")
     }
 
     #[tokio::test]

@@ -842,6 +842,15 @@ impl StoreV2 {
         sessions
     }
 
+    /// Remove all in-flight batches without completing them.
+    /// Used on startup to discard stale state carried over
+    /// from unclean previous shutdown.
+    pub fn discard_all_inflight(&mut self) -> usize {
+        let count = self.in_flight.len();
+        self.in_flight.clear();
+        count
+    }
+
     /// Update session and current interaction node last_seen_utc timestamps.
     pub fn extend_lifetime(&mut self, session_id: &str, expires_at_utc: u64) {
         let now = unix_now();
@@ -1725,5 +1734,175 @@ mod tests {
         // Current interaction node's last_seen_utc updated
         let client_node = &store.interactions.clients["int-A"];
         assert!(client_node.last_seen_utc > 0);
+    }
+
+    // ── Startup cleanup tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn startup_discards_non_fully_acked_batches() {
+        let path = test_path("startup-discard");
+
+        // Persist v2 store with two batches: one fully-acked, one with Pending piece
+        {
+            let mut store = StoreV2::new();
+            store.create_batch(
+                "batch-A".into(),
+                "s1".into(),
+                None,
+                vec![0xAA],
+                None,
+                vec![InFlightPiece {
+                    index: 0,
+                    content_hash: 0,
+                    request_body: vec![],
+                    status: InFlightStatus::Acked {
+                        interaction_id: "int-1".into(),
+                    },
+                }],
+            );
+            store.create_batch(
+                "batch-B".into(),
+                "s2".into(),
+                None,
+                vec![0xBB],
+                None,
+                vec![InFlightPiece {
+                    index: 0,
+                    content_hash: 0,
+                    request_body: vec![],
+                    status: InFlightStatus::Pending,
+                }],
+            );
+            store.save_to_disk(&path).await.unwrap();
+        }
+
+        // Act: startup cleanup (simulate load + two-pass)
+        let mut store = StoreV2::load_from_disk(&path).await.unwrap();
+
+        // Pass 1: complete fully-acked
+        let batch_ids: Vec<String> = store.in_flight.keys().cloned().collect();
+        let mut completed = 0usize;
+        for batch_id in &batch_ids {
+            let all_acked = store.in_flight.get(batch_id).is_some_and(|b| {
+                b.pieces
+                    .iter()
+                    .all(|p| matches!(p.status, InFlightStatus::Acked { .. }))
+            });
+            if all_acked {
+                let _ = store.complete_batch(batch_id);
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 1, "batch-A must be completed");
+
+        // Pass 2: discard rest (batch-B still present after batch-A completed)
+        let discarded = store.discard_all_inflight();
+        assert_eq!(discarded, 1, "batch-B must be discarded");
+
+        // Assert: all in-flight removed
+        assert!(
+            store.in_flight.is_empty(),
+            "all in-flight batches must be removed after startup cleanup"
+        );
+        // batch-A completed → ClientInteractionNode created
+        assert!(
+            store.interactions.clients.contains_key("int-1"),
+            "fully-acked batch-A must produce ClientInteractionNode"
+        );
+        // batch-B was discarded (not completed) → no ClientInteractionNode for it
+        // batch-B had Pending piece, never produced an upstream interaction_id
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_removes_failed_batches() {
+        let path = test_path("startup-failed");
+
+        {
+            let mut store = StoreV2::new();
+            store.create_batch(
+                "batch-F".into(),
+                "s1".into(),
+                None,
+                vec![0xCC],
+                None,
+                vec![InFlightPiece {
+                    index: 0,
+                    content_hash: 0,
+                    request_body: vec![],
+                    status: InFlightStatus::Failed {
+                        error: "timeout".into(),
+                    },
+                }],
+            );
+            store.save_to_disk(&path).await.unwrap();
+        }
+
+        let mut store = StoreV2::load_from_disk(&path).await.unwrap();
+
+        // Pass 1: nothing to complete (Failed != Acked)
+        let batch_ids: Vec<String> = store.in_flight.keys().cloned().collect();
+        for batch_id in &batch_ids {
+            let all_acked = store.in_flight.get(batch_id).is_some_and(|b| {
+                b.pieces
+                    .iter()
+                    .all(|p| matches!(p.status, InFlightStatus::Acked { .. }))
+            });
+            assert!(!all_acked, "Failed batch must not be all-acked");
+        }
+
+        // Pass 2: discard
+        let discarded = store.discard_all_inflight();
+        assert_eq!(discarded, 1, "failed batch must be discarded");
+        assert!(
+            store.in_flight.is_empty(),
+            "failed batches must be discarded on startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_does_not_touch_committed_interactions() {
+        let path = test_path("startup-committed");
+
+        {
+            let mut store = StoreV2::new();
+            // Already-committed ClientInteractionNode (not via in_flight)
+            store.interactions.insert_client(ClientInteractionNode {
+                id: "existing-id".into(),
+                prev_id: None,
+                message_hashes: vec![0x11],
+                system_instruction_hash: None,
+                upstream_ids: vec!["up-1".into()],
+                last_seen_utc: 1,
+            });
+            store.sessions.insert(
+                "s-ok".into(),
+                SessionInfo {
+                    client_session_id: "s-ok".into(),
+                    last_interaction_id: Some("existing-id".into()),
+                    last_seen_utc: 1,
+                    expires_at_utc: 999999,
+                },
+            );
+            store.save_to_disk(&path).await.unwrap();
+        }
+
+        let mut store = StoreV2::load_from_disk(&path).await.unwrap();
+
+        // Pass 1: no batches
+        let batch_ids: Vec<String> = store.in_flight.keys().cloned().collect();
+        assert!(batch_ids.is_empty(), "no in-flight batches");
+
+        // Pass 2: discard (no-op)
+        let discarded = store.discard_all_inflight();
+        assert_eq!(discarded, 0);
+
+        assert!(
+            store.interactions.clients.contains_key("existing-id"),
+            "committed interactions survive startup cleanup"
+        );
+        assert!(
+            store.sessions.contains_key("s-ok"),
+            "committed session metadata survives startup cleanup"
+        );
     }
 }

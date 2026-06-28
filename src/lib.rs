@@ -313,66 +313,49 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
         v2_path.clone(),
     )?;
 
-    // Recover in-flight batches from v2 store after unclean shutdown.
-    // ResponseStarted pieces have no interaction_id to probe — mark Failed.
-    // Sent/Pending pieces are left for manual or client-triggered recovery:
-    // on next client request with matching message_hashes, the handler
-    // will find the batch and resume or wait for completion.
+    // Startup: complete fully-acked batches, discard all other stale in-flight state.
+    // No re-fetch, no resend, no probe. Client retry will hit frontier from
+    // last committed ClientInteractionNode. Stale in-flight state carried over
+    // from previous run serves no purpose without an active client request.
     {
         let mut v2 = v2_store.write().await;
         let batch_ids: Vec<String> = v2.in_flight.keys().cloned().collect();
-        let mut recovered = 0usize;
-        let mut resp_started = 0usize;
-        let mut pending = 0usize;
-        let mut sent = 0usize;
-        let mut all_acked = 0usize;
+
+        // Pass 1: complete all fully-acked batches
+        let mut completed = 0usize;
         for batch_id in &batch_ids {
-            let all_acked_now = v2.in_flight.get(batch_id).is_some_and(|b| {
+            let all_acked = v2.in_flight.get(batch_id).is_some_and(|b| {
                 b.pieces
                     .iter()
                     .all(|p| matches!(p.status, InFlightStatus::Acked { .. }))
             });
-            if all_acked_now {
+            if all_acked {
                 match v2.complete_batch(batch_id) {
                     Ok(node) => {
                         tracing::info!(
                             batch_id = %batch_id,
                             client_id = %node.id,
-                            "recovered in-flight batch: all pieces acked, batch completed"
+                            "startup: completed fully-acked batch"
                         );
-                        all_acked += 1;
+                        completed += 1;
                     }
                     Err(e) => {
                         tracing::warn!(
                             batch_id = %batch_id,
                             error = %e,
-                            "failed to complete fully-acked in-flight batch"
+                            "startup: complete_batch failed, discarding"
                         );
-                    }
-                }
-                recovered += 1;
-                continue;
-            }
-            // Count non-terminal pieces
-            if let Some(batch) = v2.in_flight.get(batch_id) {
-                for piece in &batch.pieces {
-                    match piece.status {
-                        InFlightStatus::ResponseStarted => resp_started += 1,
-                        InFlightStatus::Pending => pending += 1,
-                        InFlightStatus::Sent { .. } => sent += 1,
-                        _ => {}
+                        v2.in_flight.remove(batch_id);
                     }
                 }
             }
         }
-        if recovered > 0 || resp_started > 0 || pending > 0 || sent > 0 {
-            tracing::info!(
-                recovered_completed = all_acked,
-                pending_pieces = pending,
-                sent_pieces = sent,
-                response_started_pieces = resp_started,
-                "v2 in-flight batch recovery: ResponseStarted pieces will be marked Failed on next persistence cycle"
-            );
+
+        // Pass 2: discard everything still in in_flight
+        let discarded = v2.discard_all_inflight();
+
+        if completed > 0 || discarded > 0 {
+            tracing::info!(completed, discarded, "startup: in-flight cleanup done");
         }
         if !batch_ids.is_empty() {
             let _ = v2.save_to_disk(&v2_path).await;

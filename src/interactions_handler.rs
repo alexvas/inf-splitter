@@ -579,6 +579,16 @@ impl InteractionsHandler {
             let interaction = self
                 .fetch_upstream_interaction(upstream_id, route, model, &guard)
                 .await?;
+
+            // Update last_seen_utc on the upstream node (spec: every GET replay)
+            {
+                let mut store = self.v2_store.write().await;
+                store.interactions.touch_upstream_on_replay(upstream_id);
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "save after replay touch");
+                }
+            }
+
             if let Some(steps) = &interaction.steps {
                 all_steps.extend(steps.clone());
             }

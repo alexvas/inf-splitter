@@ -155,6 +155,14 @@ impl InteractionStore {
         self.upstreams.insert(node.id.clone(), node);
     }
 
+    /// Update last_seen_utc on an upstream interaction node during replay.
+    /// Called after every GET fetch that traverses this upstream node.
+    pub fn touch_upstream_on_replay(&mut self, upstream_id: &str) {
+        if let Some(node) = self.upstreams.get_mut(upstream_id) {
+            node.last_seen_utc = unix_now();
+        }
+    }
+
     pub fn insert_client(&mut self, node: ClientInteractionNode) {
         // Index every message_hash position
         for (idx, &hash) in node.message_hashes.iter().enumerate() {
@@ -1904,5 +1912,41 @@ mod tests {
             store.sessions.contains_key("s-ok"),
             "committed session metadata survives startup cleanup"
         );
+    }
+
+    /// RED: upstream node last_seen_utc is NOT updated on replay fetch.
+    /// Spec says "UpstreamInteractionNode.last_seen_utc is updated on
+    /// creation and on every GET replay that traverses this node."
+    #[tokio::test]
+    async fn replay_updates_upstream_node_last_seen_utc() {
+        let path =
+            std::env::temp_dir().join(format!("test-replay-touch-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Insert upstream node with old timestamp
+        {
+            let mut store = StoreV2::new();
+            store.interactions.insert_upstream(UpstreamInteractionNode {
+                id: "up-1".into(),
+                prev_id: None,
+                client_id: "session-1".into(),
+                last_seen_utc: 100,
+                expires_at_utc: 999999,
+            });
+            store.save_to_disk(&path).await.unwrap();
+        }
+
+        // Reload and touch on replay
+        let mut store = StoreV2::load_from_disk(&path).await.unwrap();
+        store.interactions.touch_upstream_on_replay("up-1");
+
+        // GREEN: last_seen_utc updated by touch_upstream_on_replay
+        let node = store.interactions.get_upstream("up-1").unwrap();
+        assert!(
+            node.last_seen_utc > 100,
+            "GREEN: touch_upstream_on_replay updated last_seen_utc from 100 to {}",
+            node.last_seen_utc
+        );
+        let _ = store.save_to_disk(&path).await;
     }
 }

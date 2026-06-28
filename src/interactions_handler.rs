@@ -858,6 +858,9 @@ impl InteractionsHandler {
                     direction,
                     ingress,
                     guard,
+                    harness_hashes.clone(),
+                    system_instruction_hash,
+                    prev_interaction_id.clone(),
                 )
                 .await;
         }
@@ -999,6 +1002,9 @@ impl InteractionsHandler {
         direction: &str,
         ingress: Protocol,
         guard: crate::diagnostics::RequestDiagnostics,
+        harness_hashes: Vec<u64>,
+        system_instruction_hash: Option<u64>,
+        prev_interaction_id: Option<String>,
     ) -> Result<Response, AppError> {
         let request_size = guard.ingress_size();
         let request_id = guard.request_id().to_string();
@@ -1020,6 +1026,10 @@ impl InteractionsHandler {
         let dump_enabled = self.diagnostics.dump_enabled();
         let session_hdr_name = Self::session_header_name(ingress);
         let session_hdr_value = session_id.to_string();
+        let sid = session_id.to_string();
+        let v2_store = self.v2_store.clone();
+        let v2_path = self.v2_path.clone();
+        let interaction_persisted = std::sync::atomic::AtomicBool::new(false);
 
         tokio::spawn(async move {
             let mut translator: Option<
@@ -1175,9 +1185,60 @@ impl InteractionsHandler {
                                     }
                                     // Eagerly persist interaction_id from interaction.created
                                     // so client-disconnect recovery has a valid ID to probe.
-                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(_ev)) =
+                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
                                         serde_json::from_str::<InteractionSseEvent>(data)
                                     {
+                                        if interaction_persisted
+                                            .compare_exchange(
+                                                false,
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            )
+                                            .is_ok()
+                                        {
+                                            let interaction_id = ev.interaction.id.clone();
+                                            let mut store = v2_store.write().await;
+                                            let now = crate::session::unix_now();
+                                            store.interactions.insert_upstream(
+                                                crate::session::UpstreamInteractionNode {
+                                                    id: interaction_id.clone(),
+                                                    prev_id: prev_interaction_id.clone(),
+                                                    client_id: sid.clone(),
+                                                    last_seen_utc: now,
+                                                    expires_at_utc: now
+                                                        + crate::session::DEFAULT_SESSION_TTL_SECS,
+                                                },
+                                            );
+                                            store.interactions.insert_client(
+                                                crate::session::ClientInteractionNode {
+                                                    id: interaction_id.clone(),
+                                                    prev_id: prev_interaction_id.clone(),
+                                                    message_hashes: harness_hashes.clone(),
+                                                    system_instruction_hash,
+                                                    upstream_ids: vec![interaction_id.clone()],
+                                                    last_seen_utc: now,
+                                                },
+                                            );
+                                            store
+                                                .sessions
+                                                .entry(sid.clone())
+                                                .and_modify(|s| {
+                                                    s.last_interaction_id =
+                                                        Some(interaction_id.clone());
+                                                    s.last_seen_utc = now;
+                                                })
+                                                .or_insert_with(|| crate::session::SessionInfo {
+                                                    client_session_id: sid.clone(),
+                                                    last_interaction_id: Some(interaction_id),
+                                                    last_seen_utc: now,
+                                                    expires_at_utc: now
+                                                        + crate::session::DEFAULT_SESSION_TTL_SECS,
+                                                });
+                                            if let Err(e) = store.save_to_disk(&v2_path).await {
+                                                tracing::warn!(error = %e, "v2 store save after stream interaction.created");
+                                            }
+                                        }
                                     }
                                 }
                             }

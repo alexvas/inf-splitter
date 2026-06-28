@@ -305,8 +305,11 @@ pub fn find_frontier(
             current_client
         };
 
-        let is_known =
-            prefix_len == hashes.len() && incoming_prev_id == terminal_client.prev_id.as_deref();
+        // Proof of ownership: either caller provided explicit prev_id (stateful),
+        // or hash-chain match proves identity (stateless, incoming_prev_id = None).
+        let is_known = prefix_len == hashes.len()
+            && (incoming_prev_id.is_none()
+                || incoming_prev_id == terminal_client.prev_id.as_deref());
 
         match &mut best {
             Some((best_len, best_node, best_known)) => {
@@ -1090,6 +1093,30 @@ mod tests {
         let frontier = find_frontier(&[0xA, 0xB], Some("int-0"), &store);
         assert!(frontier.all_known);
         assert_eq!(frontier.matched_client_id.as_deref(), Some("int-B"));
+    }
+
+    #[test]
+    fn frontier_all_known_stateless_non_root() {
+        // Stateless client (incoming_prev_id = None) with non-root chain.
+        // Hash-chain match alone proves ownership — prev_id check skipped.
+        let mut store = InteractionStore::new();
+        store.insert_client(make_client_node(
+            "int-child",
+            Some("int-parent"),
+            vec![0xCA, 0xFE],
+            vec!["up-A", "up-B"],
+        ));
+
+        let frontier = find_frontier(&[0xCA, 0xFE], None, &store);
+        assert!(
+            frontier.all_known,
+            "stateless all_known must work for non-root nodes"
+        );
+        assert_eq!(frontier.matched_client_id.as_deref(), Some("int-child"));
+        assert_eq!(
+            frontier.previous_interaction_id.as_deref(),
+            Some("int-parent")
+        );
     }
 
     // ── Phase 3: Versioned Persistence and SessionInfo ──────────

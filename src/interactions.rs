@@ -161,11 +161,12 @@ pub fn build_chunk_request(
     input: Vec<Content>,
     system_instruction: Option<String>,
     previous_interaction_id: Option<String>,
+    stream: bool,
 ) -> CreateModelInteractionParams {
     CreateModelInteractionParams {
         model: model.to_string(),
         input: InteractionsInput::ContentList(input),
-        stream: Some(false),
+        stream: Some(stream),
         system_instruction,
         previous_interaction_id,
         ..Default::default()
@@ -1945,5 +1946,29 @@ mod tests {
             size <= limit,
             "system part + envelope ({size}) <= limit ({limit})"
         );
+    }
+
+    #[test]
+    fn build_chunk_request_stream_true() {
+        let req = build_chunk_request("m", vec![], Some("sys".into()), None, true);
+        assert_eq!(req.stream, Some(true));
+    }
+
+    #[test]
+    fn build_chunk_request_stream_false() {
+        let req = build_chunk_request("m", vec![], Some("sys".into()), None, false);
+        assert_eq!(req.stream, Some(false));
+    }
+
+    #[test]
+    fn build_chunk_request_preserves_prev_id() {
+        let req = build_chunk_request(
+            "m",
+            vec![],
+            Some("sys".into()),
+            Some("prev-123".into()),
+            true,
+        );
+        assert_eq!(req.previous_interaction_id.as_deref(), Some("prev-123"));
     }
 }

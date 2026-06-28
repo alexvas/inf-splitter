@@ -30,6 +30,7 @@ use crate::interactions_types::{
 };
 use crate::session::{self, StoreV2};
 use crate::sse;
+use crate::sse::SseBuffer;
 use anyllm_translate::anthropic::{ContentBlock, MessageResponse, Role, StopReason, Usage};
 use anyllm_translate::openai::{
     ChatCompletionResponse, ChatContent, ChatMessage, ChatRole, ChatUsage, Choice, FinishReason,
@@ -1468,6 +1469,7 @@ impl InteractionsHandler {
                 chunk.clone(),
                 si,
                 current_prev.clone(),
+                false,
             );
             if is_first_chunk {
                 chunk_req.tools = params.tools.clone();
@@ -1811,6 +1813,484 @@ impl InteractionsHandler {
         }
     }
 
+    /// Split system_instruction across multiple streaming interactions, buffer
+    /// raw SSE in sse::MemSseBuffer, substitute intermediate interaction IDs with
+    /// the final ID, translate to client protocol, and drain.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_split_system_instruction_streaming(
+        &self,
+        sys: &str,
+        url: &str,
+        route: &RouteTarget,
+        session_id: &str,
+        chunks: &[Vec<crate::interactions_types::Content>],
+        harness_hashes: Vec<u64>,
+        prev_interaction_id: Option<String>,
+        limit: usize,
+        model: &str,
+        upstream_label: &str,
+        ingress_body: &[u8],
+        direction: &str,
+        request_headers: &HeaderMap,
+        ingress: Protocol,
+        guard: crate::diagnostics::RequestDiagnostics,
+        tools: Option<Vec<crate::interactions_types::Tool>>,
+        generation_config: Option<crate::interactions_types::GenerationConfig>,
+    ) -> Result<Response, AppError> {
+        let start = std::time::Instant::now();
+        let mut total_response_bytes: usize = 0;
+        let egress_headers =
+            build_interactions_headers_map(route.api_key.as_deref(), request_headers);
+        let system_instruction_hash = if prev_interaction_id.is_none() {
+            Some(xxhash_rust::xxh3::xxh3_64(sys.as_bytes()))
+        } else {
+            None
+        };
+        // Split system_instruction on natural boundaries
+        let sys_parts = match split_text_for_limit(sys, limit) {
+            Ok(parts) => parts,
+            Err(msg) => {
+                return Err(guard.abort_bad_request(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    msg,
+                ));
+            }
+        };
+        let mut current_prev: Option<String> = prev_interaction_id.clone();
+        let mut all_int_ids: Vec<String> = Vec::new();
+        let mut sse_buffer = sse::MemSseBuffer::with_limit(sse::DEFAULT_SSE_BUFFER_LIMIT);
+        let mut final_id: Option<String> = None;
+        let mut piece_index: usize = 0;
+
+        // Send system_instruction chunks as streaming requests
+        for (i, part) in sys_parts.iter().enumerate() {
+            let is_first_chunk = i == 0;
+            let is_last_sys = i == sys_parts.len() - 1;
+            let input_for_chunk = if is_last_sys && !chunks.is_empty() {
+                chunks[0].clone()
+            } else {
+                vec![]
+            };
+            let mut chunk_req = interactions_lib::build_chunk_request(
+                model,
+                input_for_chunk,
+                Some(part.clone()),
+                current_prev.clone(),
+                true,
+            );
+            if is_first_chunk {
+                chunk_req.tools = tools.clone();
+                chunk_req.generation_config = generation_config.clone();
+            }
+            let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    e,
+                )
+            })?;
+            let df = route.drop_fields.for_model(model);
+            crate::drop_fields_from_value(&mut chunk_body_value, &df);
+            let chunk_body = serde_json::to_vec(&chunk_body_value).map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    e,
+                )
+            })?;
+
+            guard.egress_dump(&chunk_body, &egress_headers);
+
+            let builder = build_interactions_headers(
+                self.get_client(route.proxy.as_deref())
+                    .post(url)
+                    .header(header::CONTENT_TYPE, "application/json"),
+                route.api_key.as_deref(),
+                request_headers,
+            );
+            let upstream = builder.body(chunk_body).send().await.map_err(|e| {
+                guard.abort_upstream(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    e,
+                )
+            })?;
+            if !upstream.status().is_success() {
+                let status = upstream.status();
+                let response_headers = response_headers_to_pairs(upstream.headers());
+                let error_body = upstream.text().await.unwrap_or_default();
+                guard.finish_with_upstream_error(
+                    status.as_u16(),
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    error_body.clone(),
+                    response_headers,
+                );
+                let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
+                let body = crate::apply_error_translation(sc, body, &self.error_translation);
+                return Response::builder()
+                    .status(sc)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(Self::session_header_name(ingress), session_id)
+                    .body(Body::from(body))
+                    .map_err(|err| AppError::Internal(err.to_string()));
+            }
+
+            // Read SSE stream from this chunk, buffer in MemSseBuffer
+            let mut byte_stream = upstream.bytes_stream();
+            let mut buffer = String::new();
+            let mut chunk_int_id: Option<String> = None;
+            while let Some(chunk_result) = byte_stream.next().await {
+                match chunk_result {
+                    Ok(chunk_bytes) => {
+                        total_response_bytes += chunk_bytes.len();
+                        // Buffer raw bytes
+                        if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
+                            let _ = guard.abort_upstream(
+                                start.elapsed().as_millis() as u64,
+                                ingress_body.len(),
+                                upstream_label,
+                                direction,
+                                true,
+                                format!("SSE buffer overflow: {:?}", e),
+                            );
+                            return Err(AppError::Internal("SSE buffer overflow".to_string()));
+                        }
+                        // Parse to find interaction.created event
+                        if std::str::from_utf8(&chunk_bytes).is_err() {
+                            continue;
+                        }
+                        buffer.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let event_str = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+                            for line in event_str.lines() {
+                                let data = line
+                                    .strip_prefix("data: ")
+                                    .or_else(|| line.strip_prefix("data:"));
+                                let data = match data {
+                                    Some(d) => d.trim(),
+                                    None => continue,
+                                };
+                                if data.is_empty() || data == "[DONE]" {
+                                    continue;
+                                }
+                                if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
+                                    serde_json::from_str::<InteractionSseEvent>(data)
+                                {
+                                    chunk_int_id = Some(ev.interaction.id.clone());
+                                }
+                            }
+                        }
+                        if buffer.len() > MAX_SSE_BUFFER_BYTES {
+                            return Err(guard.abort_upstream(
+                                start.elapsed().as_millis() as u64,
+                                ingress_body.len(),
+                                upstream_label,
+                                direction,
+                                true,
+                                "SSE buffer exceeded max line length",
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(guard.abort_upstream(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            true,
+                            e,
+                        ));
+                    }
+                }
+            }
+
+            let int_id = chunk_int_id.ok_or_else(|| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    "no interaction.created event in streaming chunk response",
+                )
+            })?;
+
+            if i == 0 {
+                final_id = Some(int_id.clone());
+            }
+            all_int_ids.push(int_id.clone());
+            current_prev = Some(int_id.clone());
+            piece_index += 1;
+        }
+
+        // Send remaining content chunks as streaming
+        if chunks.len() > 1 {
+            for chunk in chunks.iter().skip(1) {
+                let chunk_req = interactions_lib::build_chunk_request(
+                    model,
+                    chunk.clone(),
+                    None,
+                    current_prev.clone(),
+                    true,
+                );
+                let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
+                    guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        e,
+                    )
+                })?;
+                let df = route.drop_fields.for_model(model);
+                crate::drop_fields_from_value(&mut chunk_body_value, &df);
+                let chunk_body = serde_json::to_vec(&chunk_body_value).map_err(|e| {
+                    guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        e,
+                    )
+                })?;
+
+                guard.egress_dump(&chunk_body, &egress_headers);
+
+                let builder = build_interactions_headers(
+                    self.get_client(route.proxy.as_deref())
+                        .post(url)
+                        .header(header::CONTENT_TYPE, "application/json"),
+                    route.api_key.as_deref(),
+                    request_headers,
+                );
+                let upstream = builder.body(chunk_body).send().await.map_err(|e| {
+                    guard.abort_upstream(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        e,
+                    )
+                })?;
+                if !upstream.status().is_success() {
+                    let status = upstream.status();
+                    let response_headers = response_headers_to_pairs(upstream.headers());
+                    let error_body = upstream.text().await.unwrap_or_default();
+                    guard.finish_with_upstream_error(
+                        status.as_u16(),
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        error_body.clone(),
+                        response_headers,
+                    );
+                    let sc =
+                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                    let body =
+                        crate::translate_interactions_error_to_protocol(&error_body, ingress);
+                    let body = crate::apply_error_translation(sc, body, &self.error_translation);
+                    return Response::builder()
+                        .status(sc)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(Self::session_header_name(ingress), session_id)
+                        .body(Body::from(body))
+                        .map_err(|err| AppError::Internal(err.to_string()));
+                }
+
+                let mut byte_stream = upstream.bytes_stream();
+                let mut buffer = String::new();
+                let mut chunk_int_id: Option<String> = None;
+                while let Some(chunk_result) = byte_stream.next().await {
+                    match chunk_result {
+                        Ok(chunk_bytes) => {
+                            total_response_bytes += chunk_bytes.len();
+                            if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
+                                let _ = guard.abort_upstream(
+                                    start.elapsed().as_millis() as u64,
+                                    ingress_body.len(),
+                                    upstream_label,
+                                    direction,
+                                    true,
+                                    format!("SSE buffer overflow: {:?}", e),
+                                );
+                                return Err(AppError::Internal("SSE buffer overflow".to_string()));
+                            }
+                            if std::str::from_utf8(&chunk_bytes).is_err() {
+                                continue;
+                            }
+                            buffer.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
+                            while let Some(pos) = buffer.find("\n\n") {
+                                let event_str = buffer[..pos].to_string();
+                                buffer = buffer[pos + 2..].to_string();
+                                for line in event_str.lines() {
+                                    let data = line
+                                        .strip_prefix("data: ")
+                                        .or_else(|| line.strip_prefix("data:"));
+                                    let data = match data {
+                                        Some(d) => d.trim(),
+                                        None => continue,
+                                    };
+                                    if data.is_empty() || data == "[DONE]" {
+                                        continue;
+                                    }
+                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
+                                        serde_json::from_str::<InteractionSseEvent>(data)
+                                    {
+                                        chunk_int_id = Some(ev.interaction.id.clone());
+                                    }
+                                }
+                            }
+                            if buffer.len() > MAX_SSE_BUFFER_BYTES {
+                                return Err(guard.abort_upstream(
+                                    start.elapsed().as_millis() as u64,
+                                    ingress_body.len(),
+                                    upstream_label,
+                                    direction,
+                                    true,
+                                    "SSE buffer exceeded max line length",
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            return Err(guard.abort_upstream(
+                                start.elapsed().as_millis() as u64,
+                                ingress_body.len(),
+                                upstream_label,
+                                direction,
+                                true,
+                                e,
+                            ));
+                        }
+                    }
+                }
+
+                let int_id = chunk_int_id.ok_or_else(|| {
+                    guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        "no interaction.created event in streaming chunk response",
+                    )
+                })?;
+                all_int_ids.push(int_id.clone());
+                current_prev = Some(int_id.clone());
+                piece_index += 1;
+            }
+        }
+
+        let final_id =
+            final_id.ok_or_else(|| AppError::Internal("no final interaction id".to_string()))?;
+
+        // Substitute all intermediate interaction IDs with final ID
+        for int_id in &all_int_ids {
+            if int_id != &final_id {
+                sse_buffer.substitute_id(int_id, &final_id);
+            }
+        }
+
+        let sse_bytes = sse_buffer.drain();
+        let translated = Self::translate_buffered_sse_to_client(&sse_bytes, ingress, model)
+            .map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    e,
+                )
+            })?;
+
+        // Persist interaction nodes in v2 store
+        {
+            let mut store = self.v2_store.write().await;
+            let now = crate::session::unix_now();
+            let mut prev_upstream = prev_interaction_id.clone();
+            for upstream_id in &all_int_ids {
+                store
+                    .interactions
+                    .insert_upstream(crate::session::UpstreamInteractionNode {
+                        id: upstream_id.clone(),
+                        prev_id: prev_upstream.clone(),
+                        client_id: session_id.to_string(),
+                        last_seen_utc: now,
+                        expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
+                    });
+                prev_upstream = Some(upstream_id.clone());
+            }
+            store
+                .interactions
+                .insert_client(crate::session::ClientInteractionNode {
+                    id: final_id.clone(),
+                    prev_id: prev_interaction_id,
+                    message_hashes: harness_hashes.clone(),
+                    system_instruction_hash,
+                    upstream_ids: all_int_ids.clone(),
+                    last_seen_utc: now,
+                });
+            store
+                .sessions
+                .entry(session_id.to_string())
+                .and_modify(|s| {
+                    s.last_interaction_id = Some(final_id.clone());
+                    s.last_seen_utc = now;
+                })
+                .or_insert_with(|| crate::session::SessionInfo {
+                    client_session_id: session_id.to_string(),
+                    last_interaction_id: Some(final_id.clone()),
+                    last_seen_utc: now,
+                    expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
+                });
+            if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                tracing::warn!(error = %e, "v2 store save after streaming split-send");
+            }
+        }
+
+        guard.finish(
+            200,
+            start.elapsed().as_millis() as u64,
+            ingress_body.len(),
+            Some(total_response_bytes),
+            upstream_label,
+            direction,
+            true,
+        );
+
+        let content_type = "text/event-stream";
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(Self::session_header_name(ingress), session_id)
+            .body(Body::from(translated))
+            .map_err(|err| AppError::Internal(err.to_string()))
+    }
+
     /// Split system_instruction across multiple interactions, then send chunks.
     #[allow(clippy::too_many_arguments)]
     async fn send_split_system_instruction(
@@ -1834,6 +2314,30 @@ impl InteractionsHandler {
         generation_config: Option<crate::interactions_types::GenerationConfig>,
         stream: bool,
     ) -> Result<Response, AppError> {
+        if stream {
+            return self
+                .send_split_system_instruction_streaming(
+                    sys,
+                    url,
+                    route,
+                    session_id,
+                    chunks,
+                    harness_hashes,
+                    prev_interaction_id,
+                    limit,
+                    model,
+                    upstream_label,
+                    ingress_body,
+                    direction,
+                    request_headers,
+                    ingress,
+                    guard,
+                    tools,
+                    generation_config,
+                )
+                .await;
+        }
+
         let start = std::time::Instant::now();
         let mut total_response_bytes: usize = 0;
         let egress_headers =
@@ -1876,6 +2380,7 @@ impl InteractionsHandler {
                 input_for_chunk,
                 Some(part.clone()),
                 current_prev.clone(),
+                false,
             );
             if is_first_chunk {
                 chunk_req.tools = tools.clone();
@@ -2001,6 +2506,7 @@ impl InteractionsHandler {
                     chunk.clone(),
                     None,
                     current_prev.clone(),
+                    false,
                 );
                 let chunk_body = serde_json::to_vec(&chunk_req).map_err(|e| {
                     guard.abort_internal(
@@ -2466,6 +2972,118 @@ impl InteractionsHandler {
             }
         }
         response
+    }
+
+    /// Translate buffered raw Interactions SSE bytes (after final-id substitution)
+    /// to client-protocol SSE format. Parses each SSE event, translates to
+    /// Anthropic StreamEvent (or OpenAI via ReverseStreamingTranslator), and
+    /// formats as SSE for the client.
+    ///
+    /// When multiple interactions share the same ID (post-substitution), only
+    /// the first `interaction.created` and the last `interaction.completed` are
+    /// emitted as control events; intermediate control events are suppressed
+    /// to avoid duplicate `message_start`/`message_stop` in the client stream.
+    fn translate_buffered_sse_to_client(
+        sse_bytes: &[u8],
+        ingress: Protocol,
+        model: &str,
+    ) -> Result<Vec<u8>, String> {
+        let text = std::str::from_utf8(sse_bytes).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        let is_openai = matches!(ingress, Protocol::OpenAi);
+        let model_owned = model.to_string();
+
+        // First pass: parse all events, count control events
+        let mut parsed: Vec<InteractionSseEvent> = Vec::new();
+        let mut completed_count: usize = 0;
+        for event_str in text.split("\n\n") {
+            if event_str.is_empty() {
+                continue;
+            }
+            for line in event_str.lines() {
+                let data = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"));
+                let data = match data {
+                    Some(d) => d.trim(),
+                    None => continue,
+                };
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                let event: InteractionSseEvent = match serde_json::from_str(data) {
+                    Ok(ev) => ev,
+                    Err(_) => continue,
+                };
+                match &event {
+                    InteractionSseEvent::InteractionCreatedEvent(_) => {}
+                    InteractionSseEvent::InteractionCompletedEvent(_) => completed_count += 1,
+                    _ => {}
+                }
+                parsed.push(event);
+            }
+        }
+
+        // Second pass: translate with control event filtering
+        let mut seen_start: bool = false;
+        let mut completed_seen: usize = 0;
+        let mut translator: Option<
+            anyllm_translate::mapping::reverse_streaming_map::ReverseStreamingTranslator,
+        > = None;
+        let mut last_active_index: Option<u32> = None;
+
+        for event in &parsed {
+            match event {
+                InteractionSseEvent::InteractionCreatedEvent(_) => {
+                    if seen_start {
+                        continue; // skip duplicate interaction.created
+                    }
+                    seen_start = true;
+                }
+                InteractionSseEvent::InteractionCompletedEvent(_) => {
+                    completed_seen += 1;
+                    if completed_seen < completed_count {
+                        continue; // skip intermediate interaction.completed
+                    }
+                }
+                _ => {}
+            }
+
+            let events =
+                translate_stream_event_from_parsed(event, &model_owned, &mut last_active_index);
+            if let Some(events) = events {
+                for ev in &events {
+                    if is_openai {
+                        use anyllm_translate::anthropic::StreamEvent;
+                        if matches!(ev, StreamEvent::MessageStart { .. }) {
+                            if let StreamEvent::MessageStart { message } = ev {
+                                translator = Some(anyllm_translate::new_reverse_stream_translator(
+                                    message.id.clone(),
+                                    model_owned.clone(),
+                                ));
+                            }
+                            continue;
+                        }
+                        if let Some(ref mut active) = translator {
+                            for chunk in active.process_event(ev) {
+                                let payload = sse::format_openai_sse_chunk(&chunk);
+                                out.extend_from_slice(payload.as_bytes());
+                            }
+                        }
+                    } else {
+                        let payload = sse::format_sse_event(ev);
+                        out.extend_from_slice(&payload);
+                    }
+                }
+            }
+        }
+
+        // Emit [DONE] for OpenAI when streaming completed normally
+        if is_openai && seen_start && completed_seen == completed_count {
+            out.extend_from_slice(b"data: [DONE]\n\n");
+        }
+
+        Ok(out)
     }
 
     /// Build a streaming SSE response from the split-send final interaction.
@@ -3173,8 +3791,6 @@ fn translate_stream_event(
     model: &str,
     last_active_index: &mut Option<u32>,
 ) -> Option<Vec<anyllm_translate::anthropic::StreamEvent>> {
-    use anyllm_translate::anthropic::StreamEvent;
-
     let event: InteractionSseEvent = match serde_json::from_str(data) {
         Ok(ev) => ev,
         Err(e) => {
@@ -3183,6 +3799,15 @@ fn translate_stream_event(
             return None;
         }
     };
+    translate_stream_event_from_parsed(&event, model, last_active_index)
+}
+
+fn translate_stream_event_from_parsed(
+    event: &InteractionSseEvent,
+    model: &str,
+    last_active_index: &mut Option<u32>,
+) -> Option<Vec<anyllm_translate::anthropic::StreamEvent>> {
+    use anyllm_translate::anthropic::StreamEvent;
 
     match event {
         InteractionSseEvent::InteractionCreatedEvent(ev) => {
@@ -3208,18 +3833,18 @@ fn translate_stream_event(
                 }
             }
         }
-        InteractionSseEvent::StepDelta(ev) => match ev.delta {
+        InteractionSseEvent::StepDelta(ev) => match &ev.delta {
             StepDeltaData::TextDelta(td) => {
                 let delta = stream_event_content_block_delta_text(ev.index as u32, &td.text);
                 Some(vec![delta])
             }
             StepDeltaData::ThoughtSignatureDelta(tsd) => {
-                let signature = tsd.signature.unwrap_or_default();
+                let signature = tsd.signature.clone().unwrap_or_default();
                 let delta = stream_event_content_block_delta_signature(ev.index as u32, &signature);
                 Some(vec![delta])
             }
             StepDeltaData::ArgumentsDelta(ad) => {
-                let partial_json = ad.arguments.unwrap_or_default();
+                let partial_json = ad.arguments.clone().unwrap_or_default();
                 let delta = stream_event_content_block_delta_json(ev.index as u32, &partial_json);
                 Some(vec![delta])
             }
@@ -3709,6 +4334,7 @@ If you don't know the answer, say so honestly.";
                 chunk.clone(),
                 None,
                 current_prev.clone(),
+                false,
             );
             if is_first_chunk {
                 chunk_req.tools = params.tools.clone();
@@ -4460,5 +5086,110 @@ If you don't know the answer, say so honestly.";
             !joined.contains("tool_calls"),
             "must NOT contain tool_calls for text-only response"
         );
+    }
+
+    // --- translate_buffered_sse_to_client tests ---
+
+    fn make_interactions_sse_bytes(events: &[&str]) -> Vec<u8> {
+        let mut buf = String::new();
+        for ev in events {
+            buf.push_str("data: ");
+            buf.push_str(ev);
+            buf.push_str("\n\n");
+        }
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn translate_buffered_sse_anthropic_single_step() {
+        let raw = make_interactions_sse_bytes(&[
+            STREAM_INTERACTION_CREATED,
+            STREAM_STEP_START_THOUGHT,
+            STREAM_STEP_DELTA_TEXT,
+            STREAM_STEP_STOP,
+            STREAM_INTERACTION_COMPLETED,
+        ]);
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::Anthropic,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).expect("output must be valid UTF-8");
+        assert!(!out_str.is_empty(), "output must not be empty");
+        assert!(
+            out_str.contains("message_start"),
+            "must contain message_start, got: {out_str}"
+        );
+        assert!(
+            out_str.contains("content_block_start"),
+            "must contain content_block_start, got: {out_str}"
+        );
+        assert!(
+            out_str.contains("content_block_delta"),
+            "must contain content_block_delta, got: {out_str}"
+        );
+        assert!(
+            out_str.contains("message_stop"),
+            "must contain message_stop, got: {out_str}"
+        );
+        // The text from STREAM_STEP_DELTA_TEXT is "Hello"
+        assert!(
+            out_str.contains("Hello"),
+            "must contain step delta text, got: {out_str}"
+        );
+    }
+
+    #[test]
+    fn translate_buffered_sse_openai_single_step() {
+        let raw = make_interactions_sse_bytes(&[
+            STREAM_INTERACTION_CREATED,
+            STREAM_STEP_START_THOUGHT,
+            STREAM_STEP_DELTA_TEXT,
+            STREAM_STEP_STOP,
+            STREAM_INTERACTION_COMPLETED,
+        ]);
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::OpenAi,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).expect("output must be valid UTF-8");
+        // OpenAI format: "data: {...}\n\n"
+        assert!(
+            out_str.contains("data: "),
+            "must contain SSE data prefix, got: {out_str}"
+        );
+        assert!(
+            out_str.contains("\"object\":\"chat.completion.chunk\""),
+            "must contain chat completion chunk, got: {out_str}"
+        );
+        // The text from STREAM_STEP_DELTA_TEXT is "Hello"
+        assert!(
+            out_str.contains("Hello"),
+            "must contain step delta text, got: {out_str}"
+        );
+    }
+
+    #[test]
+    fn translate_buffered_sse_invalid_utf8() {
+        let result = InteractionsHandler::translate_buffered_sse_to_client(
+            &[0xff, 0xfe, 0xfd],
+            Protocol::Anthropic,
+            "m",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn translate_buffered_sse_empty_input() {
+        let out = InteractionsHandler::translate_buffered_sse_to_client(&[], Protocol::OpenAi, "m")
+            .expect("empty input should produce empty output");
+        assert!(out.is_empty());
     }
 }

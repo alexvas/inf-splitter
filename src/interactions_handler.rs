@@ -306,6 +306,7 @@ impl InteractionsHandler {
             new_count,
             hashes.clone(),
             system_instruction_hash,
+            frontier.previous_interaction_id.clone(),
             stream,
             &model,
             endpoint,
@@ -522,6 +523,7 @@ impl InteractionsHandler {
             } else {
                 None
             },
+            frontier.previous_interaction_id.clone(),
             stream,
             &model,
             endpoint,
@@ -781,6 +783,7 @@ impl InteractionsHandler {
         new_count: usize,
         harness_hashes: Vec<u64>,
         system_instruction_hash: Option<u64>,
+        prev_interaction_id: Option<String>,
         stream: bool,
         model: &str,
         upstream_label: &str,
@@ -914,7 +917,7 @@ impl InteractionsHandler {
                 .interactions
                 .insert_upstream(crate::session::UpstreamInteractionNode {
                     id: interaction_id.clone(),
-                    prev_id: None, // The caller's prev_id drives this in the full rewrite
+                    prev_id: prev_interaction_id.clone(),
                     client_id: session_id.to_string(),
                     last_seen_utc: now,
                     expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
@@ -923,7 +926,7 @@ impl InteractionsHandler {
                 .interactions
                 .insert_client(crate::session::ClientInteractionNode {
                     id: interaction_id.clone(),
-                    prev_id: None,
+                    prev_id: prev_interaction_id,
                     message_hashes: harness_hashes.clone(),
                     system_instruction_hash,
                     upstream_ids: vec![interaction_id.clone()],

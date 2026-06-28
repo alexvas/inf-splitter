@@ -1753,7 +1753,10 @@ mod tests {
         ];
         let filtered = filter_harness_messages(&msgs, Protocol::OpenAi);
         assert_eq!(filtered.len(), 4, "must keep system, developer, user, tool");
-        let roles: Vec<&str> = filtered.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        let roles: Vec<&str> = filtered
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
         assert_eq!(roles, vec!["system", "developer", "user", "tool"]);
         // assistant must not be present
         assert!(!filtered.iter().any(|m| m["role"] == "assistant"));
@@ -1797,6 +1800,150 @@ mod tests {
         assert_eq!(
             hashes[0],
             hash_harness_message(&serde_json::json!({"role": "user", "content": "real message"}))
+        );
+    }
+
+    // ── Phase 6.1: proxy_limit packing measures full body ─────────
+
+    #[test]
+    fn pack_chunk_body_includes_previous_interaction_id_overhead() {
+        // Each chunk body is the serialized full CreateModelInteractionParams,
+        // including previous_interaction_id. Verify size measurement accounts for it.
+        let envelope = pack_envelope("test-model");
+        let env_size = serde_json::to_vec(&envelope).unwrap().len();
+        let mut sub_env = envelope.clone();
+        sub_env.previous_interaction_id = Some("x".repeat(36));
+
+        let sub_size = serde_json::to_vec(&sub_env).unwrap().len();
+        assert!(
+            sub_size > env_size,
+            "subsequent envelope with previous_interaction_id must be larger than first envelope"
+        );
+
+        // Verify each emitted chunk body is <= limit
+        let limit = sub_size + 100;
+        let items = vec![
+            content_of_approx_size(40),
+            content_of_approx_size(40),
+            content_of_approx_size(40),
+        ];
+        let result = pack_content_into_chunks(&envelope, &sub_env, &items, limit).unwrap();
+        for chunk in &result {
+            let env = if result
+                .first()
+                .map(|c| c.as_ptr() == chunk.as_ptr())
+                .unwrap_or(false)
+            {
+                &envelope
+            } else {
+                &sub_env
+            };
+            let body = build_pack_body(env, chunk);
+            let size = serde_json::to_vec(&body).unwrap().len();
+            assert!(size <= limit, "chunk body {size} > limit {limit}");
+        }
+    }
+
+    #[test]
+    fn pack_chunk_size_accounts_for_all_fields() {
+        // Tool and generation_config fields in first envelope increase chunk size.
+        let envelope = CreateModelInteractionParams {
+            model: "test-model".into(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            tools: Some(vec![Tool::Function(crate::interactions_types::Function {
+                name: Some("my_tool".into()),
+                description: Some("A test tool".into()),
+                parameters: Some(serde_json::json!({"type": "object"})),
+                ..Default::default()
+            })]),
+            generation_config: Some(GenerationConfig {
+                temperature: Some(0.7),
+                max_output_tokens: Some(1000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sub_env = CreateModelInteractionParams {
+            model: "test-model".into(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            previous_interaction_id: Some("x".repeat(36)),
+            ..Default::default()
+        };
+
+        let env_size = serde_json::to_vec(&envelope).unwrap().len();
+        let limit = env_size + 150;
+        let items = vec![content_of_approx_size(50)];
+        let result = pack_content_into_chunks(&envelope, &sub_env, &items, limit).unwrap();
+        assert_eq!(result.len(), 1);
+        let body = build_pack_body(&envelope, &result[0]);
+        let size = serde_json::to_vec(&body).unwrap().len();
+        assert!(
+            size <= limit,
+            "chunk with tools+gen_config: {size} > {limit}"
+        );
+    }
+
+    // ── Phase 6.2: system instruction split precedes content ──────
+
+    #[test]
+    fn system_instruction_first_chunk_carries_tools_and_gen_config() {
+        // Verify the structure expected by system instruction splitting:
+        // first chunk envelope (with tools, generation_config) is larger
+        // than subsequent chunks, and system_instruction is the first thing split.
+        let first_env = CreateModelInteractionParams {
+            model: "test-model".into(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            system_instruction: Some("short sys".into()),
+            tools: Some(vec![Tool::Function(crate::interactions_types::Function {
+                name: Some("t".into()),
+                description: None,
+                parameters: Some(serde_json::json!({"type": "object"})),
+                ..Default::default()
+            })]),
+            generation_config: Some(GenerationConfig {
+                temperature: Some(0.7),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sub_env = CreateModelInteractionParams {
+            model: "test-model".into(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            previous_interaction_id: Some("x".repeat(36)),
+            ..Default::default()
+        };
+        // First envelope with tools+gen_config+sys must be larger
+        let first_size = serde_json::to_vec(&first_env).unwrap().len();
+        let sub_size = serde_json::to_vec(&sub_env).unwrap().len();
+        assert!(first_size > sub_size,
+            "first envelope ({first_size}) with tools+gen_config must be larger than subsequent ({sub_size})");
+    }
+
+    #[test]
+    fn system_instruction_split_parts_fit_under_limit() {
+        // When system_instruction needs splitting, each part (when wrapped in
+        // an envelope without tools) must fit under the limit.
+        let envelope = CreateModelInteractionParams {
+            model: "test-model".into(),
+            input: InteractionsInput::ContentList(vec![]),
+            stream: Some(false),
+            system_instruction: None,
+            previous_interaction_id: Some("x".repeat(36)),
+            ..Default::default()
+        };
+        let env_size = serde_json::to_vec(&envelope).unwrap().len();
+        let limit = env_size + 100;
+        let sys_part = "x".repeat(50);
+        let mut env_with_sys = envelope.clone();
+        env_with_sys.system_instruction = Some(sys_part);
+        let size = serde_json::to_vec(&env_with_sys).unwrap().len();
+        assert!(
+            size <= limit,
+            "system part + envelope ({size}) <= limit ({limit})"
         );
     }
 }

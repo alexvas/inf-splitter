@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyllm_translate::anthropic::{Content, MessageCreateRequest, MessageResponse};
 use anyllm_translate::openai::{ChatCompletionRequest, ChatCompletionResponse, ChatContent};
+use axum::response::IntoResponse;
 use common::{
     anthropic_upstream_response, interactions_upstream_response, openai_upstream_response,
     post_anthropic, post_openai, spawn_router, spawn_upstream,
@@ -1421,6 +1422,352 @@ proxy_limit = "350k"
             .unwrap_or_default()
             .contains("OpenAI split answer"),
         "OpenAI ingress must get OpenAI-format response (choices[].message.content), got: {body_text}"
+    );
+}
+
+// ── Phase 6.3: Split-send creates v2 nodes, replay works ─────────
+
+#[tokio::test]
+async fn split_send_creates_v2_nodes_replay_works() {
+    let session_path =
+        std::env::temp_dir().join(format!("inf-splitter-v2-split-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&session_path);
+
+    // Upstream must handle both POST (for split chunks) and GET (for replay)
+    let last_interaction: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let last_interaction_clone = last_interaction.clone();
+
+    let app = axum::Router::new()
+        .route(
+            "/v1beta/interactions",
+            axum::routing::post(
+                move |axum::Json(_body): axum::Json<serde_json::Value>| {
+                    let interaction = serde_json::json!({
+                        "id": "int-split-v2-1",
+                        "status": "completed",
+                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Response from split chunk"}]}],
+                        "usage": {"total_input_tokens": 5, "total_output_tokens": 10}
+                    });
+                    last_interaction_clone.lock().unwrap().replace(interaction.clone());
+                    async move { axum::Json(interaction) }
+                },
+            ),
+        )
+        .route(
+            "/v1beta/interactions/{id}",
+            axum::routing::get(
+                move || {
+                    let interaction = last_interaction.clone();
+                    async move {
+                        let val = interaction.lock().unwrap().clone();
+                        match val {
+                            Some(inter) => axum::Json(inter).into_response(),
+                            None => (axum::http::StatusCode::NOT_FOUND, "not found").into_response(),
+                        }
+                    }
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+interactions_session_store = "{store_path}"
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "350k"
+"#,
+        store_path = session_path.display(),
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let request = make_anthropic_request("gemini-3.1-flash-lite");
+    let body_json = serde_json::to_value(&request).unwrap();
+
+    // First request: must succeed (split-send)
+    let response1 = post_anthropic(&proxy_addr, body_json.clone()).await;
+    assert_eq!(
+        response1.status(),
+        reqwest::StatusCode::OK,
+        "first request failed"
+    );
+    let body1: serde_json::Value = serde_json::from_str(&response1.text().await.unwrap()).unwrap();
+    let id1 = body1["id"].as_str().unwrap().to_string();
+
+    // Second request with same messages: should hit all_known replay path
+    let response2 = post_anthropic(&proxy_addr, body_json).await;
+    let status2 = response2.status();
+    let body2_text = response2.text().await.unwrap();
+    assert_eq!(
+        status2,
+        reqwest::StatusCode::OK,
+        "second request failed: {body2_text}"
+    );
+    let body2: serde_json::Value = serde_json::from_str(&body2_text).unwrap();
+    let id2 = body2["id"].as_str().unwrap().to_string();
+
+    // Replay must return same interaction id as the original split's final id
+    assert_eq!(
+        id1, id2,
+        "replay must return same client node id, not a new interaction id"
+    );
+
+    let _ = std::fs::remove_file(&session_path);
+}
+
+// ── Phase 6.4: Non-streaming split merges piece responses ────────
+
+#[tokio::test]
+async fn non_streaming_split_merges_all_piece_responses() {
+    // Dynamic upstream: returns different text for each request
+    let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let request_count_clone = request_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/interactions",
+        axum::routing::post(
+            move |axum::Json(_body): axum::Json<serde_json::Value>| {
+                let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (id, text) = match count {
+                    0 => ("int-p0", "Hello"),
+                    1 => ("int-p1", " world"),
+                    _ => ("int-pn", " extra"),
+                };
+                async move {
+                    axum::Json(serde_json::json!({
+                        "id": id,
+                        "status": "completed",
+                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": text}]}],
+                        "usage": {"total_input_tokens": 5, "total_output_tokens": 10}
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    // Build a request with 2 large messages (~600 chars each) to force splitting.
+    let content_a = "A".repeat(600);
+    let content_b = "B".repeat(600);
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": content_a},
+            {"role": "user", "content": content_b}
+        ]
+    });
+    let response = post_anthropic(&proxy_addr, request).await;
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "split-send failed with {status}: {body_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+
+    // After merge: should contain text from both pieces
+    let content_text: String = body["content"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    assert!(
+        content_text.contains("Hello") && content_text.contains("world"),
+        "merged response must contain text from both pieces, got: {content_text}"
+    );
+}
+
+// ── Phase 6.5: Non-streaming merge preserves tool calls ────────
+
+#[tokio::test]
+async fn non_streaming_split_merge_preserves_tool_calls() {
+    let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let request_count_clone = request_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/interactions",
+        axum::routing::post(
+            move |axum::Json(_body): axum::Json<serde_json::Value>| {
+                let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let resp = match count {
+                    0 => serde_json::json!({
+                        "id": "int-tool-p0",
+                        "status": "completed",
+                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Let me check."}]}],
+                        "usage": {"total_input_tokens": 5, "total_output_tokens": 10}
+                    }),
+                    _ => serde_json::json!({
+                        "id": "int-tool-p1",
+                        "status": "requires_action",
+                        "steps": [{
+                            "type": "function_call",
+                            "id": "call-1",
+                            "name": "get_weather",
+                            "arguments": {"location": "Boston"}
+                        }],
+                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
+                    }),
+                };
+                async move { axum::Json(resp) }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let content_a = "T".repeat(600);
+    let content_b = "U".repeat(600);
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": content_a},
+            {"role": "user", "content": content_b}
+        ]
+    });
+    let response = post_anthropic(&proxy_addr, request).await;
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "split-send failed with {status}: {body_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+
+    // Merged response: when tool calls are present, Anthropic translation
+    // produces tool_use content blocks (text is in the merged interaction
+    // but not shown in the Anthropic response alongside tool_use).
+    let content = body["content"].as_array().expect("content must be array");
+    let has_tool_use = content.iter().any(|c| c["type"] == "tool_use");
+    assert!(
+        has_tool_use,
+        "merged response must contain tool_use block from P1"
+    );
+    // Also verify the stop_reason reflects tool use
+    assert_eq!(
+        body["stop_reason"], "tool_use",
+        "stop_reason must be tool_use when function call is present"
+    );
+}
+
+// ── Phase 6.6: Split-send failure cancels ACKed pieces ────────
+
+#[tokio::test]
+async fn split_send_piece_failure_cancels_acked_pieces() {
+    let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let request_count_clone = request_count.clone();
+    let cancel_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_called_clone = cancel_called.clone();
+
+    let app = axum::Router::new()
+        .route(
+            "/v1beta/interactions",
+            axum::routing::post(
+                move |axum::Json(_body): axum::Json<serde_json::Value>| {
+                    let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        match count {
+                            0 => axum::Json(serde_json::json!({
+                                "id": "int-fail-p0",
+                                "status": "completed",
+                                "steps": [{"type": "model_output", "content": [{"type": "text", "text": "ok"}]}],
+                                "usage": {}
+                            })).into_response(),
+                            _ => {
+                                // Second chunk fails
+                                (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                 axum::Json(serde_json::json!({"error": "upstream failure"})))
+                                    .into_response()
+                            }
+                        }
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1beta/interactions/{id}/cancel",
+            axum::routing::post(
+                move |axum::extract::Path(_id): axum::extract::Path<String>| {
+                    cancel_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async move { axum::Json(serde_json::json!({"status": "cancelled"})) }
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let content_a = "X".repeat(600);
+    let content_b = "Y".repeat(600);
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": content_a},
+            {"role": "user", "content": content_b}
+        ]
+    });
+    let response = post_anthropic(&proxy_addr, request).await;
+    // Must fail because second chunk fails
+    assert!(
+        !response.status().is_success(),
+        "split-send with piece failure must return error, got {}",
+        response.status()
+    );
+
+    // The ACKed first piece must be cancelled
+    assert!(
+        cancel_called.load(std::sync::atomic::Ordering::SeqCst),
+        "ACKed pieces must be cancelled on batch failure"
     );
 }
 

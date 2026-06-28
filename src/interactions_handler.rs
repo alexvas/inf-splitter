@@ -143,7 +143,8 @@ impl InteractionsHandler {
         let _ = self.session_store.get_or_create(&session_id).await;
 
         // Filter harness messages (Anthropic: user only) and hash them
-        let harness = interactions_lib::filter_harness_messages(&cleaned_messages, Protocol::Anthropic);
+        let harness =
+            interactions_lib::filter_harness_messages(&cleaned_messages, Protocol::Anthropic);
         let hashes: Vec<u64> = harness
             .iter()
             .map(|m| interactions_lib::hash_harness_message(m))
@@ -157,8 +158,11 @@ impl InteractionsHandler {
         // If all messages are known, replay from upstream
         if frontier.all_known {
             if let Some(ref client_id) = frontier.matched_client_id {
-                let guard2 =
-                    crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, &model);
+                let guard2 = crate::diagnostics::RequestDiagnostics::new(
+                    &self.diagnostics,
+                    &route.section,
+                    &model,
+                );
                 return self
                     .replay_from_client_node(
                         client_id,
@@ -279,7 +283,7 @@ impl InteractionsHandler {
                         &backend_url,
                         route,
                         &session_id,
-                        new_count,
+                        hashes.clone(),
                         stream,
                         &model,
                         endpoint,
@@ -365,7 +369,8 @@ impl InteractionsHandler {
         let _ = self.session_store.get_or_create(&session_id).await;
 
         // Filter harness messages (OpenAI: system, developer, user, tool) and hash them
-        let harness = interactions_lib::filter_harness_messages(&cleaned_messages, Protocol::OpenAi);
+        let harness =
+            interactions_lib::filter_harness_messages(&cleaned_messages, Protocol::OpenAi);
         let hashes: Vec<u64> = harness
             .iter()
             .map(|m| interactions_lib::hash_harness_message(m))
@@ -379,8 +384,11 @@ impl InteractionsHandler {
         // If all messages are known, replay from upstream
         if frontier.all_known {
             if let Some(ref client_id) = frontier.matched_client_id {
-                let guard2 =
-                    crate::diagnostics::RequestDiagnostics::new(&self.diagnostics, &route.section, &model);
+                let guard2 = crate::diagnostics::RequestDiagnostics::new(
+                    &self.diagnostics,
+                    &route.section,
+                    &model,
+                );
                 return self
                     .replay_from_client_node(
                         client_id,
@@ -486,7 +494,7 @@ impl InteractionsHandler {
                         &backend_url,
                         route,
                         &session_id,
-                        new_count,
+                        hashes.clone(),
                         stream,
                         &model,
                         endpoint,
@@ -539,7 +547,11 @@ impl InteractionsHandler {
             Some(n) => n,
             None => {
                 return Err(guard.abort_internal(
-                    0, 0, "replay-from-client", "replay", false,
+                    0,
+                    0,
+                    "replay-from-client",
+                    "replay",
+                    false,
                     format!("client node {client_id} not found"),
                 ));
             }
@@ -591,9 +603,10 @@ impl InteractionsHandler {
             ..Default::default()
         };
 
-        let response_json =
-            interactions_lib::build_response_from_interaction(&merged, model, ingress)
-                .map_err(|e| guard.abort_internal(0, 0, "replay-from-client", "replay", false, e))?;
+        let response_json = interactions_lib::build_response_from_interaction(
+            &merged, model, ingress,
+        )
+        .map_err(|e| guard.abort_internal(0, 0, "replay-from-client", "replay", false, e))?;
         guard.finish(200, 0, 0, None, "replay-from-client", "replay", false);
         Response::builder()
             .status(200)
@@ -631,16 +644,25 @@ impl InteractionsHandler {
             let status = upstream.status();
             let error_body = upstream.text().await.unwrap_or_default();
             return Err(guard.abort_upstream(
-                duration_ms, 0, &url, "fetch-interaction", false,
-                format!("HTTP {} fetching interaction {}: {}", status.as_u16(), interaction_id, error_body),
+                duration_ms,
+                0,
+                &url,
+                "fetch-interaction",
+                false,
+                format!(
+                    "HTTP {} fetching interaction {}: {}",
+                    status.as_u16(),
+                    interaction_id,
+                    error_body
+                ),
             ));
         }
 
         let body_bytes = upstream.bytes().await.map_err(|e| {
             guard.abort_upstream(duration_ms, 0, &url, "fetch-interaction", false, e)
         })?;
-        let validated = crate::validate_upstream_body(body_bytes, guard.request_id())
-            .map_err(|(e, _)| {
+        let validated =
+            crate::validate_upstream_body(body_bytes, guard.request_id()).map_err(|(e, _)| {
                 guard.abort_upstream(duration_ms, 0, &url, "fetch-interaction", false, e)
             })?;
         serde_json::from_str(&validated.text)
@@ -892,26 +914,28 @@ impl InteractionsHandler {
         {
             let mut store = self.v2_store.write().await;
             let now = crate::session::unix_now();
-            store.interactions.insert_upstream(
-                crate::session::UpstreamInteractionNode {
+            store
+                .interactions
+                .insert_upstream(crate::session::UpstreamInteractionNode {
                     id: interaction_id.clone(),
                     prev_id: None, // The caller's prev_id drives this in the full rewrite
                     client_id: session_id.to_string(),
                     last_seen_utc: now,
                     expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
-                },
-            );
-            store.interactions.insert_client(
-                crate::session::ClientInteractionNode {
+                });
+            store
+                .interactions
+                .insert_client(crate::session::ClientInteractionNode {
                     id: interaction_id.clone(),
                     prev_id: None,
                     message_hashes: harness_hashes.clone(),
                     system_instruction_hash: None,
                     upstream_ids: vec![interaction_id.clone()],
                     last_seen_utc: now,
-                },
-            );
-            store.sessions.entry(session_id.to_string())
+                });
+            store
+                .sessions
+                .entry(session_id.to_string())
                 .and_modify(|s| {
                     s.last_interaction_id = Some(interaction_id.clone());
                     s.last_seen_utc = now;
@@ -1269,6 +1293,9 @@ impl InteractionsHandler {
     }
 
     /// Handle split sending: break content into chunks under proxy_limit.
+    /// Uses InFlightStore for durable piece tracking and v2 InteractionStore
+    /// for chain state.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_split_send(
         &self,
         params: &CreateModelInteractionParams,
@@ -1277,7 +1304,7 @@ impl InteractionsHandler {
         url: &str,
         route: &RouteTarget,
         session_id: &str,
-        total_message_count: usize,
+        harness_hashes: Vec<u64>,
         stream: bool,
         model: &str,
         upstream_label: &str,
@@ -1292,9 +1319,6 @@ impl InteractionsHandler {
 
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
-
-        let mut last_id: Option<String> = None;
-        let mut last_interaction: Option<Interaction> = None;
 
         let system_instruction = params.system_instruction.clone();
 
@@ -1312,16 +1336,11 @@ impl InteractionsHandler {
             model: model.to_string(),
             input: InteractionsInput::ContentList(vec![]),
             stream: Some(false),
-            // Include a representative previous_interaction_id so that
-            // chunk size estimation accounts for the field that
-            // build_chunk_request actually serializes.  Without this the
-            // measured size can be smaller than the real serialized body,
-            // causing chunks to silently exceed proxy_limit.
             previous_interaction_id: Some("x".repeat(36)),
             ..Default::default()
         };
 
-        // Use the new full-chunk packer
+        // Pack content into chunks
         let chunks = match interactions_lib::pack_content_into_chunks(
             &first_envelope,
             &subsequent_envelope,
@@ -1347,8 +1366,6 @@ impl InteractionsHandler {
                 .map(|v| v.len())
                 .unwrap_or(0);
             if empty_size > limit {
-                // Compute envelope overhead (everything except system_instruction text)
-                // so split_text_for_limit produces chunks that fit when wrapped.
                 let envelope_without_sys = {
                     let mut env = first_envelope.clone();
                     env.system_instruction = Some(String::new());
@@ -1362,7 +1379,7 @@ impl InteractionsHandler {
                         route,
                         session_id,
                         &chunks,
-                        total_message_count,
+                        harness_hashes,
                         sys_limit,
                         model,
                         upstream_label,
@@ -1379,8 +1396,34 @@ impl InteractionsHandler {
             }
         }
 
-        // Send each chunk sequentially
+        // Build initial pieces (request_body filled in before each send)
+        let batch_id = format!("batch-{}-{}", session_id, crate::session::unix_now());
+        let pieces: Vec<session::InFlightPiece> = (0..chunks.len())
+            .map(|i| session::InFlightPiece {
+                index: i,
+                content_hash: 0,
+                request_body: vec![],
+                status: session::InFlightStatus::Pending,
+            })
+            .collect();
+
+        {
+            let mut store = self.v2_store.write().await;
+            store.create_batch(
+                batch_id.clone(),
+                session_id.to_string(),
+                params.previous_interaction_id.clone(),
+                harness_hashes.clone(),
+                pieces,
+            );
+            if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                tracing::warn!(error = %e, "v2 store save failed after batch creation");
+            }
+        }
+
+        // Send each chunk sequentially, tracking state in InFlightStore
         let mut current_prev = params.previous_interaction_id.clone();
+        let mut all_interactions: Vec<crate::interactions_types::Interaction> = Vec::new();
 
         for (i, chunk) in chunks.iter().enumerate() {
             let is_first_chunk = i == 0 && current_prev.is_none();
@@ -1422,6 +1465,20 @@ impl InteractionsHandler {
                 )
             })?;
 
+            // Update piece body and mark ResponseStarted
+            {
+                let mut store = self.v2_store.write().await;
+                if let Err(e) = store.set_piece_body(&batch_id, i, chunk_body.clone()) {
+                    tracing::warn!(error = %e, "set_piece_body failed");
+                }
+                if let Err(e) = store.mark_response_started(&batch_id, i) {
+                    tracing::warn!(error = %e, "mark_response_started failed");
+                }
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save failed before chunk send");
+                }
+            }
+
             guard.egress_dump(&chunk_body, &egress_headers);
 
             let builder = build_interactions_headers(
@@ -1431,20 +1488,46 @@ impl InteractionsHandler {
                 route.api_key.as_deref(),
                 request_headers,
             );
-            let upstream = builder.body(chunk_body).send().await.map_err(|e| {
-                guard.abort_upstream(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    stream,
-                    e,
-                )
-            })?;
+            let upstream = match builder.body(chunk_body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(&batch_id, format!("chunk {i} send error: {e}"))
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+                    return Err(guard.abort_upstream(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    ));
+                }
+            };
             if !upstream.status().is_success() {
                 let status = upstream.status();
                 let response_headers = response_headers_to_pairs(upstream.headers());
                 let error_body = upstream.text().await.unwrap_or_default();
+
+                // Fail the batch: cancel ACKed pieces
+                let mut store = self.v2_store.write().await;
+                let acked_ids = store
+                    .fail_batch(&batch_id, format!("chunk {i} HTTP {}", status.as_u16()))
+                    .unwrap_or_default();
+                let _ = store.save_to_disk(&self.v2_path).await;
+                drop(store);
+                for id in &acked_ids {
+                    let _ = self.cancel_interaction(id, route).await;
+                }
+
                 guard.finish_with_upstream_error(
                     status.as_u16(),
                     start.elapsed().as_millis() as u64,
@@ -1467,40 +1550,46 @@ impl InteractionsHandler {
             }
             let response_headers = response_headers_to_pairs(upstream.headers());
 
-            // Eagerly update session progress before reading the body.
-            // If body read/validation/deserialization fails after a
-            // successful HTTP 200, the upstream already created the
-            // interaction — retry must not re-send the same content.
-            let delivered_items: usize = chunks[..=i].iter().map(|c| c.len()).sum();
-            let delivered_so_far = std::cmp::min(delivered_items, total_message_count);
-            let interim_id = current_prev.clone().unwrap_or_default();
-            if let Err(e) = self
-                .session_store
-                .update(session_id, interim_id, delivered_so_far, true)
-                .await
-            {
-                tracing::error!(
-                    session_id = %session_id,
-                    error = %e,
-                    "session update failed after successful split-send chunk (eager)"
-                );
-            }
-
-            let response_bytes = upstream.bytes().await.map_err(|e| {
-                guard.abort_upstream(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    stream,
-                    e,
-                )
-            })?;
+            let response_bytes = match upstream.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(&batch_id, format!("chunk {i} body read error: {e}"))
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+                    return Err(guard.abort_upstream(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    ));
+                }
+            };
             let validated = match crate::validate_upstream_body(response_bytes, guard.request_id())
             {
                 Ok(v) => v,
                 Err((e, dump)) => {
                     guard.response_dump(dump, 502, true, response_headers.clone());
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(&batch_id, format!("chunk {i} validation error: {e}"))
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -1513,28 +1602,53 @@ impl InteractionsHandler {
             };
             guard.response_dump(validated.dump, 200, false, response_headers.clone());
             let response_text = validated.text;
-            let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
-                guard.abort_upstream(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    stream,
-                    e,
-                )
-            })?;
+            let interaction: crate::interactions_types::Interaction =
+                match serde_json::from_str(&response_text) {
+                    Ok(inter) => inter,
+                    Err(e) => {
+                        let acked_ids = {
+                            let mut store = self.v2_store.write().await;
+                            let ids = store
+                                .fail_batch(&batch_id, format!("chunk {i} parse error: {e}"))
+                                .unwrap_or_default();
+                            let _ = store.save_to_disk(&self.v2_path).await;
+                            ids
+                        };
+                        for id in &acked_ids {
+                            let _ = self.cancel_interaction(id, route).await;
+                        }
+                        return Err(guard.abort_upstream(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            stream,
+                            e,
+                        ));
+                    }
+                };
             total_response_bytes += response_text.len();
             let interaction_id = interaction.id.clone();
             current_prev = Some(interaction_id.clone());
-            last_id = Some(interaction_id.clone());
-            last_interaction = Some(interaction);
+            all_interactions.push(interaction);
 
-            // After first chunk, rebuild subsequent_envelope with the real
-            // previous_interaction_id so subsequent chunk size estimation
-            // uses the actual ID length, not a hardcoded 36-char placeholder.
+            // Mark Acked
+            {
+                let mut store = self.v2_store.write().await;
+                if let Err(e) = store.mark_sent(&batch_id, i, interaction_id.clone()) {
+                    tracing::warn!(error = %e, "mark_sent failed");
+                }
+                if let Err(e) = store.ack_piece(&batch_id, i, interaction_id.clone()) {
+                    tracing::warn!(error = %e, "ack_piece failed");
+                }
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save failed after chunk ack");
+                }
+            }
+
+            // After first chunk, rebuild subsequent_envelope with real prev_id
             if i == 0 {
                 subsequent_envelope.previous_interaction_id = Some(interaction_id.clone());
-                // Verify remaining pre-packed chunks still fit with real ID
                 for (j, chunk) in chunks.iter().enumerate().skip(1) {
                     let body = interactions_lib::build_pack_body(&subsequent_envelope, chunk);
                     let size = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
@@ -1553,28 +1667,53 @@ impl InteractionsHandler {
                     }
                 }
             }
+        }
 
-            // Update session after each successful chunk so retries don't
-            // re-send already-accepted content upstream.
-            // Track delivered Content items by index (upper bound) to
-            // prevent underestimation from proportional rounding.
-            let delivered_items: usize = chunks[..=i].iter().map(|c| c.len()).sum();
-            let delivered_so_far = std::cmp::min(delivered_items, total_message_count);
+        // Complete batch: insert UpstreamInteractionNodes + ClientInteractionNode
+        let client_node = {
+            let mut store = self.v2_store.write().await;
+            match store.complete_batch(&batch_id) {
+                Ok(node) => {
+                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                        tracing::warn!(error = %e, "v2 store save failed after batch completion");
+                    }
+                    node
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "complete_batch failed");
+                    return Err(guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    ));
+                }
+            }
+        };
+
+        // Update old session store for backward compat
+        {
+            let final_id = &client_node.id;
+            let harness_count = harness_hashes.len();
             if let Err(e) = self
                 .session_store
-                .update(session_id, interaction_id, delivered_so_far, true)
+                .update(session_id, final_id.clone(), harness_count, false)
                 .await
             {
-                tracing::error!(
+                tracing::warn!(
                     session_id = %session_id,
                     error = %e,
-                    "session update failed after successful split-send chunk"
+                    "old session store update failed after split-send"
                 );
             }
         }
 
+        // Merge non-streaming responses from all pieces
         if stream {
-            if let Some(ref inter) = last_interaction {
+            // Phase 7 will buffer streaming split-send; for now return last interaction
+            if let Some(inter) = all_interactions.last() {
                 let resp = interactions_lib::build_response_from_interaction(inter, model, ingress)
                     .map_err(|e| {
                         guard.abort_internal(
@@ -1586,21 +1725,6 @@ impl InteractionsHandler {
                             e,
                         )
                     })?;
-                // Finalize session after successful translation so retries
-                // can recover if translation fails.
-                if let Some(ref final_id) = last_id {
-                    self.session_store
-                        .update(session_id, final_id.clone(), total_message_count, false)
-                        .await
-                        .map_err(|e| {
-                            tracing::error!(
-                                session_id = %session_id,
-                                error = %e,
-                                "session update failed after successful split-send stream"
-                            );
-                            AppError::Internal(format!("session update failed: {e}"))
-                        })?;
-                }
                 let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
                 guard.ingress_response_dump(
                     crate::diagnostics::dump_body_from_bytes(&resp_bytes),
@@ -1621,47 +1745,20 @@ impl InteractionsHandler {
             }
         }
 
-        let resp = if let Some(ref inter) = last_interaction {
-            interactions_lib::build_response_from_interaction(inter, model, ingress).map_err(
-                |e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        false,
-                        e,
-                    )
-                },
-            )?
-        } else {
-            build_fallback_response(last_interaction.as_ref(), last_id.clone(), model, ingress)
-                .map_err(|e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        false,
-                        e,
-                    )
-                })?
-        };
-        // Finalize session after successful response translation.
-        if let Some(ref final_id) = last_id {
-            self.session_store
-                .update(session_id, final_id.clone(), total_message_count, false)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        session_id = %session_id,
-                        error = %e,
-                        "session update failed after successful split-send"
-                    );
-                    AppError::Internal(format!("session update failed: {e}"))
-                })?;
-        }
-        // Dump the final ingress response before finishing
+        // Non-streaming: merge all piece responses
+        let merged = Self::merge_interaction_responses(&all_interactions, &client_node.id);
+        let resp = interactions_lib::build_response_from_interaction(&merged, model, ingress)
+            .map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    false,
+                    e,
+                )
+            })?;
+
         let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
         guard.ingress_response_dump(crate::diagnostics::dump_body_from_bytes(&resp_bytes), 200);
         guard.finish(
@@ -1676,7 +1773,62 @@ impl InteractionsHandler {
         Ok(Self::ok_with_session_header(ingress, session_id, resp))
     }
 
+    /// Merge multiple interaction responses from split pieces into one
+    /// client-visible interaction. Concatenates steps from all pieces,
+    /// uses the last piece's usage, and assigns the final interaction id.
+    fn merge_interaction_responses(
+        pieces: &[crate::interactions_types::Interaction],
+        final_id: &str,
+    ) -> crate::interactions_types::Interaction {
+        let mut all_steps: Vec<crate::interactions_types::Step> = Vec::new();
+        let mut total_input_tokens: i64 = 0;
+        let mut total_output_tokens: i64 = 0;
+        let mut model: Option<String> = None;
+
+        for interaction in pieces {
+            if let Some(steps) = &interaction.steps {
+                all_steps.extend(steps.clone());
+            }
+            model = interaction.model.clone();
+            if let Some(ref usage) = interaction.usage {
+                total_input_tokens = usage.total_input_tokens.unwrap_or(0);
+                total_output_tokens = usage.total_output_tokens.unwrap_or(0);
+            }
+        }
+
+        crate::interactions_types::Interaction {
+            id: final_id.to_string(),
+            status: pieces
+                .last()
+                .map(|i| i.status.clone())
+                .unwrap_or_else(|| "completed".into()),
+            created: pieces.first().and_then(|i| i.created.clone()),
+            updated: pieces.last().and_then(|i| i.updated.clone()),
+            steps: if all_steps.is_empty() {
+                None
+            } else {
+                Some(all_steps)
+            },
+            model,
+            usage: Some(crate::interactions_types::Usage {
+                total_tokens: Some(total_input_tokens + total_output_tokens),
+                total_input_tokens: Some(total_input_tokens),
+                total_output_tokens: Some(total_output_tokens),
+                cached_tokens_by_modality: None,
+                grounding_tool_count: None,
+                input_tokens_by_modality: None,
+                output_tokens_by_modality: None,
+                tool_use_tokens_by_modality: None,
+                total_cached_tokens: None,
+                total_thought_tokens: None,
+                total_tool_use_tokens: None,
+            }),
+            ..Default::default()
+        }
+    }
+
     /// Split system_instruction across multiple interactions, then send chunks.
+    #[allow(clippy::too_many_arguments)]
     async fn send_split_system_instruction(
         &self,
         sys: &str,
@@ -1684,7 +1836,7 @@ impl InteractionsHandler {
         route: &RouteTarget,
         session_id: &str,
         chunks: &[Vec<crate::interactions_types::Content>],
-        total_message_count: usize,
+        harness_hashes: Vec<u64>,
         limit: usize,
         model: &str,
         upstream_label: &str,
@@ -1852,7 +2004,7 @@ impl InteractionsHandler {
             // so retries don't re-send already-created interaction chain.
             if let Err(e) = self
                 .session_store
-                .update(session_id, int_id, total_message_count, true)
+                .update(session_id, int_id, harness_hashes.len(), true)
                 .await
             {
                 tracing::error!(
@@ -1975,7 +2127,7 @@ impl InteractionsHandler {
 
         if let Some(ref final_id) = last_id {
             self.session_store
-                .update(session_id, final_id.clone(), total_message_count, false)
+                .update(session_id, final_id.clone(), harness_hashes.len(), false)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -4168,7 +4320,10 @@ If you don't know the answer, say so honestly.";
         );
         // x-claude-code-session-id is forwarded as-is (passthrough)
         assert_eq!(
-            map.get("x-claude-code-session-id").unwrap().to_str().unwrap(),
+            map.get("x-claude-code-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "sess-1"
         );
     }

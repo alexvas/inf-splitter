@@ -304,18 +304,25 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
 
     let v2_path = std::path::PathBuf::from(format!("{}.v2", session_path));
     let v2_store = Arc::new(tokio::sync::RwLock::new(
-        crate::session::StoreV2::load_from_disk(&v2_path).await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to load v2 store, starting fresh");
-            crate::session::StoreV2::new()
-        }),
+        crate::session::StoreV2::load_from_disk(&v2_path)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to load v2 store, starting fresh");
+                crate::session::StoreV2::new()
+            }),
     ));
 
     let config = Arc::new(config);
     let max_request_body = config.max_request_body;
     let openai = OpenAiHandler::new(config.as_ref(), diagnostics.clone())?;
     let anthropic = AnthropicHandler::new(config.as_ref(), diagnostics.clone())?;
-    let interactions =
-        InteractionsHandler::new(config.as_ref(), diagnostics.clone(), session_store.clone(), v2_store, v2_path)?;
+    let interactions = InteractionsHandler::new(
+        config.as_ref(),
+        diagnostics.clone(),
+        session_store.clone(),
+        v2_store,
+        v2_path,
+    )?;
 
     // Recover pending sessions: after an unclean shutdown, sessions with
     // pending=true need verification. For each pending session, check if the

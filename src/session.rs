@@ -314,10 +314,16 @@ pub enum InFlightStatus {
     /// HTTP 200 received from upstream, but no interaction id observed yet.
     ResponseStarted,
     /// Upstream interaction id observed; SSE stream may still be draining.
-    Sent { interaction_id: String },
+    Sent {
+        interaction_id: String,
+    },
     /// SSE stream fully consumed, all content collected.
-    Acked { interaction_id: String },
-    Failed { error: String },
+    Acked {
+        interaction_id: String,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// A single piece in a split-send batch.
@@ -430,7 +436,10 @@ impl InteractionStore {
         let mut current = self.clients.get(id);
         while let Some(node) = current {
             result.push(node);
-            current = node.prev_id.as_deref().and_then(|pid| self.clients.get(pid));
+            current = node
+                .prev_id
+                .as_deref()
+                .and_then(|pid| self.clients.get(pid));
         }
         result
     }
@@ -441,7 +450,10 @@ impl InteractionStore {
         let mut current = self.upstreams.get(id);
         while let Some(node) = current {
             result.push(node);
-            current = node.prev_id.as_deref().and_then(|pid| self.upstreams.get(pid));
+            current = node
+                .prev_id
+                .as_deref()
+                .and_then(|pid| self.upstreams.get(pid));
         }
         result
     }
@@ -539,8 +551,8 @@ pub fn find_frontier(
             current_client
         };
 
-        let is_known = prefix_len == hashes.len()
-            && incoming_prev_id == terminal_client.prev_id.as_deref();
+        let is_known =
+            prefix_len == hashes.len() && incoming_prev_id == terminal_client.prev_id.as_deref();
 
         match &mut best {
             Some((best_len, best_node, best_known)) => {
@@ -584,9 +596,8 @@ pub fn find_frontier(
                 }
             } else {
                 // Check if we ended at a boundary or inside
-                let ended_at_boundary = ended_at_client_boundary(
-                    hashes, prefix_len, terminal_client, store,
-                );
+                let ended_at_boundary =
+                    ended_at_client_boundary(hashes, prefix_len, terminal_client, store);
                 if ended_at_boundary {
                     Frontier {
                         index: prefix_len,
@@ -615,10 +626,7 @@ pub fn find_frontier(
 }
 
 /// Find the next client node in chain (child of `node`).
-fn next_in_chain<'a>(
-    node: &ClientInteractionNode,
-    store: &'a InteractionStore,
-) -> Option<&'a str> {
+fn next_in_chain<'a>(node: &ClientInteractionNode, store: &'a InteractionStore) -> Option<&'a str> {
     for client in store.clients.values() {
         if client.prev_id.as_deref() == Some(&node.id) {
             return Some(&client.id);
@@ -656,7 +664,10 @@ fn ended_at_client_boundary(
             containing_client = node;
             break;
         }
-        current = node.prev_id.as_deref().and_then(|pid| store.clients.get(pid));
+        current = node
+            .prev_id
+            .as_deref()
+            .and_then(|pid| store.clients.get(pid));
     }
 
     // Check if the last hash is the LAST hash in its client node
@@ -713,10 +724,13 @@ impl StoreV2 {
             .map_err(|e| e.to_string())?;
 
         // Detect old v1 format (no version=2 field)
-        let check: toml::Value = toml::from_str(&raw).map_err(|e| {
-            format!("failed to parse session TOML: {e}")
-        })?;
-        if !check.get("version").and_then(|v| v.as_integer()).is_some_and(|v| v == 2) {
+        let check: toml::Value =
+            toml::from_str(&raw).map_err(|e| format!("failed to parse session TOML: {e}"))?;
+        if !check
+            .get("version")
+            .and_then(|v| v.as_integer())
+            .is_some_and(|v| v == 2)
+        {
             tracing::warn!(
                 path = %path.display(),
                 "old session store format detected (missing version=2), ignoring. count-based sessions cannot be migrated to v2 hashed chains",
@@ -724,9 +738,8 @@ impl StoreV2 {
             return Ok(StoreV2::new());
         }
 
-        let doc: StoreDocumentV2 = toml::from_str(&raw).map_err(|e| {
-            format!("failed to deserialize v2 store: {e}")
-        })?;
+        let doc: StoreDocumentV2 =
+            toml::from_str(&raw).map_err(|e| format!("failed to deserialize v2 store: {e}"))?;
 
         let mut store = StoreV2 {
             sessions: doc.sessions,
@@ -743,15 +756,12 @@ impl StoreV2 {
         let clients = std::mem::take(&mut store.interactions.clients);
         for (_, node) in &clients {
             for (idx, &hash) in node.message_hashes.iter().enumerate() {
-                store
-                    .interactions
-                    .hash_index
-                    .entry(hash)
-                    .or_default()
-                    .push(ClientInteractionPosition {
+                store.interactions.hash_index.entry(hash).or_default().push(
+                    ClientInteractionPosition {
                         client_id: node.id.clone(),
                         message_index: idx,
-                    });
+                    },
+                );
             }
             for upstream_id in &node.upstream_ids {
                 store
@@ -786,8 +796,8 @@ impl StoreV2 {
             },
             in_flight: self.in_flight.clone(),
         };
-        let toml_str = toml::to_string(&doc)
-            .map_err(|e| format!("failed to serialize v2 store: {e}"))?;
+        let toml_str =
+            toml::to_string(&doc).map_err(|e| format!("failed to serialize v2 store: {e}"))?;
         let tmp = path.with_extension("tmp");
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -843,7 +853,11 @@ impl StoreV2 {
     }
 
     /// Transition a piece from Pending to ResponseStarted.
-    pub fn mark_response_started(&mut self, batch_id: &str, piece_index: usize) -> Result<(), String> {
+    pub fn mark_response_started(
+        &mut self,
+        batch_id: &str,
+        piece_index: usize,
+    ) -> Result<(), String> {
         let batch = self
             .in_flight
             .get_mut(batch_id)
@@ -864,7 +878,12 @@ impl StoreV2 {
     }
 
     /// Transition a piece from ResponseStarted to Sent.
-    pub fn mark_sent(&mut self, batch_id: &str, piece_index: usize, interaction_id: String) -> Result<(), String> {
+    pub fn mark_sent(
+        &mut self,
+        batch_id: &str,
+        piece_index: usize,
+        interaction_id: String,
+    ) -> Result<(), String> {
         let batch = self
             .in_flight
             .get_mut(batch_id)
@@ -885,7 +904,12 @@ impl StoreV2 {
     }
 
     /// Transition a piece to Acked.
-    pub fn ack_piece(&mut self, batch_id: &str, piece_index: usize, interaction_id: String) -> Result<(), String> {
+    pub fn ack_piece(
+        &mut self,
+        batch_id: &str,
+        piece_index: usize,
+        interaction_id: String,
+    ) -> Result<(), String> {
         let batch = self
             .in_flight
             .get_mut(batch_id)
@@ -912,7 +936,11 @@ impl StoreV2 {
     pub fn batch_is_complete(&self, batch_id: &str) -> bool {
         self.in_flight
             .get(batch_id)
-            .map(|b| b.pieces.iter().all(|p| matches!(p.status, InFlightStatus::Acked { .. })))
+            .map(|b| {
+                b.pieces
+                    .iter()
+                    .all(|p| matches!(p.status, InFlightStatus::Acked { .. }))
+            })
             .unwrap_or(false)
     }
 
@@ -1013,6 +1041,26 @@ impl StoreV2 {
     /// Remove a failed batch from the store.
     pub fn remove_batch(&mut self, batch_id: &str) {
         self.in_flight.remove(batch_id);
+    }
+
+    /// Update a piece's request_body before sending.
+    pub fn set_piece_body(
+        &mut self,
+        batch_id: &str,
+        piece_index: usize,
+        body: Vec<u8>,
+    ) -> Result<(), String> {
+        let batch = self
+            .in_flight
+            .get_mut(batch_id)
+            .ok_or_else(|| format!("batch {batch_id} not found"))?;
+        let piece = batch
+            .pieces
+            .get_mut(piece_index)
+            .ok_or_else(|| format!("piece {piece_index} not found"))?;
+        piece.request_body = body;
+        batch.updated_utc = unix_now();
+        Ok(())
     }
 }
 
@@ -1294,7 +1342,9 @@ mod tests {
     fn interaction_store_insert_and_lookup_upstream() {
         let mut store = InteractionStore::new();
         store.insert_upstream(make_upstream_node("int-A", None));
-        let node = store.get_upstream("int-A").expect("must find upstream node");
+        let node = store
+            .get_upstream("int-A")
+            .expect("must find upstream node");
         assert_eq!(node.id, "int-A");
         assert!(node.prev_id.is_none());
     }
@@ -1317,10 +1367,24 @@ mod tests {
     #[test]
     fn interaction_store_hash_index_supports_duplicates() {
         let mut store = InteractionStore::new();
-        store.insert_client(make_client_node("int-A", None, vec![0xA, 0xB], vec!["int-A"]));
-        store.insert_client(make_client_node("int-B", None, vec![0xA, 0xC], vec!["int-B"]));
+        store.insert_client(make_client_node(
+            "int-A",
+            None,
+            vec![0xA, 0xB],
+            vec!["int-A"],
+        ));
+        store.insert_client(make_client_node(
+            "int-B",
+            None,
+            vec![0xA, 0xC],
+            vec!["int-B"],
+        ));
         let positions = store.lookup_hash(0xA);
-        assert_eq!(positions.len(), 2, "duplicate hash must return both positions");
+        assert_eq!(
+            positions.len(),
+            2,
+            "duplicate hash must return both positions"
+        );
         let ids: Vec<&str> = positions.iter().map(|p| p.client_id.as_str()).collect();
         assert!(ids.contains(&"int-A"));
         assert!(ids.contains(&"int-B"));
@@ -1356,7 +1420,12 @@ mod tests {
     fn frontier_isolated_later_hash_does_not_move_frontier() {
         let mut store = InteractionStore::new();
         // 0xB is only in an unrelated branch, not in any valid prefix starting from 0xA
-        store.insert_client(make_client_node("unrelated", None, vec![0xB], vec!["int-X"]));
+        store.insert_client(make_client_node(
+            "unrelated",
+            None,
+            vec![0xB],
+            vec!["int-X"],
+        ));
         // No chain contains 0xA, so prefix [0xA, 0xB] can't start
 
         let frontier = find_frontier(&[0xA, 0xB], None, &store);
@@ -1405,7 +1474,10 @@ mod tests {
         let frontier = find_frontier(&[0xA, 0xB, 0xD], None, &store);
         // Expect fork: C2's parent = C1
         assert_eq!(frontier.previous_interaction_id.as_deref(), Some("C1"));
-        assert_eq!(frontier.index, 0, "fork at C1, re-send from position 0 of C2");
+        assert_eq!(
+            frontier.index, 0,
+            "fork at C1, re-send from position 0 of C2"
+        );
     }
 
     #[test]
@@ -1486,7 +1558,10 @@ mod tests {
 
         let loaded = StoreV2::load_from_disk(&path).await.unwrap();
         assert_eq!(loaded.sessions.len(), 1);
-        assert_eq!(loaded.sessions["sess-1"].last_interaction_id.as_deref(), Some("int-A"));
+        assert_eq!(
+            loaded.sessions["sess-1"].last_interaction_id.as_deref(),
+            Some("int-A")
+        );
         assert_eq!(loaded.interactions.clients.len(), 1);
         assert_eq!(loaded.interactions.upstreams.len(), 1);
         // Hash index must be rebuilt
@@ -1524,7 +1599,12 @@ mod tests {
     #[tokio::test]
     async fn session_info_does_not_drive_frontier() {
         let mut store = InteractionStore::new();
-        store.insert_client(make_client_node("int-new", None, vec![0xA], vec!["int-new"]));
+        store.insert_client(make_client_node(
+            "int-new",
+            None,
+            vec![0xA],
+            vec!["int-new"],
+        ));
 
         // SessionInfo pointed at int-old — frontier must use InteractionStore, not SessionInfo
         let _info = SessionInfo {
@@ -1553,7 +1633,13 @@ mod tests {
         }
     }
 
-    fn make_batch(id: &str, session_id: &str, prev_id: Option<&str>, hashes: Vec<u64>, pieces: Vec<InFlightPiece>) -> InFlightBatch {
+    fn make_batch(
+        id: &str,
+        session_id: &str,
+        prev_id: Option<&str>,
+        hashes: Vec<u64>,
+        pieces: Vec<InFlightPiece>,
+    ) -> InFlightBatch {
         InFlightBatch {
             id: id.to_string(),
             session_id: session_id.to_string(),
@@ -1688,7 +1774,9 @@ mod tests {
             .interactions
             .insert_upstream(make_upstream_node("int-A", None));
 
-        let acked = store.fail_batch("batch-1", "upstream error".into()).unwrap();
+        let acked = store
+            .fail_batch("batch-1", "upstream error".into())
+            .unwrap();
         assert_eq!(acked, vec!["int-A"]);
         // Upstream node for int-A removed
         assert!(store.interactions.get_upstream("int-A").is_none());

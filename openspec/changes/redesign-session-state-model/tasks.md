@@ -92,45 +92,22 @@
 
 ## Phase 6: Split-Send Preservation and State Rewrite
 
-### 6.1 RED — Full-body proxy_limit packing preserved
-- Chunk sizes are measured as serialized full `CreateModelInteractionParams`
-- Every chunk body is `<= proxy_limit`
+- [x] 6.1 RED — Full-body proxy_limit packing preserved ✓ 2026-06-28
+- [x] 6.2 RED — System instruction split still precedes content ✓ 2026-06-28
+- [x] 6.3 RED — Split-send creates upstream nodes and client node ✓ 2026-06-28
+- [x] 6.4 RED — Non-streaming split merges all piece responses ✓ 2026-06-28
+- [x] 6.5 RED — Non-streaming merge preserves tool calls across pieces ✓ 2026-06-28
+- [x] 6.6 RED — Split-send failure cancels and records failed batch ✓ 2026-06-28
+- [x] 6.7 GREEN — Rewrite `handle_split_send` around InFlightStore ✓ 2026-06-28
+  - `handle_split_send` now creates InFlightBatch, tracks piece status (Pending→ResponseStarted→Sent→Acked)
+  - Persists after every state transition via `save_to_disk()`
+  - On completion: `complete_batch()` inserts UpstreamInteractionNodes + ClientInteractionNode
+  - On failure: `fail_batch()` + cancels ACKed pieces upstream
+  - Non-streaming responses merged via `merge_interaction_responses()`
+  - Old per-chunk `message_count` updates removed; old SessionStore kept for backward compat
+  - Added `set_piece_body()` to StoreV2 for updating piece request bodies before send
 
-### 6.2 RED — System instruction split still precedes content
-- Oversized system instruction splits first
-- First system chunk carries tools/generation config + first part
-- Each subsequent chunk carries its system_instruction part + prev id
-- Last system chunk can also pack content if it fits
-
-### 6.3 RED — Split-send creates upstream nodes and client node
-- Multi-piece split completes
-- THEN all `UpstreamInteractionNode`s inserted in chain order
-- AND `ClientInteractionNode` has `id = final`, `upstream_ids = [all Acked interaction_ids in piece order]`, `message_hashes = original`
-- AND batch removed from `InFlightStore`
-
-### 6.4 RED — Non-streaming split merges all piece responses
-- P0 returns text "Hello", P1 returns text " world"
-- THEN client receives one response with "Hello world" and final interaction id
-
-### 6.5 RED — Non-streaming merge preserves tool calls across pieces
-- P0 returns text, P1 returns FunctionCallStep
-- THEN merged response contains both text and tool_use with final id
-
-### 6.6 RED — Split-send failure cancels and records failed batch
-- Later piece fails
-- THEN ACKed pieces are cancelled and batch is failed
-
-### 6.7 GREEN — Rewrite `handle_split_send` around InFlightStore
-- Preserve existing packing helpers where possible
-- Persist before sending each piece
-- Store intermediate interaction IDs in Acked pieces
-- Merge piece responses into one client-visible response with final id
-- Insert all `UpstreamInteractionNode`s in chain order
-- Insert `ClientInteractionNode` with `upstream_ids` and `message_hashes`
-- Remove completed batch from `InFlightStore`
-- Remove old per-chunk `message_count` updates
-
-**Quality Gate:** `cargo test --locked` — Phase 6 tests pass
+**Quality Gate:** PASSED — `cargo fmt --check` clean, `cargo clippy --locked` 0 errors, `cargo test --locked` 426 tests pass
 
 ---
 
@@ -225,7 +202,7 @@
 - [x] Phase 3: Versioned Persistence and SessionInfo ✓ 2026-06-28
 - [x] Phase 4: InFlightStore State Machine ✓ 2026-06-28
 - [x] Phase 5: Handler Frontier Integration ✓ 2026-06-28
-- [ ] Phase 6: Split-Send Preservation and State Rewrite
+- [x] Phase 6: Split-Send Preservation and State Rewrite ✓ 2026-06-28
 - [ ] Phase 7: Streaming Split-Send Buffer
 - [ ] Phase 8: Startup Recovery and Control Messages
 - [ ] Phase 9: Regression and Final Checks

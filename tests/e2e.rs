@@ -2047,3 +2047,185 @@ models = "gemini-3.1-flash-lite"
         "Content-Type must always be application/json"
     );
 }
+
+// ── Phase 7.3: Anthropic split streaming emits coherent final-id stream ──
+
+#[tokio::test]
+async fn anthropic_split_streaming_uses_final_id() {
+    let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let request_count_clone = request_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/interactions",
+        axum::routing::post(
+            move |axum::Json(_body): axum::Json<serde_json::Value>| {
+                let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let resp = match count {
+                    0 => serde_json::json!({
+                        "id": "int-A",
+                        "status": "completed",
+                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Hello"}]}],
+                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
+                    }),
+                    _ => serde_json::json!({
+                        "id": "int-B",
+                        "status": "completed",
+                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": " world"}]}],
+                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
+                    }),
+                };
+                async move { axum::Json(resp) }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let content_a = "A".repeat(600);
+    let content_b = "B".repeat(600);
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": content_a},
+            {"role": "user", "content": content_b}
+        ]
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "split streaming request failed with {status}: {body_text}"
+    );
+
+    // Must contain content from both pieces (merged)
+    assert!(
+        body_text.contains("Hello"),
+        "streaming response missing first piece content: {body_text}"
+    );
+    assert!(
+        body_text.contains("world"),
+        "streaming response missing second piece content: {body_text}"
+    );
+
+    // Must NOT expose intermediate interaction id
+    assert!(
+        !body_text.contains("int-A"),
+        "streaming response must not expose intermediate interaction id int-A: {body_text}"
+    );
+
+    // Must use final interaction id
+    assert!(
+        body_text.contains("int-B"),
+        "streaming response must contain final interaction id int-B: {body_text}"
+    );
+}
+
+// ── Phase 7.4: OpenAI split streaming emits final-id chat chunks ──
+
+#[tokio::test]
+async fn openai_split_streaming_uses_final_id() {
+    let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let request_count_clone = request_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/interactions",
+        axum::routing::post(
+            move |axum::Json(_body): axum::Json<serde_json::Value>| {
+                let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let resp = match count {
+                    0 => serde_json::json!({
+                        "id": "int-A",
+                        "status": "completed",
+                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Hello"}]}],
+                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
+                    }),
+                    _ => serde_json::json!({
+                        "id": "int-B",
+                        "status": "completed",
+                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": " world"}]}],
+                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
+                    }),
+                };
+                async move { axum::Json(resp) }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    let content_a = "A".repeat(600);
+    let content_b = "B".repeat(600);
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": content_a},
+            {"role": "user", "content": content_b}
+        ]
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "split streaming OpenAI request failed with {status}: {body_text}"
+    );
+
+    // Must contain content from both pieces
+    assert!(
+        body_text.contains("Hello"),
+        "streaming response missing first piece content: {body_text}"
+    );
+    assert!(
+        body_text.contains("world"),
+        "streaming response missing second piece content: {body_text}"
+    );
+
+    // Must NOT expose intermediate interaction id
+    assert!(
+        !body_text.contains("int-A"),
+        "streaming response must not expose intermediate interaction id int-A: {body_text}"
+    );
+}

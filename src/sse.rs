@@ -11,6 +11,125 @@ use crate::error::AppError;
 /// Protects against unbounded buffer growth from a misbehaving upstream.
 pub const MAX_SSE_LINE_LENGTH: usize = 1024 * 1024; // 1 MB
 
+/// Default limit for MemSseBuffer in bytes.
+pub const DEFAULT_SSE_BUFFER_LIMIT: usize = 100 * 1024 * 1024; // 100 MB
+
+// ── SSE Buffer for streaming split-send ─────────────────────────────
+
+/// Error returned by `SseBuffer` operations.
+#[derive(Debug)]
+pub enum SseBufferError {
+    /// Buffer exceeded the configured byte limit.
+    Overflow { limit: usize, current: usize },
+}
+
+/// Buffer for raw SSE bytes from multiple upstream piece responses.
+///
+/// Used during streaming split-send: upstream piece SSE streams are
+/// buffered until the final interaction id is known, then intermediate
+/// ids are substituted, and the unified stream is drained to the client.
+pub trait SseBuffer {
+    /// Append raw upstream SSE bytes for a given piece index.
+    fn push(&mut self, piece_index: usize, bytes: &[u8]) -> Result<(), SseBufferError>;
+
+    /// Replace all occurrences of `from` with `to` in buffered bytes.
+    fn substitute_id(&mut self, from: &str, to: &str);
+
+    /// Emit all buffered bytes in piece order.
+    fn drain(self) -> Vec<u8>;
+
+    /// Total number of bytes currently buffered.
+    fn len_bytes(&self) -> usize;
+}
+
+/// Memory-backed SSE buffer with configurable byte limit.
+pub struct MemSseBuffer {
+    pieces: Vec<(usize, Vec<u8>)>,
+    limit_bytes: usize,
+    current_bytes: usize,
+}
+
+impl Default for MemSseBuffer {
+    fn default() -> Self {
+        Self {
+            pieces: Vec::new(),
+            limit_bytes: DEFAULT_SSE_BUFFER_LIMIT,
+            current_bytes: 0,
+        }
+    }
+}
+
+impl MemSseBuffer {
+    /// Create a new buffer with a custom byte limit.
+    pub fn with_limit(limit_bytes: usize) -> Self {
+        Self {
+            pieces: Vec::new(),
+            limit_bytes,
+            current_bytes: 0,
+        }
+    }
+}
+
+impl SseBuffer for MemSseBuffer {
+    fn push(&mut self, piece_index: usize, bytes: &[u8]) -> Result<(), SseBufferError> {
+        let new_total = self.current_bytes + bytes.len();
+        if new_total > self.limit_bytes {
+            return Err(SseBufferError::Overflow {
+                limit: self.limit_bytes,
+                current: self.current_bytes,
+            });
+        }
+        self.current_bytes = new_total;
+
+        // Find or create the piece entry, maintaining sort by piece_index
+        match self
+            .pieces
+            .binary_search_by_key(&piece_index, |(idx, _)| *idx)
+        {
+            Ok(pos) => {
+                self.pieces[pos].1.extend_from_slice(bytes);
+            }
+            Err(pos) => {
+                self.pieces.insert(pos, (piece_index, bytes.to_vec()));
+            }
+        }
+        Ok(())
+    }
+
+    fn substitute_id(&mut self, from: &str, to: &str) {
+        for (_idx, data) in &mut self.pieces {
+            // Simple byte-level replacement. Works because interaction ids
+            // are alphanumeric+underscore and never contain special characters
+            // that could create false matches across SSE event boundaries.
+            let mut result = Vec::new();
+            let mut remaining = data.as_slice();
+            while let Some(pos) = remaining
+                .windows(from.len())
+                .position(|w| w == from.as_bytes())
+            {
+                result.extend_from_slice(&remaining[..pos]);
+                result.extend_from_slice(to.as_bytes());
+                remaining = &remaining[pos + from.len()..];
+            }
+            result.extend_from_slice(remaining);
+            *data = result;
+        }
+    }
+
+    fn drain(self) -> Vec<u8> {
+        let total: usize = self.pieces.iter().map(|(_, d)| d.len()).sum();
+        let mut out = Vec::with_capacity(total);
+        for (_, data) in self.pieces {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn len_bytes(&self) -> usize {
+        self.current_bytes
+    }
+}
+
 /// Parse an accumulated SSE byte buffer into a `DumpBody` containing a JSON array
 /// of each event's `data:` field. Non-JSON data lines (e.g. `[DONE]`) are skipped.
 /// If the last event is incomplete (no trailing `\n\n`), it is discarded.
@@ -338,6 +457,144 @@ mod tests {
             }
             _ => panic!("expected Utf8"),
         }
+    }
+
+    // ── MemSseBuffer tests (Phase 7) ────────────────────────────────
+
+    #[test]
+    fn mem_sse_buffer_push_and_drain_single_piece() {
+        let mut buf = MemSseBuffer::default();
+        let chunk1 = b"event: message_start\ndata: {\"id\":\"int-A\"}\n\n";
+        let chunk2 = b"event: content_block_delta\ndata: {\"text\":\"Hi\"}\n\n";
+        buf.push(0, chunk1).unwrap();
+        buf.push(0, chunk2).unwrap();
+        let expected = chunk1.len() + chunk2.len();
+        assert_eq!(buf.len_bytes(), expected);
+        let drained = buf.drain();
+        let drained_str = std::str::from_utf8(&drained).unwrap();
+        assert!(drained_str.contains("int-A"));
+        assert!(drained_str.contains("\"text\":\"Hi\""));
+    }
+
+    #[test]
+    fn mem_sse_buffer_pieces_ordered_on_drain() {
+        let mut buf = MemSseBuffer::default();
+        buf.push(1, b"event: delta\ndata: {\"id\":\"int-B\"}\n\n")
+            .unwrap();
+        buf.push(0, b"event: start\ndata: {\"id\":\"int-A\"}\n\n")
+            .unwrap();
+        buf.push(2, b"event: stop\ndata: {\"id\":\"int-C\"}\n\n")
+            .unwrap();
+
+        let drained = buf.drain();
+        let drained_str = std::str::from_utf8(&drained).unwrap();
+        // Pieces must appear in index order: 0, 1, 2
+        let pos_a = drained_str.find("int-A").unwrap();
+        let pos_b = drained_str.find("int-B").unwrap();
+        let pos_c = drained_str.find("int-C").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+    }
+
+    #[test]
+    fn mem_sse_buffer_duplicate_piece_index_appends() {
+        let mut buf = MemSseBuffer::default();
+        buf.push(0, b"first ").unwrap();
+        buf.push(1, b"second ").unwrap();
+        buf.push(0, b"append ").unwrap();
+
+        let drained = buf.drain();
+        let drained_str = std::str::from_utf8(&drained).unwrap();
+        assert_eq!(drained_str, "first append second ");
+    }
+
+    #[test]
+    fn mem_sse_buffer_substitute_id_replaces_all_occurrences() {
+        let mut buf = MemSseBuffer::default();
+        buf.push(
+            0,
+            b"event: created\ndata: {\"id\":\"int-A\",\"status\":\"in_progress\"}\n\n",
+        )
+        .unwrap();
+        buf.push(
+            0,
+            b"event: completed\ndata: {\"id\":\"int-A\",\"output\":\"done\"}\n\n",
+        )
+        .unwrap();
+        buf.push(
+            1,
+            b"event: created\ndata: {\"id\":\"int-B\",\"prev\":\"int-A\"}\n\n",
+        )
+        .unwrap();
+        buf.push(
+            1,
+            b"event: completed\ndata: {\"id\":\"int-B\",\"output\":\"more\"}\n\n",
+        )
+        .unwrap();
+
+        buf.substitute_id("int-A", "int-B");
+
+        let drained = buf.drain();
+        let drained_str = std::str::from_utf8(&drained).unwrap();
+        // All int-A references replaced with int-B
+        assert!(!drained_str.contains("int-A"));
+        // int-B occurrences: piece 0 had 2 int-A→int-B, piece 1 had 2 int-B (unchanged) + 1 int-A→int-B
+        assert_eq!(drained_str.matches("int-B").count(), 5);
+        // prev field should also be substituted
+        assert!(drained_str.contains("\"prev\":\"int-B\""));
+    }
+
+    #[test]
+    fn mem_sse_buffer_substitute_id_no_match_leaves_unchanged() {
+        let mut buf = MemSseBuffer::default();
+        buf.push(0, b"event: data\ndata: {\"id\":\"int-X\"}\n\n")
+            .unwrap();
+        buf.substitute_id("int-Y", "int-Z");
+        let drained = buf.drain();
+        let drained_str = std::str::from_utf8(&drained).unwrap();
+        assert!(drained_str.contains("int-X"));
+        assert!(!drained_str.contains("int-Z"));
+    }
+
+    #[test]
+    fn mem_sse_buffer_overflow_returns_error() {
+        let mut buf = MemSseBuffer::with_limit(10);
+        buf.push(0, b"12345").unwrap();
+        assert_eq!(buf.len_bytes(), 5);
+        let err = buf.push(0, b"123456").unwrap_err();
+        match err {
+            SseBufferError::Overflow { limit, current } => {
+                assert_eq!(limit, 10);
+                assert_eq!(current, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn mem_sse_buffer_overflow_does_not_mutate() {
+        let mut buf = MemSseBuffer::with_limit(10);
+        buf.push(0, b"12345").unwrap();
+        let _ = buf.push(0, b"123456"); // overflow
+                                        // Buffer state unchanged after overflow
+        assert_eq!(buf.len_bytes(), 5);
+        let drained = buf.drain();
+        assert_eq!(&drained, b"12345");
+    }
+
+    #[test]
+    fn mem_sse_buffer_empty_drain() {
+        let buf = MemSseBuffer::default();
+        assert_eq!(buf.len_bytes(), 0);
+        assert!(buf.drain().is_empty());
+    }
+
+    #[test]
+    fn mem_sse_buffer_large_content_within_limit() {
+        let mut buf = MemSseBuffer::with_limit(1024 * 1024);
+        let chunk = vec![b'x'; 512 * 1024]; // 512 KB
+        buf.push(0, &chunk).unwrap();
+        buf.push(1, &chunk).unwrap();
+        assert_eq!(buf.len_bytes(), 1024 * 1024);
     }
 }
 

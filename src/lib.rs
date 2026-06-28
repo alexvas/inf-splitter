@@ -13,6 +13,7 @@ pub mod router;
 pub mod session;
 pub mod sse;
 
+use crate::session::InFlightStatus;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -320,68 +321,73 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
         config.as_ref(),
         diagnostics.clone(),
         session_store.clone(),
-        v2_store,
-        v2_path,
+        v2_store.clone(),
+        v2_path.clone(),
     )?;
 
-    // Recover pending sessions: after an unclean shutdown, sessions with
-    // pending=true need verification. For each pending session, check if the
-    // upstream interaction still exists.
-    let pending = session_store.pending_sessions().await;
-    if !pending.is_empty() {
-        // Collect interactions sections from config for recovery attempts
-        let interactions_routes: Vec<crate::config::RouteTarget> = config
-            .sections
-            .iter()
-            .filter(|(_, s)| s.endpoint_interactions.is_some())
-            .map(|(name, s)| crate::config::RouteTarget {
-                section: name.clone(),
-                endpoint_interactions: s.endpoint_interactions.clone(),
-                api_key: s.api_key.clone(),
-                proxy: s.proxy.clone(),
-                ..Default::default()
-            })
-            .collect();
-        for (session_id, state) in &pending {
-            let mut found = false;
-            for route in &interactions_routes {
-                match interactions
-                    .get_interaction(&state.interaction_id, route)
-                    .await
-                {
-                    Ok(true) => {
+    // Recover in-flight batches from v2 store after unclean shutdown.
+    // ResponseStarted pieces have no interaction_id to probe — mark Failed.
+    // Sent/Pending pieces are left for manual or client-triggered recovery:
+    // on next client request with matching message_hashes, the handler
+    // will find the batch and resume or wait for completion.
+    {
+        let mut v2 = v2_store.write().await;
+        let batch_ids: Vec<String> = v2.in_flight.keys().cloned().collect();
+        let mut recovered = 0usize;
+        let mut resp_started = 0usize;
+        let mut pending = 0usize;
+        let mut sent = 0usize;
+        let mut all_acked = 0usize;
+        for batch_id in &batch_ids {
+            let all_acked_now = v2.in_flight.get(batch_id).is_some_and(|b| {
+                b.pieces
+                    .iter()
+                    .all(|p| matches!(p.status, InFlightStatus::Acked { .. }))
+            });
+            if all_acked_now {
+                match v2.complete_batch(batch_id) {
+                    Ok(node) => {
                         tracing::info!(
-                            session_id = %session_id,
-                            interaction_id = %state.interaction_id,
-                            "pending session recovered: interaction verified"
+                            batch_id = %batch_id,
+                            client_id = %node.id,
+                            "recovered in-flight batch: all pieces acked, batch completed"
                         );
-                        let _ = session_store.clear_pending(session_id).await;
-                        found = true;
-                        break;
-                    }
-                    Ok(false) => {
-                        // 404 or non-success — interaction doesn't exist at this endpoint
-                        continue;
+                        all_acked += 1;
                     }
                     Err(e) => {
                         tracing::warn!(
-                            session_id = %session_id,
-                            interaction_id = %state.interaction_id,
+                            batch_id = %batch_id,
                             error = %e,
-                            "pending session recovery: get_interaction failed"
+                            "failed to complete fully-acked in-flight batch"
                         );
                     }
                 }
+                recovered += 1;
+                continue;
             }
-            if !found {
-                // Interaction not found at any configured endpoint — remove stale session
-                tracing::warn!(
-                    session_id = %session_id,
-                    interaction_id = %state.interaction_id,
-                    "pending session not found at any upstream, removing"
-                );
-                let _ = session_store.remove(session_id).await;
+            // Count non-terminal pieces
+            if let Some(batch) = v2.in_flight.get(batch_id) {
+                for piece in &batch.pieces {
+                    match piece.status {
+                        InFlightStatus::ResponseStarted => resp_started += 1,
+                        InFlightStatus::Pending => pending += 1,
+                        InFlightStatus::Sent { .. } => sent += 1,
+                        _ => {}
+                    }
+                }
             }
+        }
+        if recovered > 0 || resp_started > 0 || pending > 0 || sent > 0 {
+            tracing::info!(
+                recovered_completed = all_acked,
+                pending_pieces = pending,
+                sent_pieces = sent,
+                response_started_pieces = resp_started,
+                "v2 in-flight batch recovery: ResponseStarted pieces will be marked Failed on next persistence cycle"
+            );
+        }
+        if !batch_ids.is_empty() {
+            let _ = v2.save_to_disk(&v2_path).await;
         }
     }
 

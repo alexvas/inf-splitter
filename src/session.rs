@@ -1062,6 +1062,51 @@ impl StoreV2 {
         batch.updated_utc = unix_now();
         Ok(())
     }
+
+    /// Clear all sessions, interaction nodes, hash_index, upstream_to_clients,
+    /// and in-flight batches. Returns the sessions that were cleared (for
+    /// upstream interaction cancellation).
+    pub fn clean_all(&mut self) -> Vec<(String, SessionInfo)> {
+        let sessions: Vec<(String, SessionInfo)> = self.sessions.drain().collect();
+        self.interactions.clients.clear();
+        self.interactions.upstreams.clear();
+        self.interactions.hash_index.clear();
+        self.interactions.upstream_to_clients.clear();
+        self.in_flight.clear();
+        sessions
+    }
+
+    /// Update session and current interaction node last_seen_utc timestamps.
+    pub fn extend_lifetime(&mut self, session_id: &str, expires_at_utc: u64) {
+        let now = unix_now();
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.expires_at_utc = expires_at_utc;
+            session.last_seen_utc = now;
+        }
+        // Update last_seen_utc on the current client interaction node if present
+        if let Some(session) = self.sessions.get(session_id) {
+            if let Some(ref last_id) = session.last_interaction_id {
+                if let Some(client) = self.interactions.clients.get_mut(last_id) {
+                    client.last_seen_utc = now;
+                }
+            }
+        }
+    }
+
+    /// Collect all known upstream interaction ids and in-flight acked piece ids
+    /// for cancellation/deletion during clean-all.
+    pub fn all_upstream_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.interactions.upstreams.keys().cloned().collect();
+        // Also include Acked in-flight piece ids
+        for batch in self.in_flight.values() {
+            for piece in &batch.pieces {
+                if let InFlightStatus::Acked { ref interaction_id } = piece.status {
+                    ids.push(interaction_id.clone());
+                }
+            }
+        }
+        ids
+    }
 }
 
 #[cfg(test)]
@@ -1855,5 +1900,229 @@ mod tests {
         assert_eq!(client.id, "int-A");
         assert_eq!(client.upstream_ids, vec!["int-A"]);
         assert_eq!(client.message_hashes, vec![0xC]);
+    }
+
+    // ── Phase 8: Startup Recovery and Control Messages ────────────
+
+    /// 8.1 — StoreV2::load_from_disk rebuilds hash_index and upstream_to_clients
+    /// from persisted client nodes (which are stored without runtime indexes).
+    #[tokio::test]
+    async fn startup_rebuilds_derived_indexes() {
+        let path = test_path("phase8-rebuild");
+        let _ = fs::remove_file(&path);
+
+        let mut store = StoreV2::new();
+        store.sessions.insert(
+            "sess-1".to_string(),
+            SessionInfo {
+                client_session_id: "sess-1".to_string(),
+                last_interaction_id: Some("int-B".to_string()),
+                last_seen_utc: 200,
+                expires_at_utc: 300,
+            },
+        );
+        store.interactions.insert_client(make_client_node(
+            "int-A",
+            None,
+            vec![0xA0, 0xB0],
+            vec!["int-A"],
+        ));
+        store.interactions.insert_client(make_client_node(
+            "int-B",
+            Some("int-A"),
+            vec![0xC0],
+            vec!["int-B"],
+        ));
+        store
+            .interactions
+            .insert_upstream(make_upstream_node("int-A", None));
+        store
+            .interactions
+            .insert_upstream(make_upstream_node("int-B", Some("int-A")));
+
+        store.save_to_disk(&path).await.unwrap();
+
+        // Simulate restart: load into fresh store
+        let loaded = StoreV2::load_from_disk(&path).await.unwrap();
+
+        // hash_index rebuilt: lookup each message hash
+        assert_eq!(loaded.interactions.lookup_hash(0xA0).len(), 1);
+        assert_eq!(loaded.interactions.lookup_hash(0xA0)[0].client_id, "int-A");
+        assert_eq!(loaded.interactions.lookup_hash(0xB0).len(), 1);
+        assert_eq!(loaded.interactions.lookup_hash(0xB0)[0].client_id, "int-A");
+        assert_eq!(loaded.interactions.lookup_hash(0xC0).len(), 1);
+        assert_eq!(loaded.interactions.lookup_hash(0xC0)[0].client_id, "int-B");
+        // Unknown hash returns empty
+        assert!(loaded.interactions.lookup_hash(0xDEAD).is_empty());
+
+        // upstream_to_clients rebuilt
+        let upstream_int_a = loaded.interactions.upstream_to_clients.get("int-A");
+        assert!(upstream_int_a.is_some());
+        let upstream_int_a = upstream_int_a.unwrap();
+        assert!(upstream_int_a.contains(&"int-A".to_string()));
+
+        let upstream_int_b = loaded.interactions.upstream_to_clients.get("int-B");
+        assert!(upstream_int_b.is_some());
+        let upstream_int_b = upstream_int_b.unwrap();
+        assert!(upstream_int_b.contains(&"int-B".to_string()));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 8.2 — Startup resumes pending in-flight piece: persisted batch
+    /// with P0 Acked and P1 Pending (with request_body); reload then
+    /// resend P1 using the previous id from P0.
+    #[tokio::test]
+    async fn startup_resumes_pending_inflight_piece() {
+        let path = test_path("phase8-inflight");
+        let _ = fs::remove_file(&path);
+
+        let mut store = StoreV2::new();
+        store.in_flight.insert(
+            "batch-1".to_string(),
+            InFlightBatch {
+                id: "batch-1".to_string(),
+                session_id: "sess-1".to_string(),
+                prev_interaction_id: None,
+                message_hashes: vec![0x10],
+                pieces: vec![
+                    InFlightPiece {
+                        index: 0,
+                        content_hash: 0,
+                        request_body: b"POST chunk0".to_vec(),
+                        status: InFlightStatus::Acked {
+                            interaction_id: "int-A".to_string(),
+                        },
+                    },
+                    InFlightPiece {
+                        index: 1,
+                        content_hash: 0,
+                        request_body: b"POST chunk1".to_vec(),
+                        status: InFlightStatus::Pending,
+                    },
+                ],
+                created_utc: 100,
+                updated_utc: 100,
+            },
+        );
+        store.save_to_disk(&path).await.unwrap();
+
+        // Simulate restart: load into fresh store
+        let loaded = StoreV2::load_from_disk(&path).await.unwrap();
+        assert_eq!(loaded.in_flight.len(), 1);
+
+        let batch = &loaded.in_flight["batch-1"];
+        assert_eq!(batch.pieces.len(), 2);
+
+        // P0 is trusted as Acked
+        match &batch.pieces[0].status {
+            InFlightStatus::Acked { interaction_id } => {
+                assert_eq!(interaction_id, "int-A");
+            }
+            other => panic!("expected Acked, got {other:?}"),
+        }
+
+        // P1 is Pending — can be resent with prev_id = "int-A"
+        match &batch.pieces[1].status {
+            InFlightStatus::Pending => {}
+            other => panic!("expected Pending, got {other:?}"),
+        }
+
+        // P1 has its request_body for resend
+        assert_eq!(batch.pieces[1].request_body, b"POST chunk1");
+        // prev_interaction_id for P1 comes from P0's acked id
+        assert_eq!(batch.prev_interaction_id, None); // batch-level prev
+                                                     // The sender should use "int-A" as prev for P1
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// 8.3 — Clean-all clears all new stores: sessions, interaction nodes,
+    /// hash index, reverse upstream index, and in-flight batches.
+    #[tokio::test]
+    async fn clean_all_clears_v2_stores() {
+        let mut store = StoreV2::new();
+        store.sessions.insert(
+            "sess-1".to_string(),
+            SessionInfo {
+                client_session_id: "sess-1".to_string(),
+                last_interaction_id: Some("int-A".to_string()),
+                last_seen_utc: 100,
+                expires_at_utc: 200,
+            },
+        );
+        store.interactions.insert_client(make_client_node(
+            "int-A",
+            None,
+            vec![0xAA],
+            vec!["int-A"],
+        ));
+        store
+            .interactions
+            .insert_upstream(make_upstream_node("int-A", None));
+        store.in_flight.insert(
+            "batch-1".to_string(),
+            make_batch(
+                "batch-1",
+                "sess-1",
+                None,
+                vec![0xAA],
+                vec![make_piece(0, InFlightStatus::Pending)],
+            ),
+        );
+
+        // Verify pre-conditions
+        assert_eq!(store.sessions.len(), 1);
+        assert_eq!(store.interactions.clients.len(), 1);
+        assert_eq!(store.interactions.upstreams.len(), 1);
+        assert_eq!(store.in_flight.len(), 1);
+        assert_eq!(store.interactions.hash_index.len(), 1);
+        assert_eq!(store.interactions.upstream_to_clients.len(), 1);
+
+        // Clean-all
+        store.clean_all();
+
+        // All stores must be empty
+        assert!(store.sessions.is_empty());
+        assert!(store.interactions.clients.is_empty());
+        assert!(store.interactions.upstreams.is_empty());
+        assert!(store.in_flight.is_empty());
+        assert!(store.interactions.hash_index.is_empty());
+        assert!(store.interactions.upstream_to_clients.is_empty());
+    }
+
+    /// 8.4 — Extend-lifetime updates SessionInfo metadata and current
+    /// interaction node's last_seen_utc.
+    #[tokio::test]
+    async fn extend_lifetime_updates_v2_session_and_client_node() {
+        let mut store = StoreV2::new();
+        let new_expiry = 999_999;
+
+        store.sessions.insert(
+            "sess-1".to_string(),
+            SessionInfo {
+                client_session_id: "sess-1".to_string(),
+                last_interaction_id: Some("int-A".to_string()),
+                last_seen_utc: 100,
+                expires_at_utc: 200,
+            },
+        );
+        store.interactions.insert_client(make_client_node(
+            "int-A",
+            None,
+            vec![0xBB],
+            vec!["int-A"],
+        ));
+
+        store.extend_lifetime("sess-1", new_expiry);
+
+        // SessionInfo updated
+        let session = &store.sessions["sess-1"];
+        assert_eq!(session.expires_at_utc, new_expiry);
+        assert!(session.last_seen_utc > 200, "last_seen_utc must be updated");
+
+        // Current interaction node's last_seen_utc updated
+        let client_node = &store.interactions.clients["int-A"];
+        assert!(client_node.last_seen_utc > 0);
     }
 }

@@ -1710,42 +1710,7 @@ impl InteractionsHandler {
             }
         }
 
-        // Merge non-streaming responses from all pieces
-        if stream {
-            // Phase 7 will buffer streaming split-send; for now return last interaction
-            if let Some(inter) = all_interactions.last() {
-                let resp = interactions_lib::build_response_from_interaction(inter, model, ingress)
-                    .map_err(|e| {
-                        guard.abort_internal(
-                            start.elapsed().as_millis() as u64,
-                            ingress_body.len(),
-                            upstream_label,
-                            direction,
-                            true,
-                            e,
-                        )
-                    })?;
-                let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
-                guard.ingress_response_dump(
-                    crate::diagnostics::dump_body_from_bytes(&resp_bytes),
-                    200,
-                );
-                guard.finish(
-                    200,
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    Some(total_response_bytes),
-                    upstream_label,
-                    direction,
-                    true,
-                );
-                return Self::streaming_response_from_interaction(
-                    ingress, session_id, model, inter,
-                );
-            }
-        }
-
-        // Non-streaming: merge all piece responses
+        // Merge all piece responses
         let merged = Self::merge_interaction_responses(&all_interactions, &client_node.id);
         let resp = interactions_lib::build_response_from_interaction(&merged, model, ingress)
             .map_err(|e| {
@@ -1754,7 +1719,7 @@ impl InteractionsHandler {
                     ingress_body.len(),
                     upstream_label,
                     direction,
-                    false,
+                    stream,
                     e,
                 )
             })?;
@@ -1768,8 +1733,13 @@ impl InteractionsHandler {
             Some(total_response_bytes),
             upstream_label,
             direction,
-            false,
+            stream,
         );
+
+        if stream {
+            return Self::streaming_response_from_merged(ingress, session_id, model, &resp);
+        }
+
         Ok(Self::ok_with_session_header(ingress, session_id, resp))
     }
 
@@ -2295,6 +2265,7 @@ impl InteractionsHandler {
     ) -> Result<Response, AppError> {
         match action {
             ControlAction::CleanAll => {
+                // Clear old v1 store
                 let all = match self.session_store.remove_all().await {
                     Ok(all) => all,
                     Err(e) => {
@@ -2309,36 +2280,55 @@ impl InteractionsHandler {
                         ));
                     }
                 };
+
+                // Collect v1 interaction ids for cancellation
+                let mut upstream_ids: Vec<String> = all
+                    .iter()
+                    .filter_map(|(_sid, state)| {
+                        if state.interaction_id.is_empty() {
+                            None
+                        } else {
+                            Some(state.interaction_id.clone())
+                        }
+                    })
+                    .collect();
+
+                // Collect v2 upstream ids and clean v2 store
+                {
+                    let mut v2 = self.v2_store.write().await;
+                    let v2_ids = v2.all_upstream_ids();
+                    upstream_ids.extend(v2_ids);
+                    v2.clean_all();
+                    let _ = v2.save_to_disk(&self.v2_path).await;
+                }
+
                 let mut cancelled = 0usize;
                 let mut deleted = 0usize;
                 let mut errors: Vec<String> = Vec::new();
-                for (_sid, state) in &all {
-                    if !state.interaction_id.is_empty() {
-                        if let Err(e) = self.cancel_interaction(&state.interaction_id, route).await
-                        {
-                            errors.push(format!("cancel {}: {}", state.interaction_id, e));
-                        } else {
-                            cancelled += 1;
-                        }
-                        if let Err(e) = self.delete_interaction(&state.interaction_id, route).await
-                        {
-                            errors.push(format!("delete {}: {}", state.interaction_id, e));
-                        } else {
-                            deleted += 1;
-                        }
+                for id in &upstream_ids {
+                    if let Err(e) = self.cancel_interaction(id, route).await {
+                        errors.push(format!("cancel {}: {}", id, e));
+                    } else {
+                        cancelled += 1;
+                    }
+                    if let Err(e) = self.delete_interaction(id, route).await {
+                        errors.push(format!("delete {}: {}", id, e));
+                    } else {
+                        deleted += 1;
                     }
                 }
+                let total = all.len() + upstream_ids.len().saturating_sub(all.len());
                 let msg = if errors.is_empty() {
                     format!(
                         "Cleaned all {} sessions ({} cancelled, {} deleted)",
-                        all.len(),
+                        total.max(all.len()),
                         cancelled,
                         deleted
                     )
                 } else {
                     format!(
                         "Cleaned all {} sessions ({} cancelled, {} deleted). Errors: {}",
-                        all.len(),
+                        total.max(all.len()),
                         cancelled,
                         deleted,
                         errors.join("; ")
@@ -2366,6 +2356,12 @@ impl InteractionsHandler {
                         ));
                     }
                 };
+                // Also update v2 session metadata
+                {
+                    let mut v2 = self.v2_store.write().await;
+                    v2.extend_lifetime(session_id, *until);
+                    let _ = v2.save_to_disk(&self.v2_path).await;
+                }
                 let msg = format!("Session {} lifetime extended to UTC {}", session_id, until);
                 guard.finish(200, 0, 0, None, "control-action", "extend-lifetime", false);
                 Ok(Self::ok_with_session_header(
@@ -2476,6 +2472,45 @@ impl InteractionsHandler {
     }
 
     /// Build a streaming SSE response from the split-send final interaction.
+    /// Build a streaming (SSE) response from a pre-built protocol response.
+    /// Synthesizes Anthropic or OpenAI SSE events to produce a coherent
+    /// stream with only the final interaction id visible.
+    fn streaming_response_from_merged(
+        ingress: Protocol,
+        session_id: &str,
+        model: &str,
+        resp: &serde_json::Value,
+    ) -> Result<Response, AppError> {
+        match ingress {
+            Protocol::Anthropic => {
+                let events = synthesize_anthropic_events(model, resp);
+                let body = sse::format_sse_events(&events);
+                let hdr_name = Self::session_header_name(ingress);
+                let hdr_value =
+                    HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(HeaderName::from_static(hdr_name), hdr_value)
+                    .body(Body::from(body))
+                    .map_err(|err| AppError::Internal(err.to_string()))
+            }
+            Protocol::OpenAi => {
+                let chunks = synthesize_openai_chunks(model, resp);
+                let body = chunks.join("");
+                let hdr_name = Self::session_header_name(ingress);
+                let hdr_value =
+                    HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(HeaderName::from_static(hdr_name), hdr_value)
+                    .body(Body::from(body))
+                    .map_err(|err| AppError::Internal(err.to_string()))
+            }
+        }
+    }
+
     fn streaming_response_from_interaction(
         ingress: Protocol,
         session_id: &str,

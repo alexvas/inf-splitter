@@ -11,11 +11,12 @@
 
 `InteractionsHandler` no longer tracks delivered messages by raw `message_count`. Conversation frontier is derived from canonical harness-message hashes and `InteractionStore`.
 
-Session ID resolution remains unchanged:
-1. HTTP header `x-request-id`
+**Note: Breaking change** — session ID resolution priority was previously undocumented for `X-Client-Request-Id`. The existing `openspec/specs/routing.md` listed `x-request-id` as primary; this delta documents the actual implemented behavior where `X-Client-Request-Id` wins over `x-request-id`.
+1. HTTP header `X-Client-Request-Id` (primary)
 2. HTTP header `x-claude-code-session-id`
-3. Body field `request_id`
-4. Random UUID v7
+3. HTTP header `x-request-id`
+4. Body field `request_id` (fallback)
+5. Random UUID v7 (last resort)
 
 Resolved session ID is used for response headers, metadata, in-flight batch matching, control-message scope, and diagnostics. It MUST NOT by itself select `previous_interaction_id`.
 
@@ -38,32 +39,32 @@ Resolved session ID is used for response headers, metadata, in-flight batch matc
 - THEN the proxy starts a new chain instead of reusing stale `previous_interaction_id`
 
 #### Scenario: Session ID from HTTP header still wins
-- GIVEN `x-request-id: conv-abc123` header and `request_id: "body-id"` in body
+- GIVEN `X-Client-Request-Id: cli-req-abc` header and `request_id: "body-id"` in body
 - WHEN session is resolved
-- THEN `session_id = "conv-abc123"`
+- THEN `session_id = "cli-req-abc"` (header wins over body field)
 
 ### Requirement: Session Persistence
 
-Session persistence changes from old count-based `SessionState` to a versioned v2 document containing sessions, interactions, and in-flight batches. The configured `interactions_session_store` path remains the storage path.
+Session persistence changes from old count-based `SessionState` to a versioned v2 document containing sessions, client interactions, upstream interactions, and in-flight batches. The configured `interactions_session_store` path remains the storage path.
 
 Startup recovery:
 - Load v2 document atomically.
 - Ignore old v1 count-based files with a warning.
-- Rebuild `hash_index` from persisted `InteractionNode.message_hashes`.
+- Rebuild `hash_index` from persisted `ClientInteractionNode.message_hashes`.
 - For each in-flight batch:
   - `Acked` pieces are trusted.
   - `Sent` pieces are verified by stored interaction id when available; otherwise they are treated as indeterminate and failed with a retryable error.
-  - `Pending` pieces are resent from persisted request data.
-  - complete batches insert their terminal `InteractionNode`.
-  - failed/expired batches are retained until TTL eviction or removed by clean-all.
+  - `Pending` pieces are resent from persisted `request_body`.
+  - complete batches insert their `UpstreamInteractionNode`s and `ClientInteractionNode`.
+  - failed batches are retained until clean-all or future expiration cleanup.
 
-Periodic eviction MUST remove expired `SessionInfo`, `InteractionNode`, stale `hash_index` positions, and `InFlightBatch` entries. Upstream deletion remains best-effort.
+Expiration cleanup (expired `SessionInfo`, expired `UpstreamInteractionNode`s, `ClientInteractionNode`s whose ALL upstream nodes are expired, stale `hash_index` positions, and expired `InFlightBatch` entries) is out of scope for this change and will be specified by a dependent change.
 
 #### Scenario: V2 store survives restart
-- GIVEN persistence file has `version = 2` with one session, one interaction node, and no in-flight batches
+- GIVEN persistence file has `version = 2` with one session, one client node, two upstream nodes, and no in-flight batches
 - WHEN proxy starts
 - THEN all stores are loaded
-- AND `hash_index` lookups work for the loaded node hashes
+- AND `hash_index` lookups work for the loaded client node hashes
 
 #### Scenario: Old store resets safely
 - GIVEN persistence file has old `interaction_id`, `message_count`, and `pending` entries
@@ -85,8 +86,8 @@ All `InteractionsHandler` response paths still return the resolved session ID as
 
 This header is independent of `InteractionStore` frontier selection.
 
-#### Scenario: Replay response includes session header
-- GIVEN all incoming harness hashes are known and replay is used
+#### Scenario: Fetched interaction response includes session header
+- GIVEN all incoming harness hashes are known and the existing interaction is fetched via GET
 - WHEN response is returned to an Anthropic client
 - THEN response includes `x-claude-code-session-id: <session_id>`
 
@@ -95,11 +96,12 @@ This header is independent of `InteractionStore` frontier selection.
 Control messages MUST be stripped before harness-message filtering and hashing.
 
 Clean-all MUST:
-- cancel/delete known terminal interactions best-effort;
+- cancel/delete known terminal upstream interactions best-effort (iterate all `ClientInteractionNode.upstream_ids`, cancel/delete each);
+- after processing all `ClientInteractionNode`s, iterate remaining `UpstreamInteractionNode`s not referenced by any `ClientInteractionNode` (orphaned from failed batches where cancel failed) and DELETE them best-effort;
 - cancel ACKed in-flight piece interactions best-effort;
-- clear `SessionInfo`, `InteractionStore`, `hash_index`, and `InFlightStore`.
+- clear `SessionInfo`, `ClientInteractionNode`, `UpstreamInteractionNode`, `hash_index`, and `InFlightStore`.
 
-Extend-lifetime MUST update current `SessionInfo` and the matched current `InteractionNode` when one exists. It MUST NOT create a routing dependency on `SessionInfo.last_interaction_id`.
+Extend-lifetime MUST update current `SessionInfo` and the matched current `ClientInteractionNode` when one exists. It MUST NOT create a routing dependency on `SessionInfo.last_interaction_id`.
 
 Control-message idempotency remains hash-based and excludes control messages from harness hash frontier.
 
@@ -112,3 +114,10 @@ Control-message idempotency remains hash-based and excludes control messages fro
 - GIVEN sessions, interaction nodes, hash-index entries, and in-flight batches exist
 - WHEN clean-all control is processed
 - THEN all local stores are empty after best-effort upstream cleanup
+
+#### Scenario: SessionInfo updated after ClientInteractionNode insertion
+- GIVEN a successful non-split interaction creates `int-A`
+- WHEN `ClientInteractionNode {id: int-A, ...}` is inserted into InteractionStore
+- THEN `SessionInfo.last_interaction_id` is set to `"int-A"` AFTER node insertion
+- AND `SessionInfo.last_seen_utc` is set to current time
+- NOTE: SessionInfo MUST be updated after node insertion, before response is sent to client, to guarantee consistency on crash: if client received the response, the node is persisted.

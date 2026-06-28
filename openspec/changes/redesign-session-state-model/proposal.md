@@ -24,7 +24,7 @@ Replace count-based session state with three explicit stores:
 
 - `InteractionStore` — durable tree of known upstream interactions and the harness-message hashes delivered by each terminal interaction.
 - `InFlightStore` — durable per-batch/per-piece state for split sends that have not reached terminal success or failure.
-- `SessionStore<SessionInfo>` — durable client-session metadata for logging, response headers, TTL cleanup, and incident investigation. It does not choose routing frontier.
+- `SessionStore<SessionInfo>` — durable client-session metadata for logging, response headers, and incident investigation. It does not choose routing frontier.
 
 ### Canonical harness message hashing
 
@@ -35,31 +35,49 @@ Before hashing, the handler strips in-band control messages. It then filters har
 | Anthropic Messages | `user` messages, including `tool_result` blocks | `assistant` |
 | OpenAI Chat Completions | `system`, `developer`, `user`, `tool` messages | `assistant` |
 
-Each kept message is serialized with `serde_json::to_vec` from the parsed `serde_json::Value` after control stripping. The `xxh3-64` of those bytes is the message hash. Hash collisions are handled by storing all candidate positions for a hash and validating chain order, not by trusting a single hash lookup.
+Each kept message is serialized in full with `serde_json::to_vec` from the parsed `serde_json::Value` after control stripping — the entire message `Value` (all fields including `role`, `content`, nested `tool_result` blocks) is serialized, not extracted text. The `xxh3-64` of those bytes is the message hash. Hash collisions are handled by storing all candidate positions for a hash and validating chain order, not by trusting a single hash lookup.
 
-### Branch-safe InteractionStore
+### Two-model InteractionStore
+
+`InteractionStore` separates the client-visible logical chain from the upstream physical chain:
 
 ```rust
-struct InteractionNode {
-    id: String,
-    prev_id: Option<String>,
-    message_hashes: Vec<u64>,
+struct ClientInteractionNode {
+    id: String,                  // terminal upstream id, client-visible
+    prev_id: Option<String>,     // previous ClientInteractionNode.id
+    message_hashes: Vec<u64>,    // pre-split harness message hashes
+    system_instruction_hash: Option<u64>, // hash of first-interaction system_instruction; None for follow-ups
+    upstream_ids: Vec<String>,   // all backing UpstreamInteractionNode.id's
+    last_seen_utc: u64,
+}
+
+struct UpstreamInteractionNode {
+    id: String,                  // upstream-assigned interaction id
+    prev_id: Option<String>,     // previous UpstreamInteractionNode.id
+    client_id: String,           // diagnostic: {request_id} or {request_id}:{chunk-N}
     last_seen_utc: u64,
     expires_at_utc: u64,
 }
 
-struct InteractionPosition {
-    interaction_id: String,
+struct ClientInteractionPosition {
+    client_id: String,
     message_index: usize,
 }
 
 struct InteractionStore {
-    nodes: HashMap<String, InteractionNode>,
-    hash_index: HashMap<u64, Vec<InteractionPosition>>,
+    clients: HashMap<String, ClientInteractionNode>,
+    upstreams: HashMap<String, UpstreamInteractionNode>,
+    hash_index: HashMap<u64, Vec<ClientInteractionPosition>>,
 }
 ```
 
-`id` remains the unique upstream identifier. `hash_index` is multi-valued because identical content can repeat and branches can contain same hashes. All chain decisions validate ordered prefix membership against concrete nodes.
+Key properties:
+- `UpstreamInteractionNode.client_id` is diagnostic-only. The mapping client→upstream lives exclusively in `ClientInteractionNode.upstream_ids`.
+- `UpstreamInteractionNode.last_seen_utc` is updated on creation and on every GET replay that traverses this node.
+- `ClientInteractionNode` is created AFTER all upstream pieces complete. It's a denormalized view — `upstream_ids` lists all backing upstream nodes in chain order.
+- `ClientInteractionNode.system_instruction_hash` stores the xxh3 hash of system_instruction from the first interaction in chain (when `prev_id` is `None`). Follow-up interactions set it to `None`. If a follow-up request's system_instruction hash differs from the root node's stored hash, the handler forks.
+- `hash_index` indexes only `ClientInteractionNode.message_hashes` — never piece hashes or upstream nodes. Multi-valued: duplicate content and branch collisions are valid.
+- Frontier works exclusively with client nodes. Upstream nodes are never consulted for routing.
 
 ### Stateless frontier selection
 
@@ -68,12 +86,12 @@ Stateless clients (Anthropic Messages and OpenAI Chat Completions) resend full v
 1. strips control messages;
 2. filters harness-originated messages;
 3. hashes each canonical message;
-4. searches `InteractionStore` for the longest contiguous prefix `[0..k)` that belongs to one valid interaction chain in order;
-5. forwards only messages from `k` onward;
-6. sets `previous_interaction_id` to the terminal interaction of the matched prefix, if any;
-7. replays that terminal interaction when `k == len`.
+4. searches `InteractionStore` client chain for the longest contiguous prefix `[0..k)` that belongs to one valid client interaction chain in order;
+5. if prefix ends at a client interaction **boundary**: `previous_interaction_id = that client node's id`, forward only messages from `k` onward;
+6. if prefix ends **inside** a client interaction: fork at the client node's `prev_id`, forward all messages from that node's first message onward;
+7. when `k == len` (all messages known), require incoming `prev_id` to equal the matched `ClientInteractionNode.prev_id`; then read `ClientInteractionNode.upstream_ids`, fetch all upstream interactions via GET, merge `steps[]` in piece order (last piece's `usage`, first piece's `tools`/`system_instruction`/`generation_config`), return one response with the client node's `id`.
 
-If two candidate chains have same longest prefix, choose the one with newest `last_seen_utc`; if still tied, choose lexicographically smallest `interaction_id` for deterministic behavior.
+If duplicate/collision candidates leave multiple fully validated chains with same longest prefix, choose the one with newest `last_seen_utc`; if still tied, choose lexicographically smallest `interaction_id` for deterministic behavior. Normal duplicate-content disambiguation uses chain validation: lookup by hash, then identify the client node by `(prev_id, message_hash)` in chain order. Tuple `[Some(prev_id), message_hash]` identifies a client node equivalently to `id`.
 
 ### Stateful future path
 
@@ -88,7 +106,6 @@ struct InFlightBatch {
     prev_interaction_id: Option<String>,
     message_hashes: Vec<u64>,
     pieces: Vec<InFlightPiece>,
-    terminal_result: Option<String>,
     created_utc: u64,
     updated_utc: u64,
 }
@@ -108,9 +125,16 @@ enum InFlightStatus {
 }
 ```
 
-`message_hashes` are original harness-message hashes. `content_hash` is piece identity only. `request_body` is persisted before send so Pending pieces can be resent during startup recovery. Intermediate split pieces create upstream interactions but do not own harness-message hashes in `InteractionStore`. On complete success, a single terminal `InteractionNode` is inserted with `id = final piece interaction_id`, `prev_id = batch.prev_interaction_id`, and `message_hashes = batch.message_hashes`.
+`message_hashes` are original harness-message hashes. `content_hash` is piece identity only. `request_body` is persisted before send so Pending pieces can be resent during startup recovery. Intermediate split pieces create upstream interactions but do not own harness-message hashes in `InteractionStore`.
 
-If a client retries while a batch is incomplete, matching is by `session_id + message_hashes + prev_interaction_id`. The handler waits for completion when possible. If the batch already completed, it replays `terminal_result`.
+When all pieces are `Acked`, the batch completes:
+1. Insert all `UpstreamInteractionNode`s for each `Acked { interaction_id }` in piece order, linked by `prev_id`.
+2. Insert one `ClientInteractionNode` with `id = final Acked interaction_id`, `prev_id = batch.prev_interaction_id`, `message_hashes = batch.message_hashes`, and `upstream_ids = [all Acked interaction_ids in piece order]`.
+3. Remove the batch from `InFlightStore`.
+
+When a client retries with same `message_hashes` and frontier hits a client node with multiple `upstream_ids`, the handler fetches all upstream interactions via GET, merges their content into one composite response, and returns it with the client node's `id`. Only the terminal upstream id is ever visible to the client.
+
+If a client retries while a batch is incomplete, matching is by `session_id + message_hashes + prev_interaction_id`. The handler waits for completion when possible.
 
 ### Deterministic split packing
 
@@ -118,10 +142,11 @@ Existing full-body `proxy_limit` semantics are preserved:
 
 1. Measure full serialized `CreateModelInteractionParams`, not content-only bytes.
 2. Split `system_instruction` first when first-envelope + system instruction exceeds limit.
-3. First chunk can carry `tools`, `generation_config`, and `system_instruction`.
-4. Later chunks carry `previous_interaction_id` and omit first-interaction fields.
-5. Chunk sizing accounts for serialized `previous_interaction_id` overhead.
-6. Every emitted chunk body must be `<= proxy_limit` or the request fails before sending.
+3. First system-instruction chunk carries `tools`, `generation_config`, and first part of `system_instruction`.
+4. Each subsequent system-instruction chunk carries its part of `system_instruction` + `previous_interaction_id`; `tools` and `generation_config` are absent.
+5. The last system-instruction chunk can also pack content items when they fit within `proxy_limit`.
+6. Chunk sizing accounts for serialized `previous_interaction_id` overhead.
+7. Every emitted chunk body must be `<= proxy_limit` or the request fails before sending.
 
 ### Streaming split-send
 
@@ -133,10 +158,10 @@ Initial buffer implementation is memory-backed with a 100 MB cap. On overflow, t
 
 | Scenario | Handling |
 |----------|----------|
-| Piece N fails or times out | Cancel ACKed piece interactions via `POST /{id}/cancel`, mark batch failed, do not insert terminal InteractionNode, return error. |
-| Client disconnects mid-split | Continue current batch to terminal state. Completed retry replays terminal interaction; failed retry returns stored failure. |
-| Client resends same in-flight split | Find matching batch; wait for terminal result when still running, replay or return stored failure when terminal. |
-| Crash mid-split | Load persisted InFlightStore; ACKed pieces are trusted, Sent-without-ACK pieces are marked indeterminate/failed to avoid duplicate sends, Pending pieces are resent, Failed batches are retained until TTL. |
+| Piece N fails or times out | Cancel ACKed piece interactions via `POST /{id}/cancel`, mark batch failed, do not insert ClientInteractionNode, return error. |
+| Client disconnects mid-split | Continue batch to completion. Insert `UpstreamInteractionNode`s + `ClientInteractionNode`. Retry fetches via `upstream_ids`, merges, returns. |
+| Client resends same in-flight split | Find matching batch. If running, wait. If completed, fetch via `ClientInteractionNode.upstream_ids`, merge, return. |
+| Crash mid-split | Load persisted InFlightStore; ACKed pieces are trusted. Sent pieces with interaction_id trigger GET to re-fetch the interaction from upstream — if it exists, drain and transition to Acked; if 404 or error, mark Failed. Pending pieces are resent. Failed batches remain until clean-all or future expiration cleanup. |
 | SSE buffer overflow | Cancel ACKed piece interactions, mark batch failed, return error. |
 | Hash collision or duplicate content | `hash_index` returns candidates; chain order validation chooses valid longest prefix, never single hash alone. |
 
@@ -151,7 +176,7 @@ The existing `interactions_session_store` config path remains the persistence lo
 
 Old version-1 files are not migrated because they lack content hashes. On startup, the proxy logs a warning, ignores old count-based sessions, and overwrites with the v2 format on next save.
 
-TTL eviction removes expired sessions, interaction nodes, hash-index positions, and in-flight batches. Clean-all control cancels/deletes known terminal interactions, cancels ACKed in-flight pieces, and clears all three stores.
+Clean-all control cancels/deletes known terminal interactions, cancels ACKed in-flight pieces, and clears all three stores. Expiration cleanup for sessions, interaction nodes, hash-index positions, and in-flight batches is out of scope for this change and should be specified by a dependent change.
 
 ## Scope
 
@@ -160,7 +185,7 @@ TTL eviction removes expired sessions, interaction nodes, hash-index positions, 
 - Harness message filtering after control-message stripping.
 - Canonical `xxh3-64` hashing of filtered messages.
 - Branch/collision-safe `InteractionStore` and frontier selection.
-- Durable `InFlightStore` with per-piece status and terminal replay.
+- Durable `InFlightStore` with per-piece status and terminal result fetching.
 - Versioned persistence and old-session invalidation.
 - `SessionInfo` replacing old `SessionState` for metadata only.
 - Existing split-send full-body packing invariants preserved.
@@ -197,6 +222,6 @@ TTL eviction removes expired sessions, interaction nodes, hash-index positions, 
 | Frontier selection chooses wrong branch | Medium | High | Longest valid prefix, deterministic tie-break, tests for forks and rewrites. |
 | Old session files ignored | Medium | Medium | Log explicit warning; safe reset beats stale `previous_interaction_id`. |
 | Streaming buffer too large | Low | Medium | 100 MB cap, cancel ACKed pieces, fail clearly. |
-| Recovery replays duplicate piece | Low | High | Persist request hash/status before send; verify Sent pieces via GET before resend. |
+| Recovery resends duplicate piece | Low | High | Persist request hash/status before send; verify Sent pieces via GET before resend. |
 | Cancel API behavior differs | Low | High | Use existing `POST /{id}/cancel`; tolerate 404 during cleanup. |
-| Store grows unbounded | Medium | Medium | TTL eviction across sessions, interactions, in-flight batches, and hash_index. |
+| Store grows unbounded | Medium | Medium | Follow-up expiration cleanup change will define eviction across sessions, interactions, in-flight batches, and hash_index. |

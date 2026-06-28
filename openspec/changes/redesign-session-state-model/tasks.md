@@ -28,37 +28,51 @@
 
 ## Phase 2: InteractionStore and Frontier Selection
 
-### 2.1 RED — Insert and lookup node by id
-- Insert `InteractionNode { id: "int-1", prev_id: None, message_hashes: vec![0xA] }`
-- THEN `get("int-1")` succeeds
+### 2.1 RED — Insert and lookup upstream node by id
+- Insert `UpstreamInteractionNode { id: "int-A", prev_id: None, ... }`
+- THEN `get_upstream("int-A")` succeeds
 
-### 2.2 RED — Hash index supports duplicate positions
-- Insert branch A and branch B both containing `0xA`
+### 2.2 RED — Insert and lookup client node by id
+- Insert `ClientInteractionNode { id: "int-A", prev_id: None, message_hashes: vec![0xA], upstream_ids: ["int-A"] }`
+- THEN `get_client("int-A")` succeeds
+- AND `hash_index` maps `0xA` → `("int-A", 0)`
+
+### 2.3 RED — Hash index supports duplicate positions
+- Insert two ClientInteractionNodes from different branches, both containing `0xA`
 - THEN `lookup_hash(0xA)` returns both positions
+- NOTE: Frontier uses this by finding candidates by hash, then validating a unique chain by `Some(prev_id)` plus current message hash. Tuple `[Some(prev_id), message_hash]` identifies the client node equivalently to `id`.
 
-### 2.3 RED — Walk chain leaf to root
-- GIVEN `int-1 -> int-2 -> int-3`
-- THEN `walk_chain("int-3")` returns `[int-3, int-2, int-1]`
+### 2.4 RED — Walk client chain leaf to root
+- GIVEN `C1 → C2 → C3`
+- THEN `walk_client_chain("C3.id")` returns `[C3, C2, C1]`
 
-### 2.4 RED — Longest valid prefix ignores unrelated later hash
-- Store contains `0xB` only on unrelated branch
+### 2.5 RED — Longest valid prefix ignores unrelated later hash
+- Store contains `0xB` only on unrelated client branch
 - Incoming hashes `[0xA, 0xB]`
 - THEN frontier is `0`, not `2`
 
-### 2.5 RED — Longest valid prefix returns previous interaction
-- Known chain hashes `[0xA, 0xB]` ending at `int-2`
+### 2.6 RED — Longest valid prefix returns previous client at boundary
+- Known client chain hashes `[0xA, 0xB]` ending at `C2`
 - Incoming `[0xA, 0xB, 0xC]`
-- THEN frontier is `2`, previous interaction is `int-2`
+- THEN frontier is `2`, previous interaction is `C2.id`, only `0xC` sent
 
-### 2.6 RED — Duplicate branch tie-break deterministic
-- Two chains match same prefix and same `last_seen_utc`
-- THEN lexicographically smallest terminal id wins
+### 2.7 RED — Frontier inside client node forks at parent
+- `C1 {hashes: [0xA, 0xB, 0xC]}` with `prev_id = C0.id`
+- Incoming `[0xA, 0xB, 0xD]` with `incoming.prev_id = C0.id`
+- THEN fork at `C0.id`, send messages for `[0xA, 0xB, 0xD]`
 
-### 2.7 GREEN — Implement InteractionStore and frontier selection
-- `HashMap<String, InteractionNode>`
-- `HashMap<u64, Vec<InteractionPosition>>`
+### 2.8 RED — Equal validated-chain tie-break deterministic
+- Two fully validated client chains match same prefix length after duplicate/collision chain validation
+- AND both have same `last_seen_utc`
+- THEN lexicographically smallest client id wins
+- NOTE: This is deterministic fallback for ambiguous validated candidates, not primary duplicate-content resolution.
+
+### 2.9 GREEN — Implement InteractionStore and frontier selection
+- `HashMap<String, UpstreamInteractionNode>`
+- `HashMap<String, ClientInteractionNode>`
+- `HashMap<u64, Vec<ClientInteractionPosition>>`
 - `find_frontier(hashes) -> Frontier { index, previous_interaction_id }`
-- TTL eviction removes stale nodes and hash-index positions
+- Expiration cleanup is out of scope for this change; dependent change will define node/in-flight expiration removal
 
 **Quality Gate:** `cargo test --locked` — Phase 2 tests pass
 
@@ -84,7 +98,7 @@
 ### 3.4 GREEN — Replace old SessionState store
 - Remove `SessionState`, `message_count`, `pending`
 - Add versioned store document
-- Add `SessionInfo`, `InteractionStore`, `InFlightStore` persistence
+- Add `SessionInfo`, `ClientInteractionNode`, `UpstreamInteractionNode`, `InFlightStore` persistence
 - Remove `compute_delta`, `pending_sessions`, `clear_pending`
 
 **Quality Gate:** `cargo test --locked` — Phase 3 tests pass
@@ -97,15 +111,18 @@
 - Pending -> Sent -> Acked
 - THEN each transition is saved to store document
 
-### 4.2 RED — Complete batch inserts terminal node only
+### 4.2 RED — Complete batch inserts upstream nodes and one client node
 - One harness message splits into P0/P1
 - P0 ACKs `int-A`, P1 ACKs `int-B`
-- THEN `InteractionStore` indexes hash only for terminal `int-B`
+- THEN `UpstreamInteractionNode`s: `{id: "int-A", prev_id: None}`, `{id: "int-B", prev_id: "int-A"}`
+- AND `ClientInteractionNode { id: "int-B", upstream_ids: ["int-A", "int-B"], message_hashes: [0xH0] }`
+- AND batch is removed from `InFlightStore`
 
-### 4.3 RED — Failed piece cancels ACKed pieces
+### 4.3 RED — Failed piece cancels ACKed pieces, no client node
 - P0 ACKed, P1 fails
 - THEN `POST /int-A/cancel` is called best-effort
-- AND no terminal node is inserted
+- AND no `ClientInteractionNode` is inserted
+- AND `UpstreamInteractionNode` for `int-A` is removed
 
 ### 4.4 RED — Retry reuses matching in-flight batch
 - Same `session_id + prev_interaction_id + message_hashes` arrives during incomplete split
@@ -139,20 +156,27 @@
 - OpenAI history includes assistant message between user/tool messages
 - THEN assistant is not counted or sent in hash delta
 
-### 5.4 RED — All-known request replays terminal interaction
+### 5.4 RED — All-known request fetches existing interaction from upstream
 - Incoming harness hashes all match known chain
-- THEN handler calls replay path and makes no create-interaction call
+- AND incoming `prev_id == ClientInteractionNode.prev_id`
+- THEN handler calls `GET /v1beta/interactions/{id}` and translates the response — no `POST` call made
 
-### 5.5 RED — First-interaction fields follow frontier
+### 5.5 RED — All-known with multiple upstream_ids fetches and merges all pieces
+- `ClientInteractionNode` for `int-B` has `upstream_ids = ["int-A", "int-B"]`
+- Client retries with same harness hashes and same `prev_id`
+- THEN handler fetches `GET /int-A` and `GET /int-B`
+- AND merges content from both into one response with id `int-B`
+
+### 5.6 RED — First-interaction fields follow frontier
 - No known prefix -> tools/system/generation config present
 - Known prefix -> those fields absent
 
-### 5.6 GREEN — Replace `compute_delta` in `handle_from_anthropic` and `handle_from_openai`
+### 5.7 GREEN — Replace `compute_delta` in `handle_from_anthropic` and `handle_from_openai`
 - Strip controls
 - Filter/hash harness messages
 - Find frontier
 - Build request from unknown messages only
-- Update InteractionStore and SessionInfo after terminal success
+- Update ClientInteractionNode and SessionInfo after terminal success
 
 **Quality Gate:** `cargo test --locked` — Phase 5 tests pass
 
@@ -166,22 +190,36 @@
 
 ### 6.2 RED — System instruction split still precedes content
 - Oversized system instruction splits first
-- First system chunk carries tools/generation config
-- Later chunks chain via previous interaction id
+- First system chunk carries tools/generation config + first part
+- Each subsequent chunk carries its system_instruction part + prev id
+- Last system chunk can also pack content if it fits
 
-### 6.3 RED — Split-send terminal node owns original harness hashes
+### 6.3 RED — Split-send creates upstream nodes and client node
 - Multi-piece split completes
-- THEN final interaction id owns original message hashes
+- THEN all `UpstreamInteractionNode`s inserted in chain order
+- AND `ClientInteractionNode` has `id = final`, `upstream_ids = [all Acked interaction_ids in piece order]`, `message_hashes = original`
+- AND batch removed from `InFlightStore`
 
-### 6.4 RED — Split-send failure cancels and records failed batch
+### 6.4 RED — Non-streaming split merges all piece responses
+- P0 returns text "Hello", P1 returns text " world"
+- THEN client receives one response with "Hello world" and final interaction id
+
+### 6.5 RED — Non-streaming merge preserves tool calls across pieces
+- P0 returns text, P1 returns FunctionCallStep
+- THEN merged response contains both text and tool_use with final id
+
+### 6.6 RED — Split-send failure cancels and records failed batch
 - Later piece fails
 - THEN ACKed pieces are cancelled and batch is failed
 
-### 6.5 GREEN — Rewrite `handle_split_send` around InFlightStore
+### 6.7 GREEN — Rewrite `handle_split_send` around InFlightStore
 - Preserve existing packing helpers where possible
 - Persist before sending each piece
-- ACK pieces after success
-- Insert terminal node once
+- Store intermediate interaction IDs in Acked pieces
+- Merge piece responses into one client-visible response with final id
+- Insert all `UpstreamInteractionNode`s in chain order
+- Insert `ClientInteractionNode` with `upstream_ids` and `message_hashes`
+- Remove completed batch from `InFlightStore`
 - Remove old per-chunk `message_count` updates
 
 **Quality Gate:** `cargo test --locked` — Phase 6 tests pass
@@ -234,9 +272,9 @@
 - THEN all local stores are empty after best-effort upstream cleanup
 
 ### 8.4 RED — Extend-lifetime updates metadata and current interaction node
-- Current request matches known terminal node
+- Current request matches known client node
 - Extend-lifetime processed
-- THEN SessionInfo and node expiry update
+- THEN SessionInfo and current interaction node last-seen metadata update
 
 ### 8.5 GREEN — Replace old pending startup recovery and update control actions
 - Remove `pending_sessions` startup loop

@@ -21,7 +21,7 @@ fn hash_harness_message(message: &Value) -> u64
 | Anthropic Messages | `user` role, including `tool_result` blocks | `assistant` |
 | OpenAI Chat Completions | `system`, `developer`, `user`, `tool` | `assistant` |
 
-Hash input is `serde_json::to_vec(message)` from the parsed `serde_json::Value` after control stripping. Hash algorithm is `xxh3-64`.
+Hash input is `serde_json::to_vec(message)` from the parsed `serde_json::Value` after control stripping — the **full** message `Value` (all fields including `role`, `content`, nested `tool_result` blocks) is serialized and hashed, not extracted text. Hash algorithm is `xxh3-64`.
 
 #### Scenario: Anthropic user kept, assistant discarded
 - GIVEN messages `[{role: "user"}, {role: "assistant"}, {role: "user"}]`
@@ -38,86 +38,177 @@ Hash input is `serde_json::to_vec(message)` from the parsed `serde_json::Value` 
 - WHEN control scanning runs before harness hashing
 - THEN only the user message contributes to message hashes
 
-### Requirement: Branch-Safe InteractionStore
+### Requirement: Two-Model InteractionStore
 
-`InteractionStore` MUST model upstream interactions as a tree and MUST support duplicate hashes and forks.
+`InteractionStore` separates the client-visible logical chain from the upstream physical chain. Two node types, one store:
 
 ```rust
-struct InteractionNode {
+/// Client-visible logical interaction. Created AFTER all upstream
+/// pieces complete.
+struct ClientInteractionNode {
+    /// Terminal upstream id — client-visible. Always equals
+    /// upstream_ids.last().
     id: String,
+    /// Previous ClientInteractionNode.id in the logical chain.
     prev_id: Option<String>,
+    /// Pre-split xxh3 hashes of harness messages delivered in this
+    /// logical interaction.
     message_hashes: Vec<u64>,
+    /// xxh3 hash of the system_instruction sent in the first interaction
+    /// of this chain (None for follow-up interactions where prev_id is Some).
+    /// Used to detect mid-chain system_instruction changes and trigger a fork.
+    system_instruction_hash: Option<u64>,
+    /// All backing UpstreamInteractionNode.id's, in chain order.
+    /// Single element when no split occurred.
+    upstream_ids: Vec<String>,
+    last_seen_utc: u64,
+}
+
+/// Physical upstream interaction. One per actual upstream API call.
+/// Exists independently of ClientInteractionNode — upstream nodes
+/// are created during split-send, client node only after completion.
+struct UpstreamInteractionNode {
+    /// interaction.id assigned by upstream.
+    id: String,
+    /// Previous UpstreamInteractionNode.id in the physical chain.
+    prev_id: Option<String>,
+    /// Diagnostic back-reference for incident investigation.
+    /// Format: `{client_request_id}` for single-piece; `{client_request_id}:{chunk-N}` for split.
+    client_id: String,
+    /// Updated on creation and on every GET replay that references this node.
     last_seen_utc: u64,
     expires_at_utc: u64,
 }
 
-struct InteractionPosition {
-    interaction_id: String,
+/// Position of a harness-message hash within a ClientInteractionNode.
+/// hash_index ONLY indexes ClientInteractionNode.message_hashes —
+/// upstream piece hashes are never indexed.
+struct ClientInteractionPosition {
+    client_id: String,
     message_index: usize,
 }
 
 struct InteractionStore {
-    nodes: HashMap<String, InteractionNode>,
-    hash_index: HashMap<u64, Vec<InteractionPosition>>,
+    clients: HashMap<String, ClientInteractionNode>,
+    upstreams: HashMap<String, UpstreamInteractionNode>,
+    /// message_hash → client interaction positions.
+    /// Multi-valued: duplicate content and branch collisions are valid.
+    hash_index: HashMap<u64, Vec<ClientInteractionPosition>>,
 }
 ```
 
+Key invariants:
+- `ClientInteractionNode` is created ONLY after ALL `upstream_ids` nodes are persisted in `upstreams`.
+- `hash_index` references ONLY `ClientInteractionNode.message_hashes` — never piece hashes, never upstream nodes.
+- `UpstreamInteractionNode.client_id` is diagnostic-only. The mapping client→upstream lives exclusively in `ClientInteractionNode.upstream_ids`.
+- `UpstreamInteractionNode.last_seen_utc` is updated on creation AND on every GET replay that traverses this node.
+- `ClientInteractionNode.system_instruction_hash` is set to `Some(hash)` on the first interaction of a chain (when `prev_id` is `None`), and `None` on follow-ups. If a follow-up request has `prev_id=Some(...)` but the client's current `system_instruction` xxh3 hash differs from the root interaction's stored `system_instruction_hash`, the handler MUST log an error and fork (`prev_id=None`).
+
 Operations:
-- `insert(node)` — adds/updates node and indexes every `message_hashes` position.
-- `get(id) -> Option<&InteractionNode>`.
-- `lookup_hash(hash) -> &[InteractionPosition]`.
-- `walk_chain(id) -> Vec<&InteractionNode>` from leaf to root.
-- `evict_expired(now)` removes expired nodes and stale hash-index positions.
+- `insert_upstream(node)` — adds upstream node.
+- `insert_client(node)` — adds client node and indexes every `message_hashes` position into `hash_index`.
+- `get_client(id) -> Option<&ClientInteractionNode>`.
+- `get_upstream(id) -> Option<&UpstreamInteractionNode>`.
+- `lookup_hash(hash) -> &[ClientInteractionPosition]`.
+- `walk_client_chain(id) -> Vec<&ClientInteractionNode>` from leaf to root.
+- `walk_upstream_chain(id) -> Vec<&UpstreamInteractionNode>` from leaf to root.
 
-`hash_index` MUST NOT be single-valued. Duplicate content and branch collisions are valid inputs.
+Expiration cleanup is out of scope for this change and will be specified by a dependent change.
 
-#### Scenario: Duplicate hash in two branches
-- GIVEN branch A has node `int-A` with hash `0xH`
-- AND branch B has node `int-B` with hash `0xH`
-- WHEN `lookup_hash(0xH)` is called
-- THEN both positions are returned
+#### Scenario: Single upstream — single client
+- GIVEN no split, one upstream call creates `int-A`
+- WHEN interaction completes
+- THEN `UpstreamInteractionNode { id: "int-A", prev_id: ... }` is inserted
+- AND `ClientInteractionNode { id: "int-A", upstream_ids: ["int-A"], message_hashes: [...] }` is inserted
+- AND `hash_index` maps each message_hash → `("int-A", index)`
 
-#### Scenario: Chain walking
-- GIVEN `int-1 -> int-2 -> int-3`
-- WHEN walking from `int-3`
-- THEN nodes are returned leaf-to-root: `[int-3, int-2, int-1]`
+#### Scenario: Split into two — one client, two upstreams
+- GIVEN harness message H1 split into two pieces
+- WHEN P0 ACKs `int-B`, P1 ACKs `int-D` (with system_instruction chunk `int-C` between)
+- THEN `UpstreamInteractionNode`s: `int-B → int-C → int-D`
+- AND `ClientInteractionNode { id: "int-D", upstream_ids: ["int-B", "int-C", "int-D"], message_hashes: [hash(H1)] }`
+- AND `hash_index` maps `hash(H1)` → `("int-D", 0)`
+
+#### Scenario: Chain walking — client chain
+- GIVEN `C1 → C2 → C3`
+- WHEN walking client chain from `C3`
+- THEN nodes returned leaf-to-root: `[C3, C2, C1]`
 
 ### Requirement: Longest Valid Prefix Frontier
 
-For stateless clients, frontier selection MUST choose the longest contiguous prefix of incoming harness-message hashes that appears in one valid interaction chain in order.
+For stateless clients, frontier selection MUST choose the longest contiguous prefix of incoming harness-message hashes that appears in one valid **client** interaction chain in order. Frontier works exclusively with `ClientInteractionNode` and `hash_index` — upstream nodes are never consulted for routing.
 
 Algorithm requirements:
-1. Search candidate chains using multi-valued `hash_index` positions.
-2. Validate ordered prefix membership against concrete `InteractionNode.message_hashes` in chain order.
-3. Ignore isolated hash matches that are not part of the same ordered prefix.
-4. Return `(frontier_index, previous_interaction_id)` where `frontier_index` is the first unknown message.
-5. If all messages are known, `previous_interaction_id` is replay target.
-6. Tie-break same-length candidates by newest `last_seen_utc`, then lexicographically smallest `interaction_id`.
+1. Hash each filtered harness message.
+2. Look up each hash in `hash_index` to get candidate `(client_id, message_index)` positions.
+3. Validate ordered prefix membership against concrete `ClientInteractionNode.message_hashes` in client chain order.
+4. Ignore isolated hash matches not part of the same ordered prefix.
+5. If prefix ends at a client interaction **boundary** (last matched message is last in its client node): `previous_interaction_id` is that client node's `id`.
+6. If prefix ends **inside** a client interaction: fork at the client node's `prev_id`.
+7. Return `(frontier_index, previous_interaction_id)`.
+8. If all messages are known: require incoming `prev_id` to equal the matched `ClientInteractionNode.prev_id`, then read `ClientInteractionNode.upstream_ids`, fetch all upstream interactions via GET, merge `steps[]` in piece order (last piece's `usage`, first piece's `tools`/`system_instruction`/`generation_config`), return one response with the client node's `id`.
+9. Normal duplicate-content disambiguation validates chain order using `(prev_id, message_hash)`; tuple `[Some(prev_id), message_hash]` identifies the client node equivalently to `id`.
+10. If multiple fully validated candidates still have same prefix length, tie-break by newest `last_seen_utc`, then lexicographically smallest `id`.
 
-#### Scenario: Known prefix trimmed
-- GIVEN chain `int-1 {hashes: [0xA]}` -> `int-2 {hashes: [0xB]}`
+#### Scenario: Known prefix trimmed at client boundary
+- GIVEN client chain `C1 {hashes: [0xA]}` -> `C2 {hashes: [0xB]}`
 - WHEN incoming hashes are `[0xA, 0xB, 0xC]`
-- THEN frontier is `2` and previous interaction is `int-2`
+- THEN frontier is `2` and previous interaction is `C2.id`
+- AND only `0xC` is forwarded
+
+#### Scenario: Frontier inside client node — fork at parent
+- GIVEN `C1 {hashes: [0xA, 0xB, 0xC]}` with `prev_id = C0.id`
+- WHEN incoming hashes are `[0xA, 0xB, 0xD]` with incoming `prev_id = C0.id`
+- THEN `0xA, 0xB` match positions 0,1 inside C1
+- AND `0xC` is absent from incoming (suffix divergence)
+- THEN `previous_interaction_id = C0.id` (fork at C1's parent)
+- AND messages for `[0xA, 0xB, 0xD]` are forwarded
+
+#### Scenario: Frontier inside multi-node client chain
+- GIVEN `C1 {hashes: [0xA]}` -> `C2 {hashes: [0xB, 0xC]}`
+- WHEN incoming hashes are `[0xA, 0xB, 0xD]`
+- THEN `0xA` matches C1 boundary, `0xB` matches C2 position 0
+- AND `0xC` is absent from incoming (C2 suffix divergence)
+- THEN `previous_interaction_id = C1.id` (fork at C2's parent)
+- AND messages for `[0xB, 0xD]` are forwarded
 
 #### Scenario: Isolated later hash does not move frontier
-- GIVEN store has hash `0xB` only in an unrelated branch
+- GIVEN store has hash `0xB` only in an unrelated client branch
 - WHEN incoming hashes are `[0xA, 0xB]`
 - THEN frontier is `0` because prefix `0xA` is unknown
 
-#### Scenario: All known replays terminal interaction
-- GIVEN chain contains incoming hashes `[0xA, 0xB]`
-- WHEN frontier selection runs
-- THEN frontier is `2` and replay target is terminal interaction for the matched chain
+#### Scenario: All known — fetch and merge from all upstream nodes
+- GIVEN `ClientInteractionNode { id: "int-B", prev_id: Some("int-0"), upstream_ids: ["int-A", "int-B"], message_hashes: [0xA, 0xB] }`
+- AND incoming hashes are `[0xA, 0xB]`
+- AND incoming `prev_id == Some("int-0")`
+- THEN frontier is `2`
+- AND handler reads `upstream_ids`, fetches `GET /int-A` and `GET /int-B` from upstream
+- AND merges content from both into one response with id `int-B`
 
-#### Scenario: Equal prefix tie-break is deterministic
-- GIVEN two chains both match prefix `[0xA, 0xB]`
-- AND both have equal `last_seen_utc`
+#### Scenario: All known — no split, single upstream
+- GIVEN `ClientInteractionNode { id: "int-A", prev_id: Some("int-0"), upstream_ids: ["int-A"], message_hashes: [0xH0] }`
+- AND incoming hashes are `[0xH0]`
+- AND incoming `prev_id == Some("int-0")`
+- THEN frontier is `1`
+- AND handler fetches `GET /int-A`, translates response — no merge needed
+
+#### Scenario: Equal validated-chain tie-break is deterministic
+- GIVEN duplicate/collision candidates leave two fully validated client chains with same prefix length
+- AND both chains have equal `last_seen_utc`
 - WHEN frontier selection runs
 - THEN lexicographically smallest terminal interaction id wins
+- NOTE: This is only a deterministic fallback after chain validation. Normal duplicate-content disambiguation uses `(prev_id, message_hash)` in chain order; tuple `[Some(prev_id), message_hash]` identifies the client node equivalently to `id`.
 
 ### Requirement: Durable InFlightStore
 
-`InFlightStore` MUST persist split-send progress before and after every piece status transition.
+`InFlightStore` MUST persist split-send progress via `save_to_disk()` after every piece status transition (Pending→Sent, Sent→Acked, any→Failed) and on batch creation/completion.
+
+#### Scenario: Persistence after every piece status change
+- GIVEN an InFlightBatch with piece P0 Pending
+- WHEN P0 transitions to Sent
+- THEN `save_to_disk()` is called immediately
+- WHEN P0 transitions to Acked
+- THEN `save_to_disk()` is called immediately
 
 ```rust
 struct InFlightBatch {
@@ -126,7 +217,6 @@ struct InFlightBatch {
     prev_interaction_id: Option<String>,
     message_hashes: Vec<u64>,
     pieces: Vec<InFlightPiece>,
-    terminal_result: Option<String>,
     created_utc: u64,
     updated_utc: u64,
 }
@@ -140,24 +230,41 @@ struct InFlightPiece {
 
 enum InFlightStatus {
     Pending,
+    /// HTTP 200 received, SSE stream in progress or completed but not fully drained.
+    /// On recovery, proxy MUST re-fetch interaction via GET to verify completion
+    /// and re-drain content rather than re-sending. If GET fails or interaction
+    /// is gone, treat as Failed.
     Sent { request_hash: u64, interaction_id: Option<String> },
+    /// SSE stream fully consumed, all response content collected, no more events expected.
     Acked { interaction_id: String },
     Failed { error: String },
 }
 ```
 
-`message_hashes` are original harness-message hashes. `content_hash` identifies a split piece only. `request_body` is persisted before send so Pending pieces can be resent during startup recovery. Intermediate piece interactions MUST NOT own original harness-message hashes in `InteractionStore`.
+`message_hashes` are original harness-message hashes. `content_hash` identifies a split piece only. `request_body` is persisted before send so Pending pieces can be resent during startup recovery.
 
-A batch is complete when every piece is `Acked`. On completion, insert one terminal `InteractionNode`:
-- `id = final Acked interaction_id`
-- `prev_id = batch.prev_interaction_id`
-- `message_hashes = batch.message_hashes`
+A batch is complete when every piece is `Acked`. On completion:
+1. Insert all `UpstreamInteractionNode`s for each `Acked { interaction_id }` in piece order, linked by `prev_id` (first piece's `prev_id = batch.prev_interaction_id`).
+2. Insert one `ClientInteractionNode`:
+   - `id = final Acked interaction_id`
+   - `prev_id = batch.prev_interaction_id`
+   - `message_hashes = batch.message_hashes`
+   - `upstream_ids = [all Acked interaction_ids in piece order]`
+3. Remove the batch from `InFlightStore`.
 
-#### Scenario: Two pieces complete as one terminal node
-- GIVEN batch has `message_hashes = [0xH0]` and two pieces
+When a subsequent client request hits the same `message_hashes` and frontier selects the client node, the handler reads `upstream_ids`, fetches all upstream interactions via GET, merges their content, and returns one response with the client node's `id`.
+
+#### Scenario: Two pieces complete — upstream nodes + one client node
+- GIVEN batch has `message_hashes = [0xH0]`, `prev_interaction_id = None`, two pieces
 - WHEN P0 ACKs `int-A` and P1 ACKs `int-B`
-- THEN only terminal node `int-B` is inserted with `message_hashes = [0xH0]`
-- AND no node for `int-A` owns `0xH0`
+- THEN `UpstreamInteractionNode`s inserted: `{id: "int-A", prev_id: None}`, `{id: "int-B", prev_id: "int-A"}`
+- AND `ClientInteractionNode` inserted: `{id: "int-B", prev_id: None, message_hashes: [0xH0], upstream_ids: ["int-A", "int-B"]}`
+- AND batch is removed from `InFlightStore`
+
+#### Scenario: Single piece — one upstream node, one client node
+- GIVEN batch has one piece ACKing `int-A`
+- THEN `UpstreamInteractionNode {id: "int-A", ...}` and `ClientInteractionNode {id: "int-A", upstream_ids: ["int-A"], ...}` are inserted
+- AND retry fetches only `GET /int-A`
 
 #### Scenario: Retry matches existing in-flight batch
 - GIVEN an incomplete batch with `session_id = sess-1`, `prev_interaction_id = int-0`, and `message_hashes = [0xA]`
@@ -169,6 +276,22 @@ A batch is complete when every piece is `Acked`. On completion, insert one termi
 - WHEN P1 fails
 - THEN the handler calls `POST /int-A/cancel`, marks batch failed, and does not insert an `InteractionNode`
 
+#### Scenario: Recovery — Sent piece with interaction_id re-fetched via GET
+- GIVEN persisted batch has P0 Acked `int-A`, P1 Sent `{ request_hash, interaction_id: Some("int-B") }`
+- WHEN proxy starts and recovers
+- THEN P0 is trusted
+- AND proxy calls `GET /v1beta/interactions/int-B`
+- AND if 200: drains content from the interaction, marks P1 Acked `int-B`, batch completes normally
+- AND if 404: marks P1 Failed, cancels P0's `int-A`, batch failed
+- AND if GET fails (network error): keeps P1 as Sent for next recovery attempt
+
+#### Scenario: Recovery — Sent piece without interaction_id
+- GIVEN persisted batch has P0 Acked `int-A`, P1 Sent `{ request_hash, interaction_id: None }`
+- WHEN proxy starts and recovers
+- THEN P1 is indeterminate — no interaction_id to probe
+- AND P1 is marked Failed (duplicate-send prevention)
+- AND P0's `int-A` is cancelled best-effort
+
 ### Requirement: Versioned Persistence Document
 
 The file configured by `interactions_session_store` MUST store a versioned document:
@@ -179,8 +302,11 @@ version = 2
 [sessions]
 # client_session_id = SessionInfo
 
-[interactions]
-# interaction_id = InteractionNode
+[interactions.clients]
+# id = ClientInteractionNode
+
+[interactions.upstreams]
+# id = UpstreamInteractionNode
 
 [in_flight]
 # batch_id = InFlightBatch
@@ -207,7 +333,7 @@ struct SessionInfo {
 }
 ```
 
-`SessionInfo` MUST NOT drive frontier selection or `previous_interaction_id`. Handlers update it after successful terminal interaction replay or creation so logs and response-header behavior remain inspectable.
+`SessionInfo` MUST NOT drive frontier selection or `previous_interaction_id`. Handlers update it after successful upstream interaction creation or fetch, so logs and response-header behavior remain inspectable.
 
 #### Scenario: SessionInfo does not choose route frontier
 - GIVEN SessionInfo points to `int-old`
@@ -220,7 +346,8 @@ struct SessionInfo {
 ### Requirement: SessionState Replacement
 
 `SessionState { interaction_id, message_count, pending }` is removed. Its responsibilities are split:
-- `InteractionStore` chooses chain frontier.
+- `ClientInteractionNode` + `hash_index` drive chain frontier (logical client chain).
+- `UpstreamInteractionNode` tracks physical upstream interactions.
 - `InFlightStore` tracks partial split-send progress.
 - `SessionInfo` records client-session metadata only.
 

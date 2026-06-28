@@ -2052,31 +2052,51 @@ models = "gemini-3.1-flash-lite"
 
 #[tokio::test]
 async fn anthropic_split_streaming_uses_final_id() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+
     let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let request_count_clone = request_count.clone();
 
+    fn make_sse(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .map(|v| format!("data: {}\n\n", serde_json::to_string(v).unwrap()))
+            .collect()
+    }
+
+    let sse_a = make_sse(&[
+        serde_json::json!({"event_type":"interaction.created","interaction":{"id":"int-A","status":"in_progress"}}),
+        serde_json::json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+        serde_json::json!({"event_type":"step.delta","delta":{"type":"text","text":"Hello"},"index":0}),
+        serde_json::json!({"event_type":"step.stop","index":0}),
+        serde_json::json!({"event_type":"interaction.completed","interaction":{"id":"int-A","status":"completed","usage":{"total_input_tokens":5,"total_output_tokens":5}}}),
+    ]);
+    let sse_b = make_sse(&[
+        serde_json::json!({"event_type":"interaction.created","interaction":{"id":"int-B","status":"in_progress"}}),
+        serde_json::json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+        serde_json::json!({"event_type":"step.delta","delta":{"type":"text","text":" world"},"index":0}),
+        serde_json::json!({"event_type":"step.stop","index":0}),
+        serde_json::json!({"event_type":"interaction.completed","interaction":{"id":"int-B","status":"completed","usage":{"total_input_tokens":5,"total_output_tokens":5}}}),
+    ]);
+
     let app = axum::Router::new().route(
         "/v1beta/interactions",
-        axum::routing::post(
-            move |axum::Json(_body): axum::Json<serde_json::Value>| {
-                let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let resp = match count {
-                    0 => serde_json::json!({
-                        "id": "int-A",
-                        "status": "completed",
-                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Hello"}]}],
-                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
-                    }),
-                    _ => serde_json::json!({
-                        "id": "int-B",
-                        "status": "completed",
-                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": " world"}]}],
-                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
-                    }),
-                };
-                async move { axum::Json(resp) }
-            },
-        ),
+        axum::routing::post(move |axum::Json(_body): axum::Json<serde_json::Value>| {
+            let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = match count {
+                0 => sse_a.clone(),
+                _ => sse_b.clone(),
+            };
+            async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
@@ -2146,31 +2166,51 @@ proxy_limit = "1k"
 
 #[tokio::test]
 async fn openai_split_streaming_uses_final_id() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+
     let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let request_count_clone = request_count.clone();
 
+    fn make_sse(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .map(|v| format!("data: {}\n\n", serde_json::to_string(v).unwrap()))
+            .collect()
+    }
+
+    let sse_a = make_sse(&[
+        serde_json::json!({"event_type":"interaction.created","interaction":{"id":"int-A","status":"in_progress"}}),
+        serde_json::json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+        serde_json::json!({"event_type":"step.delta","delta":{"type":"text","text":"Hello"},"index":0}),
+        serde_json::json!({"event_type":"step.stop","index":0}),
+        serde_json::json!({"event_type":"interaction.completed","interaction":{"id":"int-A","status":"completed","usage":{"total_input_tokens":5,"total_output_tokens":5}}}),
+    ]);
+    let sse_b = make_sse(&[
+        serde_json::json!({"event_type":"interaction.created","interaction":{"id":"int-B","status":"in_progress"}}),
+        serde_json::json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+        serde_json::json!({"event_type":"step.delta","delta":{"type":"text","text":" world"},"index":0}),
+        serde_json::json!({"event_type":"step.stop","index":0}),
+        serde_json::json!({"event_type":"interaction.completed","interaction":{"id":"int-B","status":"completed","usage":{"total_input_tokens":5,"total_output_tokens":5}}}),
+    ]);
+
     let app = axum::Router::new().route(
         "/v1beta/interactions",
-        axum::routing::post(
-            move |axum::Json(_body): axum::Json<serde_json::Value>| {
-                let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let resp = match count {
-                    0 => serde_json::json!({
-                        "id": "int-A",
-                        "status": "completed",
-                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Hello"}]}],
-                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
-                    }),
-                    _ => serde_json::json!({
-                        "id": "int-B",
-                        "status": "completed",
-                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": " world"}]}],
-                        "usage": {"total_input_tokens": 5, "total_output_tokens": 5}
-                    }),
-                };
-                async move { axum::Json(resp) }
-            },
-        ),
+        axum::routing::post(move |axum::Json(_body): axum::Json<serde_json::Value>| {
+            let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = match count {
+                0 => sse_a.clone(),
+                _ => sse_b.clone(),
+            };
+            async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();

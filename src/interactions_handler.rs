@@ -1456,6 +1456,12 @@ impl InteractionsHandler {
         // Send each chunk sequentially, tracking state in InFlightStore
         let mut current_prev = params.previous_interaction_id.clone();
         let mut all_interactions: Vec<crate::interactions_types::Interaction> = Vec::new();
+        let mut sse_buffer = if stream {
+            Some(sse::MemSseBuffer::with_limit(sse::DEFAULT_SSE_BUFFER_LIMIT))
+        } else {
+            None
+        };
+        let mut all_int_ids: Vec<String> = Vec::new();
 
         for (i, chunk) in chunks.iter().enumerate() {
             let is_first_chunk = i == 0 && current_prev.is_none();
@@ -1469,7 +1475,7 @@ impl InteractionsHandler {
                 chunk.clone(),
                 si,
                 current_prev.clone(),
-                false,
+                stream,
             );
             if is_first_chunk {
                 chunk_req.tools = params.tools.clone();
@@ -1583,66 +1589,136 @@ impl InteractionsHandler {
             }
             let response_headers = response_headers_to_pairs(upstream.headers());
 
-            let response_bytes = match upstream.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(&batch_id, format!("chunk {i} body read error: {e}"))
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
+            let interaction_id;
+            if stream {
+                // Streaming: read SSE byte stream, buffer raw bytes, parse interaction.created
+                let mut byte_stream = upstream.bytes_stream();
+                let mut line_buf = String::new();
+                let mut chunk_int_id: Option<String> = None;
+                let sse_buf = sse_buffer.as_mut().unwrap();
+                while let Some(chunk_result) = byte_stream.next().await {
+                    match chunk_result {
+                        Ok(chunk_bytes) => {
+                            total_response_bytes += chunk_bytes.len();
+                            if let Err(e) = sse_buf.push(i, &chunk_bytes) {
+                                let acked_ids = {
+                                    let mut store = self.v2_store.write().await;
+                                    let ids = store
+                                        .fail_batch(
+                                            &batch_id,
+                                            format!("SSE buffer overflow: {e:?}"),
+                                        )
+                                        .unwrap_or_default();
+                                    let _ = store.save_to_disk(&self.v2_path).await;
+                                    ids
+                                };
+                                for id in &acked_ids {
+                                    let _ = self.cancel_interaction(id, route).await;
+                                }
+                                return Err(guard.abort_upstream(
+                                    start.elapsed().as_millis() as u64,
+                                    ingress_body.len(),
+                                    upstream_label,
+                                    direction,
+                                    stream,
+                                    format!("SSE buffer overflow: {e:?}"),
+                                ));
+                            }
+                            if std::str::from_utf8(&chunk_bytes).is_err() {
+                                continue;
+                            }
+                            line_buf.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
+                            while let Some(pos) = line_buf.find("\n\n") {
+                                let event_str = line_buf[..pos].to_string();
+                                line_buf = line_buf[pos + 2..].to_string();
+                                for line in event_str.lines() {
+                                    let data = line
+                                        .strip_prefix("data: ")
+                                        .or_else(|| line.strip_prefix("data:"));
+                                    let data = match data {
+                                        Some(d) => d.trim(),
+                                        None => continue,
+                                    };
+                                    if data.is_empty() || data == "[DONE]" {
+                                        continue;
+                                    }
+                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
+                                        serde_json::from_str::<InteractionSseEvent>(data)
+                                    {
+                                        chunk_int_id = Some(ev.interaction.id.clone());
+                                    }
+                                }
+                            }
+                            if line_buf.len() > MAX_SSE_BUFFER_BYTES {
+                                let acked_ids = {
+                                    let mut store = self.v2_store.write().await;
+                                    let ids = store
+                                        .fail_batch(
+                                            &batch_id,
+                                            format!(
+                                                "SSE buffer exceeded max line length for chunk {i}"
+                                            ),
+                                        )
+                                        .unwrap_or_default();
+                                    let _ = store.save_to_disk(&self.v2_path).await;
+                                    ids
+                                };
+                                for id in &acked_ids {
+                                    let _ = self.cancel_interaction(id, route).await;
+                                }
+                                return Err(guard.abort_upstream(
+                                    start.elapsed().as_millis() as u64,
+                                    ingress_body.len(),
+                                    upstream_label,
+                                    direction,
+                                    stream,
+                                    "SSE buffer exceeded max line length",
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            let acked_ids = {
+                                let mut store = self.v2_store.write().await;
+                                let ids = store
+                                    .fail_batch(&batch_id, format!("chunk {i} stream error: {e}"))
+                                    .unwrap_or_default();
+                                let _ = store.save_to_disk(&self.v2_path).await;
+                                ids
+                            };
+                            for id in &acked_ids {
+                                let _ = self.cancel_interaction(id, route).await;
+                            }
+                            return Err(guard.abort_upstream(
+                                start.elapsed().as_millis() as u64,
+                                ingress_body.len(),
+                                upstream_label,
+                                direction,
+                                stream,
+                                e,
+                            ));
+                        }
                     }
-                    return Err(guard.abort_upstream(
+                }
+                interaction_id = chunk_int_id.ok_or_else(|| {
+                    guard.abort_internal(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
                         upstream_label,
                         direction,
                         stream,
-                        e,
-                    ));
-                }
-            };
-            let validated = match crate::validate_upstream_body(response_bytes, guard.request_id())
-            {
-                Ok(v) => v,
-                Err((e, dump)) => {
-                    guard.response_dump(dump, 502, true, response_headers.clone());
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(&batch_id, format!("chunk {i} validation error: {e}"))
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
-                    return Err(guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    ));
-                }
-            };
-            guard.response_dump(validated.dump, 200, false, response_headers.clone());
-            let response_text = validated.text;
-            let interaction: crate::interactions_types::Interaction =
-                match serde_json::from_str(&response_text) {
-                    Ok(inter) => inter,
+                        format!("no interaction.created event in streaming chunk {i}"),
+                    )
+                })?;
+                all_int_ids.push(interaction_id.clone());
+            } else {
+                // Non-streaming: collect full response, validate, parse Interaction
+                let response_bytes = match upstream.bytes().await {
+                    Ok(b) => b,
                     Err(e) => {
                         let acked_ids = {
                             let mut store = self.v2_store.write().await;
                             let ids = store
-                                .fail_batch(&batch_id, format!("chunk {i} parse error: {e}"))
+                                .fail_batch(&batch_id, format!("chunk {i} body read error: {e}"))
                                 .unwrap_or_default();
                             let _ = store.save_to_disk(&self.v2_path).await;
                             ids
@@ -1660,10 +1736,67 @@ impl InteractionsHandler {
                         ));
                     }
                 };
-            total_response_bytes += response_text.len();
-            let interaction_id = interaction.id.clone();
+                let validated =
+                    match crate::validate_upstream_body(response_bytes, guard.request_id()) {
+                        Ok(v) => v,
+                        Err((e, dump)) => {
+                            guard.response_dump(dump, 502, true, response_headers.clone());
+                            let acked_ids = {
+                                let mut store = self.v2_store.write().await;
+                                let ids = store
+                                    .fail_batch(
+                                        &batch_id,
+                                        format!("chunk {i} validation error: {e}"),
+                                    )
+                                    .unwrap_or_default();
+                                let _ = store.save_to_disk(&self.v2_path).await;
+                                ids
+                            };
+                            for id in &acked_ids {
+                                let _ = self.cancel_interaction(id, route).await;
+                            }
+                            return Err(guard.abort_upstream(
+                                start.elapsed().as_millis() as u64,
+                                ingress_body.len(),
+                                upstream_label,
+                                direction,
+                                stream,
+                                e,
+                            ));
+                        }
+                    };
+                guard.response_dump(validated.dump, 200, false, response_headers.clone());
+                let response_text = validated.text;
+                let interaction: crate::interactions_types::Interaction =
+                    match serde_json::from_str(&response_text) {
+                        Ok(inter) => inter,
+                        Err(e) => {
+                            let acked_ids = {
+                                let mut store = self.v2_store.write().await;
+                                let ids = store
+                                    .fail_batch(&batch_id, format!("chunk {i} parse error: {e}"))
+                                    .unwrap_or_default();
+                                let _ = store.save_to_disk(&self.v2_path).await;
+                                ids
+                            };
+                            for id in &acked_ids {
+                                let _ = self.cancel_interaction(id, route).await;
+                            }
+                            return Err(guard.abort_upstream(
+                                start.elapsed().as_millis() as u64,
+                                ingress_body.len(),
+                                upstream_label,
+                                direction,
+                                stream,
+                                e,
+                            ));
+                        }
+                    };
+                total_response_bytes += response_text.len();
+                interaction_id = interaction.id.clone();
+                all_interactions.push(interaction);
+            }
             current_prev = Some(interaction_id.clone());
-            all_interactions.push(interaction);
 
             // Mark Acked
             {
@@ -1726,7 +1859,49 @@ impl InteractionsHandler {
             }
         };
 
-        // Merge all piece responses
+        if stream {
+            // Streaming split-send: substitute intermediate interaction IDs with final,
+            // translate buffered SSE to client protocol, drain as one coherent stream.
+            let final_id = &client_node.id;
+            let mut sse_buf = sse_buffer.take().unwrap();
+            for int_id in &all_int_ids {
+                if int_id != final_id {
+                    sse_buf.substitute_id(int_id, final_id);
+                }
+            }
+            let sse_bytes = sse_buf.drain();
+            let translated = Self::translate_buffered_sse_to_client(&sse_bytes, ingress, model)
+                .map_err(|e| {
+                    guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    )
+                })?;
+
+            guard.finish(
+                200,
+                start.elapsed().as_millis() as u64,
+                ingress_body.len(),
+                Some(total_response_bytes),
+                upstream_label,
+                direction,
+                stream,
+            );
+
+            let content_type = "text/event-stream";
+            return Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(Self::session_header_name(ingress), session_id)
+                .body(Body::from(translated))
+                .map_err(|err| AppError::Internal(err.to_string()));
+        }
+
+        // Non-streaming: merge all piece responses into one client-visible interaction
         let merged = Self::merge_interaction_responses(&all_interactions, &client_node.id);
         let resp = interactions_lib::build_response_from_interaction(&merged, model, ingress)
             .map_err(|e| {
@@ -1751,10 +1926,6 @@ impl InteractionsHandler {
             direction,
             stream,
         );
-
-        if stream {
-            return Self::streaming_response_from_merged(ingress, session_id, model, &resp);
-        }
 
         Ok(Self::ok_with_session_header(ingress, session_id, resp))
     }
@@ -3086,46 +3257,6 @@ impl InteractionsHandler {
         Ok(out)
     }
 
-    /// Build a streaming SSE response from the split-send final interaction.
-    /// Build a streaming (SSE) response from a pre-built protocol response.
-    /// Synthesizes Anthropic or OpenAI SSE events to produce a coherent
-    /// stream with only the final interaction id visible.
-    fn streaming_response_from_merged(
-        ingress: Protocol,
-        session_id: &str,
-        model: &str,
-        resp: &serde_json::Value,
-    ) -> Result<Response, AppError> {
-        match ingress {
-            Protocol::Anthropic => {
-                let events = synthesize_anthropic_events(model, resp);
-                let body = sse::format_sse_events(&events);
-                let hdr_name = Self::session_header_name(ingress);
-                let hdr_value =
-                    HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(HeaderName::from_static(hdr_name), hdr_value)
-                    .body(Body::from(body))
-                    .map_err(|err| AppError::Internal(err.to_string()))
-            }
-            Protocol::OpenAi => {
-                let chunks = synthesize_openai_chunks(model, resp);
-                let body = chunks.join("");
-                let hdr_name = Self::session_header_name(ingress);
-                let hdr_value =
-                    HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(HeaderName::from_static(hdr_name), hdr_value)
-                    .body(Body::from(body))
-                    .map_err(|err| AppError::Internal(err.to_string()))
-            }
-        }
-    }
-
     fn streaming_response_from_interaction(
         ingress: Protocol,
         session_id: &str,
@@ -3912,6 +4043,7 @@ mod tests {
     use super::*;
     use crate::interactions::{single_element_too_large, split_content_for_limit};
     use crate::interactions_types::{Content, TextContent};
+    use crate::sse::MemSseBuffer;
 
     // --- clamp_max_tokens tests ---
 
@@ -5191,5 +5323,277 @@ If you don't know the answer, say so honestly.";
         let out = InteractionsHandler::translate_buffered_sse_to_client(&[], Protocol::OpenAi, "m")
             .expect("empty input should produce empty output");
         assert!(out.is_empty());
+    }
+
+    // --- Buffered split-send streaming tests (MemSseBuffer + translate_buffered_sse_to_client) ---
+
+    /// Build raw SSE bytes for one chunk with a given interaction id and text content.
+    fn make_chunk_sse(id: &str, text: &str) -> Vec<u8> {
+        make_interactions_sse_bytes(&[
+            &format!(
+                r#"{{"event_type":"interaction.created","interaction":{{"id":"{id}","status":"in_progress"}}}}"#
+            ),
+            r#"{"event_type":"step.start","index":0,"step":{"type":"model_output"}}"#,
+            &format!(
+                r#"{{"event_type":"step.delta","delta":{{"type":"text","text":"{text}"}},"index":0}}"#
+            ),
+            r#"{"event_type":"step.stop","index":0}"#,
+            &format!(
+                r#"{{"event_type":"interaction.completed","interaction":{{"id":"{id}","status":"completed","usage":{{"total_input_tokens":5,"total_output_tokens":5}}}}}}"#
+            ),
+        ])
+    }
+
+    /// Build raw SSE bytes for a chunk with a function_call step.
+    fn make_tool_chunk_sse(id: &str, tool_id: &str, tool_name: &str, args_json: &str) -> Vec<u8> {
+        make_interactions_sse_bytes(&[
+            &format!(
+                r#"{{"event_type":"interaction.created","interaction":{{"id":"{id}","status":"in_progress"}}}}"#
+            ),
+            &format!(
+                r#"{{"event_type":"step.start","index":0,"step":{{"type":"function_call","id":"{tool_id}","name":"{tool_name}"}}}}"#
+            ),
+            &format!(
+                r#"{{"event_type":"step.delta","index":0,"delta":{{"type":"arguments_delta","arguments":"{args_json}"}}}}"#
+            ),
+            r#"{"event_type":"step.stop","index":0}"#,
+            &format!(
+                r#"{{"event_type":"interaction.completed","interaction":{{"id":"{id}","status":"completed","usage":{{"total_input_tokens":5,"total_output_tokens":5}}}}}}"#
+            ),
+        ])
+    }
+
+    #[test]
+    fn buffered_two_pieces_anthropic_content_merged() {
+        let mut buf = MemSseBuffer::default();
+        buf.push(0, &make_chunk_sse("int-A", "Hello")).unwrap();
+        buf.push(1, &make_chunk_sse("int-B", "World")).unwrap();
+        buf.substitute_id("int-A", "int-B");
+        let raw = buf.drain();
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::Anthropic,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).unwrap();
+        // Content from both pieces must appear
+        assert!(out_str.contains("Hello"), "missing first piece content");
+        assert!(out_str.contains("World"), "missing second piece content");
+        // Intermediate interaction id must not leak
+        assert!(!out_str.contains("int-A"), "intermediate id int-A leaked");
+        // Final interaction id must be present
+        assert!(out_str.contains("int-B"), "missing final interaction id");
+        // Must have proper structure: one message_start event, one message_stop
+        assert_eq!(
+            out_str.matches("event: message_start\n").count(),
+            1,
+            "must have exactly one message_start event"
+        );
+        assert!(
+            out_str.contains("event: message_stop\n"),
+            "must contain message_stop event"
+        );
+    }
+
+    #[test]
+    fn buffered_two_pieces_openai_content_merged() {
+        let mut buf = MemSseBuffer::default();
+        buf.push(0, &make_chunk_sse("int-A", "Hello")).unwrap();
+        buf.push(1, &make_chunk_sse("int-B", "World")).unwrap();
+        buf.substitute_id("int-A", "int-B");
+        let raw = buf.drain();
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::OpenAi,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(out_str.contains("data: "), "must contain SSE data prefix");
+        assert!(
+            out_str.contains("chat.completion.chunk"),
+            "must contain chat completion chunks"
+        );
+        assert!(out_str.contains("Hello"), "missing first piece content");
+        assert!(out_str.contains("World"), "missing second piece content");
+        assert!(!out_str.contains("int-A"), "intermediate id int-A leaked");
+        // OpenAI must end with [DONE]
+        assert!(out_str.contains("[DONE]"), "must contain [DONE] marker");
+    }
+
+    #[test]
+    fn buffered_single_piece_no_substitution_passes_through() {
+        // Single piece, no ID substitution — should behave like normal streaming translation
+        let raw = make_chunk_sse("int-X", "Solo");
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::Anthropic,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(out_str.contains("Solo"), "missing content");
+        assert!(out_str.contains("int-X"), "final id must appear");
+        assert_eq!(out_str.matches("event: message_start\n").count(), 1);
+    }
+
+    #[test]
+    fn buffered_tool_call_across_pieces() {
+        let mut buf = MemSseBuffer::default();
+        let tool_args = "{\\\"location\\\":\\\"Boston\\\"}";
+        buf.push(
+            0,
+            &make_tool_chunk_sse("int-A", "call-1", "get_weather", tool_args),
+        )
+        .unwrap();
+        buf.push(1, &make_chunk_sse("int-B", "Done")).unwrap();
+        buf.substitute_id("int-A", "int-B");
+        let raw = buf.drain();
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::Anthropic,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).unwrap();
+        // Tool name must appear in output
+        assert!(out_str.contains("get_weather"), "missing tool call name");
+        // Tool args must appear
+        assert!(out_str.contains("Boston"), "missing tool call arguments");
+        // Second piece text content must appear
+        assert!(out_str.contains("Done"), "missing second piece text");
+        // Intermediate id must not leak
+        assert!(!out_str.contains("int-A"), "intermediate id leaked");
+        assert_eq!(out_str.matches("event: message_start\n").count(), 1);
+        assert!(out_str.contains("event: message_stop\n"));
+    }
+
+    #[test]
+    fn buffered_tool_call_openai() {
+        let mut buf = MemSseBuffer::default();
+        let tool_args = "{\\\"query\\\":\\\"weather\\\"}";
+        buf.push(
+            0,
+            &make_tool_chunk_sse("int-A", "call-1", "search", tool_args),
+        )
+        .unwrap();
+        buf.push(1, &make_chunk_sse("int-B", "Result")).unwrap();
+        buf.substitute_id("int-A", "int-B");
+        let raw = buf.drain();
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::OpenAi,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(
+            out_str.contains("chat.completion.chunk"),
+            "must be OpenAI chunks"
+        );
+        assert!(out_str.contains("search"), "missing tool call name");
+        assert!(out_str.contains("weather"), "missing tool call args");
+        assert!(out_str.contains("Result"), "missing text content");
+        assert!(!out_str.contains("int-A"));
+        assert!(out_str.contains("[DONE]"));
+    }
+
+    #[test]
+    fn buffered_three_pieces_ordered_output() {
+        // Three pieces: verify content order is preserved
+        let mut buf = MemSseBuffer::default();
+        // Push out of order — MemSseBuffer sorts by piece_index on drain
+        buf.push(2, &make_chunk_sse("int-C", "Third")).unwrap();
+        buf.push(0, &make_chunk_sse("int-A", "First")).unwrap();
+        buf.push(1, &make_chunk_sse("int-B", "Second")).unwrap();
+        buf.substitute_id("int-A", "int-C");
+        buf.substitute_id("int-B", "int-C");
+        let raw = buf.drain();
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::Anthropic,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).unwrap();
+        // Content must appear in piece order: First, Second, Third
+        let pos_first = out_str.find("First").unwrap();
+        let pos_second = out_str.find("Second").unwrap();
+        let pos_third = out_str.find("Third").unwrap();
+        assert!(pos_first < pos_second, "First must precede Second");
+        assert!(pos_second < pos_third, "Second must precede Third");
+        assert!(!out_str.contains("int-A"));
+        assert!(!out_str.contains("int-B"));
+    }
+
+    #[test]
+    fn buffered_no_content_pieces_with_id_substitution() {
+        // Pieces with only interaction.created + interaction.completed, no step events
+        let mut buf = MemSseBuffer::default();
+        let empty_a = make_interactions_sse_bytes(&[
+            r#"{"event_type":"interaction.created","interaction":{"id":"int-A","status":"in_progress"}}"#,
+            r#"{"event_type":"interaction.completed","interaction":{"id":"int-A","status":"completed","usage":{"total_input_tokens":1,"total_output_tokens":0}}}"#,
+        ]);
+        let empty_b = make_interactions_sse_bytes(&[
+            r#"{"event_type":"interaction.created","interaction":{"id":"int-B","status":"in_progress"}}"#,
+            r#"{"event_type":"interaction.completed","interaction":{"id":"int-B","status":"completed","usage":{"total_input_tokens":1,"total_output_tokens":2}}}"#,
+        ]);
+        buf.push(0, &empty_a).unwrap();
+        buf.push(1, &empty_b).unwrap();
+        buf.substitute_id("int-A", "int-B");
+        let raw = buf.drain();
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::Anthropic,
+            "test-model",
+        )
+        .expect("translate should succeed");
+
+        let out_str = std::str::from_utf8(&out).unwrap();
+        // Must have message_start and message_stop
+        assert!(out_str.contains("message_start"), "missing message_start");
+        assert!(out_str.contains("message_stop"), "missing message_stop");
+        // Final id visible, intermediate not
+        assert!(!out_str.contains("int-A"));
+        assert!(out_str.contains("int-B"));
+    }
+
+    #[test]
+    fn buffered_overflow_does_not_crash_on_substitute_and_translate() {
+        // Second piece caused overflow — first piece data still valid
+        let mut buf = MemSseBuffer::with_limit(1000);
+        buf.push(0, &make_chunk_sse("int-A", "Hello"))
+            .expect("should fit");
+        // Second piece causes overflow — but first piece data is still valid
+        let big = vec![b'x'; 2000];
+        assert!(buf.push(1, &big).is_err(), "must overflow");
+
+        // Substitute still works on buffered data
+        buf.substitute_id("int-A", "int-Final");
+        let raw = buf.drain();
+        assert!(!raw.is_empty(), "must have buffered data from first piece");
+
+        let out = InteractionsHandler::translate_buffered_sse_to_client(
+            &raw,
+            Protocol::Anthropic,
+            "test-model",
+        )
+        .expect("translate should succeed after partial buffer");
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(out_str.contains("Hello"), "first piece content must appear");
+        assert!(!out_str.contains("int-A"), "old id must be substituted");
     }
 }

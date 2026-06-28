@@ -167,7 +167,7 @@ Initial buffer implementation is memory-backed with a 100 MB cap counted as tota
 | Piece N fails or times out | Cancel ACKed piece interactions via `POST /{id}/cancel`, mark batch failed, do not insert ClientInteractionNode, return error. |
 | Client disconnects mid-split | Continue batch to completion. Insert `UpstreamInteractionNode`s + `ClientInteractionNode`. Retry fetches via `upstream_ids`, merges, returns. |
 | Client resends same in-flight split | Find matching batch. If running, wait. If completed, fetch via `ClientInteractionNode.upstream_ids`, merge, return. |
-| Crash mid-split | Load persisted InFlightStore; ACKed pieces are trusted. Sent pieces trigger GET to re-fetch the interaction from upstream — if it exists, drain and transition to Acked; if 404 or error, mark Failed. ResponseStarted pieces have no interaction id to probe and fail for duplicate-send prevention. Pending pieces are resent. Failed batches remain until clean-all or future expiration cleanup. |
+| Crash mid-split | Discard all in-flight batches. Upstream interactions that were ACKed before crash stay in `InteractionStore` (they were committed via `complete_batch`). No re-fetch, no resend, no probe. Client on retry will hit frontier and replay from last committed ClientInteractionNode. In-flight metadata is cleaned on startup. |
 | SSE buffer overflow | Cancel ACKed piece interactions, mark batch failed, return error. |
 | Hash collision or duplicate content | `hash_index` returns candidates; chain order validation chooses valid longest prefix, never single hash alone. |
 
@@ -198,7 +198,7 @@ Clean-all control cancels/deletes known terminal interactions, uses `upstream_to
 - `SessionInfo` replacing old `SessionState` for metadata only.
 - Existing split-send full-body packing invariants preserved.
 - Streaming split-send buffering and final-id substitution.
-- Startup recovery for persisted in-flight batches.
+- Startup cleanup of stale in-flight batches.
 - Existing response session headers preserved.
 - Clean-all / extend-lifetime control behavior updated for new stores.
 
@@ -217,7 +217,7 @@ Clean-all control cancels/deletes known terminal interactions, uses `upstream_to
 | `src/interactions_handler.rs` | Major | Control stripping before hashing, frontier selection, split-send state machine, replay, streaming buffering, cancellation. |
 | `src/interactions.rs` | Major | Harness filtering, canonical hashing helpers, preserve full-body split packing. |
 | `src/sse.rs` | Minor | Memory SSE buffer and id substitution utilities. |
-| `src/lib.rs` | Major | Startup recovery loads v2 stores and resumes/verifies in-flight batches. |
+| `src/lib.rs` | Major | Startup loads v2 stores, completes fully-acked batches, discards all other in-flight state. |
 | `src/config.rs` | Minor | Document changed meaning of `interactions_session_store`; no new config key. |
 | `Cargo.toml`/lockfile | Minor | Add `xxhash-rust`. |
 | Tests | Major | Session model, frontier selection, split/recovery/control/header regression tests. |
@@ -230,6 +230,5 @@ Clean-all control cancels/deletes known terminal interactions, uses `upstream_to
 | Frontier selection chooses wrong branch | Medium | High | Longest valid prefix, deterministic tie-break, tests for forks and rewrites. |
 | Old session files ignored | Medium | Medium | Log explicit warning; safe reset beats stale `previous_interaction_id`. |
 | Streaming buffer too large | Low | Medium | 100 MB cap, cancel ACKed pieces, fail clearly. |
-| Recovery resends duplicate piece | Low | High | Persist request hash/status before send; verify Sent pieces via GET before resend. |
 | Cancel API behavior differs | Low | High | Use existing `POST /{id}/cancel`; tolerate 404 during cleanup. |
 | Store grows unbounded | Medium | Medium | Follow-up expiration cleanup change will define eviction across sessions, interactions, in-flight batches, and hash_index. |

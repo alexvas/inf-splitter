@@ -127,18 +127,21 @@
 
 ---
 
-## Phase 8: Startup Recovery and Control Messages
+## Phase 8: Startup Cleanup and Control Messages
 
 - [x] 8.1 RED — Startup rebuilds derived indexes from persisted interactions ✓ 2026-06-28
   - Test `startup_rebuilds_derived_indexes` verifies hash_index and upstream_to_clients rebuild
-- [x] 8.2 RED — Startup resumes pending in-flight piece ✓ 2026-06-28
-  - Test `startup_resumes_pending_inflight_piece` verifies P0 Acked, P1 Pending with request_body survive restart
+- [x] 8.2 RED — Startup discards stale in-flight batches ✓ 2026-06-28
+  - Test `startup_discards_non_fully_acked_batches` — fully-acked completes, Pending/Sent/Failed discarded
+  - Test `startup_cleanup_does_not_touch_committed_interactions` — committed nodes survive
 - [x] 8.3 RED — Clean-all clears all new stores ✓ 2026-06-28
   - Test `clean_all_clears_v2_stores` verifies sessions, interactions, hash_index, upstream_to_clients, in_flight all cleared
 - [x] 8.4 RED — Extend-lifetime updates metadata and current interaction node ✓ 2026-06-28
   - Test `extend_lifetime_updates_v2_session_and_client_node` verifies SessionInfo and client node last_seen_utc updates
-- [x] 8.5 GREEN — Replace old pending startup recovery and update control actions ✓ 2026-06-28
-  - Replaced `pending_sessions` startup loop with v2 in-flight batch recovery (complete all-Acked batches)
+- [x] 8.5 GREEN — Replace old pending startup recovery with v2 in-flight batch cleanup ✓ 2026-06-28
+  - Complete fully-acked batches, discard all other in-flight state (no re-fetch, no resend, no probe)
+  - Added `discard_all_inflight()` to `StoreV2` — clears in-flight without completing
+  - Added `clean_all()` to `StoreV2` — clears all stores
   - Added `clean_all()` to `StoreV2` — clears all stores
   - Added `extend_lifetime()` to `StoreV2` — updates SessionInfo + client node last_seen_utc
   - Added `all_upstream_ids()` to `StoreV2` — collects all upstream ids for cancellation
@@ -174,7 +177,7 @@
 - [x] Phase 5: Handler Frontier Integration ✓ 2026-06-28
 - [x] Phase 6: Split-Send Preservation and State Rewrite ✓ 2026-06-28
 - [x] Phase 7: Streaming Split-Send Buffer ✓ 2026-06-28
-- [x] Phase 8: Startup Recovery and Control Messages ✓ 2026-06-28
+- [x] Phase 8: Startup Cleanup and Control Messages ✓ 2026-06-28
 - [x] Phase 9: Regression and Final Checks ✓ 2026-06-28
 - [ ] Source specs updated by `/openspec-archive`
 - [ ] Ready for merge

@@ -2037,6 +2037,37 @@ impl InteractionsHandler {
         let mut final_id: Option<String> = None;
         let mut piece_index: usize = 0;
 
+        // Compute total piece count for InFlightStore batch
+        let extra_chunks = if chunks.len() > 1 {
+            chunks.len() - 1
+        } else {
+            0
+        };
+        let total_pieces = sys_parts.len() + extra_chunks;
+        let batch_id = format!("batch-{}-{}", session_id, crate::session::unix_now());
+        {
+            let pieces: Vec<session::InFlightPiece> = (0..total_pieces)
+                .map(|i| session::InFlightPiece {
+                    index: i,
+                    content_hash: 0,
+                    request_body: vec![],
+                    status: session::InFlightStatus::Pending,
+                })
+                .collect();
+            let mut store = self.v2_store.write().await;
+            store.create_batch(
+                batch_id.clone(),
+                session_id.to_string(),
+                prev_interaction_id.clone(),
+                harness_hashes.clone(),
+                system_instruction_hash,
+                pieces,
+            );
+            if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                tracing::warn!(error = %e, "v2 store save failed after batch creation");
+            }
+        }
+
         // Send system_instruction chunks as streaming requests
         for (i, part) in sys_parts.iter().enumerate() {
             let is_first_chunk = i == 0;
@@ -2082,6 +2113,20 @@ impl InteractionsHandler {
 
             guard.egress_dump(&chunk_body, &egress_headers);
 
+            // InFlightStore: update piece body, mark ResponseStarted
+            {
+                let mut store = self.v2_store.write().await;
+                if let Err(e) = store.set_piece_body(&batch_id, piece_index, chunk_body.clone()) {
+                    tracing::warn!(error = %e, "set_piece_body failed");
+                }
+                if let Err(e) = store.mark_response_started(&batch_id, piece_index) {
+                    tracing::warn!(error = %e, "mark_response_started failed");
+                }
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save failed before chunk send");
+                }
+            }
+
             let builder = build_interactions_headers(
                 self.get_client(route.proxy.as_deref())
                     .post(url)
@@ -2089,20 +2134,51 @@ impl InteractionsHandler {
                 route.api_key.as_deref(),
                 request_headers,
             );
-            let upstream = builder.body(chunk_body).send().await.map_err(|e| {
-                guard.abort_upstream(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    true,
-                    e,
-                )
-            })?;
+            let upstream = match builder.body(chunk_body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(&batch_id, format!("chunk {piece_index} send error: {e}"))
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+                    return Err(guard.abort_upstream(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        e,
+                    ));
+                }
+            };
             if !upstream.status().is_success() {
                 let status = upstream.status();
                 let response_headers = response_headers_to_pairs(upstream.headers());
                 let error_body = upstream.text().await.unwrap_or_default();
+
+                // Fail batch, cancel acked pieces
+                let acked_ids = {
+                    let mut store = self.v2_store.write().await;
+                    let ids = store
+                        .fail_batch(
+                            &batch_id,
+                            format!("chunk {piece_index} HTTP {}", status.as_u16()),
+                        )
+                        .unwrap_or_default();
+                    let _ = store.save_to_disk(&self.v2_path).await;
+                    ids
+                };
+                for id in &acked_ids {
+                    let _ = self.cancel_interaction(id, route).await;
+                }
+
                 guard.finish_with_upstream_error(
                     status.as_u16(),
                     start.elapsed().as_millis() as u64,
@@ -2134,15 +2210,25 @@ impl InteractionsHandler {
                         total_response_bytes += chunk_bytes.len();
                         // Buffer raw bytes
                         if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
-                            let _ = guard.abort_upstream(
+                            let acked_ids = {
+                                let mut store = self.v2_store.write().await;
+                                let ids = store
+                                    .fail_batch(&batch_id, format!("SSE buffer overflow: {e:?}"))
+                                    .unwrap_or_default();
+                                let _ = store.save_to_disk(&self.v2_path).await;
+                                ids
+                            };
+                            for id in &acked_ids {
+                                let _ = self.cancel_interaction(id, route).await;
+                            }
+                            return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
                                 upstream_label,
                                 direction,
                                 true,
                                 format!("SSE buffer overflow: {:?}", e),
-                            );
-                            return Err(AppError::Internal("SSE buffer overflow".to_string()));
+                            ));
                         }
                         // Parse to find interaction.created event
                         if std::str::from_utf8(&chunk_bytes).is_err() {
@@ -2171,6 +2257,20 @@ impl InteractionsHandler {
                             }
                         }
                         if buffer.len() > MAX_SSE_BUFFER_BYTES {
+                            let acked_ids = {
+                                let mut store = self.v2_store.write().await;
+                                let ids = store
+                                    .fail_batch(
+                                        &batch_id,
+                                        "SSE buffer exceeded max line length".to_string(),
+                                    )
+                                    .unwrap_or_default();
+                                let _ = store.save_to_disk(&self.v2_path).await;
+                                ids
+                            };
+                            for id in &acked_ids {
+                                let _ = self.cancel_interaction(id, route).await;
+                            }
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -2182,6 +2282,20 @@ impl InteractionsHandler {
                         }
                     }
                     Err(e) => {
+                        let acked_ids = {
+                            let mut store = self.v2_store.write().await;
+                            let ids = store
+                                .fail_batch(
+                                    &batch_id,
+                                    format!("chunk {piece_index} stream error: {e}"),
+                                )
+                                .unwrap_or_default();
+                            let _ = store.save_to_disk(&self.v2_path).await;
+                            ids
+                        };
+                        for id in &acked_ids {
+                            let _ = self.cancel_interaction(id, route).await;
+                        }
                         return Err(guard.abort_upstream(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),
@@ -2194,22 +2308,55 @@ impl InteractionsHandler {
                 }
             }
 
-            let int_id = chunk_int_id.ok_or_else(|| {
-                guard.abort_internal(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    true,
-                    "no interaction.created event in streaming chunk response",
-                )
-            })?;
+            let int_id = match chunk_int_id {
+                Some(id) => id,
+                None => {
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(
+                                &batch_id,
+                                "no interaction.created event in streaming chunk response"
+                                    .to_string(),
+                            )
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+                    return Err(guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        "no interaction.created event in streaming chunk response",
+                    ));
+                }
+            };
 
             if i == 0 {
                 final_id = Some(int_id.clone());
             }
             all_int_ids.push(int_id.clone());
             current_prev = Some(int_id.clone());
+
+            // InFlightStore: mark sent and acked
+            {
+                let mut store = self.v2_store.write().await;
+                if let Err(e) = store.mark_sent(&batch_id, piece_index, int_id.clone()) {
+                    tracing::warn!(error = %e, "mark_sent failed");
+                }
+                if let Err(e) = store.ack_piece(&batch_id, piece_index, int_id.clone()) {
+                    tracing::warn!(error = %e, "ack_piece failed");
+                }
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save failed after chunk ack");
+                }
+            }
+
             piece_index += 1;
         }
 
@@ -2248,6 +2395,21 @@ impl InteractionsHandler {
 
                 guard.egress_dump(&chunk_body, &egress_headers);
 
+                // InFlightStore: update piece body, mark ResponseStarted
+                {
+                    let mut store = self.v2_store.write().await;
+                    if let Err(e) = store.set_piece_body(&batch_id, piece_index, chunk_body.clone())
+                    {
+                        tracing::warn!(error = %e, "set_piece_body failed");
+                    }
+                    if let Err(e) = store.mark_response_started(&batch_id, piece_index) {
+                        tracing::warn!(error = %e, "mark_response_started failed");
+                    }
+                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                        tracing::warn!(error = %e, "v2 store save failed before chunk send");
+                    }
+                }
+
                 let builder = build_interactions_headers(
                     self.get_client(route.proxy.as_deref())
                         .post(url)
@@ -2255,20 +2417,54 @@ impl InteractionsHandler {
                     route.api_key.as_deref(),
                     request_headers,
                 );
-                let upstream = builder.body(chunk_body).send().await.map_err(|e| {
-                    guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        true,
-                        e,
-                    )
-                })?;
+                let upstream = match builder.body(chunk_body).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let acked_ids = {
+                            let mut store = self.v2_store.write().await;
+                            let ids = store
+                                .fail_batch(
+                                    &batch_id,
+                                    format!("chunk {piece_index} send error: {e}"),
+                                )
+                                .unwrap_or_default();
+                            let _ = store.save_to_disk(&self.v2_path).await;
+                            ids
+                        };
+                        for id in &acked_ids {
+                            let _ = self.cancel_interaction(id, route).await;
+                        }
+                        return Err(guard.abort_upstream(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            true,
+                            e,
+                        ));
+                    }
+                };
                 if !upstream.status().is_success() {
                     let status = upstream.status();
                     let response_headers = response_headers_to_pairs(upstream.headers());
                     let error_body = upstream.text().await.unwrap_or_default();
+
+                    // Fail batch, cancel acked pieces
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(
+                                &batch_id,
+                                format!("chunk {piece_index} HTTP {}", status.as_u16()),
+                            )
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+
                     guard.finish_with_upstream_error(
                         status.as_u16(),
                         start.elapsed().as_millis() as u64,
@@ -2300,15 +2496,28 @@ impl InteractionsHandler {
                         Ok(chunk_bytes) => {
                             total_response_bytes += chunk_bytes.len();
                             if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
-                                let _ = guard.abort_upstream(
+                                let acked_ids = {
+                                    let mut store = self.v2_store.write().await;
+                                    let ids = store
+                                        .fail_batch(
+                                            &batch_id,
+                                            format!("SSE buffer overflow: {e:?}"),
+                                        )
+                                        .unwrap_or_default();
+                                    let _ = store.save_to_disk(&self.v2_path).await;
+                                    ids
+                                };
+                                for id in &acked_ids {
+                                    let _ = self.cancel_interaction(id, route).await;
+                                }
+                                return Err(guard.abort_upstream(
                                     start.elapsed().as_millis() as u64,
                                     ingress_body.len(),
                                     upstream_label,
                                     direction,
                                     true,
                                     format!("SSE buffer overflow: {:?}", e),
-                                );
-                                return Err(AppError::Internal("SSE buffer overflow".to_string()));
+                                ));
                             }
                             if std::str::from_utf8(&chunk_bytes).is_err() {
                                 continue;
@@ -2336,6 +2545,20 @@ impl InteractionsHandler {
                                 }
                             }
                             if buffer.len() > MAX_SSE_BUFFER_BYTES {
+                                let acked_ids = {
+                                    let mut store = self.v2_store.write().await;
+                                    let ids = store
+                                        .fail_batch(
+                                            &batch_id,
+                                            "SSE buffer exceeded max line length".to_string(),
+                                        )
+                                        .unwrap_or_default();
+                                    let _ = store.save_to_disk(&self.v2_path).await;
+                                    ids
+                                };
+                                for id in &acked_ids {
+                                    let _ = self.cancel_interaction(id, route).await;
+                                }
                                 return Err(guard.abort_upstream(
                                     start.elapsed().as_millis() as u64,
                                     ingress_body.len(),
@@ -2347,6 +2570,20 @@ impl InteractionsHandler {
                             }
                         }
                         Err(e) => {
+                            let acked_ids = {
+                                let mut store = self.v2_store.write().await;
+                                let ids = store
+                                    .fail_batch(
+                                        &batch_id,
+                                        format!("chunk {piece_index} stream error: {e}"),
+                                    )
+                                    .unwrap_or_default();
+                                let _ = store.save_to_disk(&self.v2_path).await;
+                                ids
+                            };
+                            for id in &acked_ids {
+                                let _ = self.cancel_interaction(id, route).await;
+                            }
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -2359,18 +2596,51 @@ impl InteractionsHandler {
                     }
                 }
 
-                let int_id = chunk_int_id.ok_or_else(|| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        true,
-                        "no interaction.created event in streaming chunk response",
-                    )
-                })?;
+                let int_id = match chunk_int_id {
+                    Some(id) => id,
+                    None => {
+                        let acked_ids = {
+                            let mut store = self.v2_store.write().await;
+                            let ids = store
+                                .fail_batch(
+                                    &batch_id,
+                                    "no interaction.created event in streaming chunk response"
+                                        .to_string(),
+                                )
+                                .unwrap_or_default();
+                            let _ = store.save_to_disk(&self.v2_path).await;
+                            ids
+                        };
+                        for id in &acked_ids {
+                            let _ = self.cancel_interaction(id, route).await;
+                        }
+                        return Err(guard.abort_internal(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            true,
+                            "no interaction.created event in streaming chunk response",
+                        ));
+                    }
+                };
                 all_int_ids.push(int_id.clone());
                 current_prev = Some(int_id.clone());
+
+                // InFlightStore: mark sent and acked
+                {
+                    let mut store = self.v2_store.write().await;
+                    if let Err(e) = store.mark_sent(&batch_id, piece_index, int_id.clone()) {
+                        tracing::warn!(error = %e, "mark_sent failed");
+                    }
+                    if let Err(e) = store.ack_piece(&batch_id, piece_index, int_id.clone()) {
+                        tracing::warn!(error = %e, "ack_piece failed");
+                    }
+                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                        tracing::warn!(error = %e, "v2 store save failed after chunk ack");
+                    }
+                }
+
                 piece_index += 1;
             }
         }
@@ -2398,33 +2668,32 @@ impl InteractionsHandler {
                 )
             })?;
 
-        // Persist interaction nodes in v2 store
+        // Complete batch: InFlightStore creates ClientInteractionNode
+        {
+            let mut store = self.v2_store.write().await;
+            match store.complete_batch(&batch_id) {
+                Ok(_node) => {
+                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                        tracing::warn!(error = %e, "v2 store save after batch completion");
+                    }
+                }
+                Err(e) => {
+                    return Err(guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        e,
+                    ));
+                }
+            }
+        }
+
+        // Update session with final interaction_id
         {
             let mut store = self.v2_store.write().await;
             let now = crate::session::unix_now();
-            let mut prev_upstream = prev_interaction_id.clone();
-            for upstream_id in &all_int_ids {
-                store
-                    .interactions
-                    .insert_upstream(crate::session::UpstreamInteractionNode {
-                        id: upstream_id.clone(),
-                        prev_id: prev_upstream.clone(),
-                        client_id: session_id.to_string(),
-                        last_seen_utc: now,
-                        expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
-                    });
-                prev_upstream = Some(upstream_id.clone());
-            }
-            store
-                .interactions
-                .insert_client(crate::session::ClientInteractionNode {
-                    id: final_id.clone(),
-                    prev_id: prev_interaction_id,
-                    message_hashes: harness_hashes.clone(),
-                    system_instruction_hash,
-                    upstream_ids: all_int_ids.clone(),
-                    last_seen_utc: now,
-                });
             store
                 .sessions
                 .entry(session_id.to_string())
@@ -2537,6 +2806,39 @@ impl InteractionsHandler {
         let mut current_prev: Option<String> = prev_interaction_id.clone();
         let mut all_int_ids: Vec<String> = Vec::new();
 
+        // Compute total piece count for InFlightStore batch
+        let extra_chunks = if chunks.len() > 1 {
+            chunks.len() - 1
+        } else {
+            0
+        };
+        let total_pieces = sys_parts.len() + extra_chunks;
+        let batch_id = format!("batch-{}-{}", session_id, crate::session::unix_now());
+        {
+            let pieces: Vec<session::InFlightPiece> = (0..total_pieces)
+                .map(|i| session::InFlightPiece {
+                    index: i,
+                    content_hash: 0,
+                    request_body: vec![],
+                    status: session::InFlightStatus::Pending,
+                })
+                .collect();
+            let mut store = self.v2_store.write().await;
+            store.create_batch(
+                batch_id.clone(),
+                session_id.to_string(),
+                prev_interaction_id.clone(),
+                harness_hashes.clone(),
+                system_instruction_hash,
+                pieces,
+            );
+            if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                tracing::warn!(error = %e, "v2 store save failed after batch creation");
+            }
+        }
+
+        let mut piece_index: usize = 0;
+
         // Send empty interactions with system_instruction chunks
         for (i, part) in sys_parts.iter().enumerate() {
             let is_first_chunk = i == 0;
@@ -2582,6 +2884,20 @@ impl InteractionsHandler {
 
             guard.egress_dump(&chunk_body, &egress_headers);
 
+            // InFlightStore: update piece body, mark ResponseStarted
+            {
+                let mut store = self.v2_store.write().await;
+                if let Err(e) = store.set_piece_body(&batch_id, piece_index, chunk_body.clone()) {
+                    tracing::warn!(error = %e, "set_piece_body failed");
+                }
+                if let Err(e) = store.mark_response_started(&batch_id, piece_index) {
+                    tracing::warn!(error = %e, "mark_response_started failed");
+                }
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save failed before chunk send");
+                }
+            }
+
             let builder = build_interactions_headers(
                 self.get_client(route.proxy.as_deref())
                     .post(url)
@@ -2589,20 +2905,51 @@ impl InteractionsHandler {
                 route.api_key.as_deref(),
                 request_headers,
             );
-            let upstream = builder.body(chunk_body).send().await.map_err(|e| {
-                guard.abort_upstream(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    stream,
-                    e,
-                )
-            })?;
+            let upstream = match builder.body(chunk_body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(&batch_id, format!("chunk {piece_index} send error: {e}"))
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+                    return Err(guard.abort_upstream(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    ));
+                }
+            };
             let upstream_status = upstream.status();
             let response_headers = response_headers_to_pairs(upstream.headers());
             if !upstream_status.is_success() {
                 let error_body = upstream.text().await.unwrap_or_default();
+
+                // Fail batch, cancel acked pieces
+                let acked_ids = {
+                    let mut store = self.v2_store.write().await;
+                    let ids = store
+                        .fail_batch(
+                            &batch_id,
+                            format!("chunk {piece_index} HTTP {}", upstream_status.as_u16()),
+                        )
+                        .unwrap_or_default();
+                    let _ = store.save_to_disk(&self.v2_path).await;
+                    ids
+                };
+                for id in &acked_ids {
+                    let _ = self.cancel_interaction(id, route).await;
+                }
+
                 guard.finish_with_upstream_error(
                     upstream_status.as_u16(),
                     start.elapsed().as_millis() as u64,
@@ -2624,22 +2971,53 @@ impl InteractionsHandler {
                     .body(Body::from(body))
                     .map_err(|err| AppError::Internal(err.to_string()));
             }
-            let response_bytes = upstream.bytes().await.map_err(|e| {
-                guard.abort_upstream(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    stream,
-                    e,
-                )
-            })?;
+            let response_bytes = match upstream.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(
+                                &batch_id,
+                                format!("chunk {piece_index} body read error: {e}"),
+                            )
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+                    return Err(guard.abort_upstream(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    ));
+                }
+            };
             total_response_bytes += response_bytes.len();
             let validated = match crate::validate_upstream_body(response_bytes, guard.request_id())
             {
                 Ok(v) => v,
                 Err((e, dump)) => {
                     guard.response_dump(dump, 502, true, response_headers.clone());
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(
+                                &batch_id,
+                                format!("chunk {piece_index} validation error: {e}"),
+                            )
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -2652,21 +3030,51 @@ impl InteractionsHandler {
             };
             guard.response_dump(validated.dump, 200, false, response_headers.clone());
             let response_text = validated.text;
-            let interaction: Interaction = serde_json::from_str(&response_text).map_err(|e| {
-                guard.abort_internal(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    stream,
-                    e,
-                )
-            })?;
+            let interaction: Interaction = match serde_json::from_str(&response_text) {
+                Ok(inter) => inter,
+                Err(e) => {
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(&batch_id, format!("chunk {piece_index} parse error: {e}"))
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+                    return Err(guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    ));
+                }
+            };
             let int_id = interaction.id.clone();
             all_int_ids.push(int_id.clone());
             current_prev = Some(int_id.clone());
             last_id = Some(int_id.clone());
             last_interaction = Some(interaction);
+
+            // InFlightStore: mark sent and acked
+            {
+                let mut store = self.v2_store.write().await;
+                if let Err(e) = store.mark_sent(&batch_id, piece_index, int_id.clone()) {
+                    tracing::warn!(error = %e, "mark_sent failed");
+                }
+                if let Err(e) = store.ack_piece(&batch_id, piece_index, int_id.clone()) {
+                    tracing::warn!(error = %e, "ack_piece failed");
+                }
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save failed after chunk ack");
+                }
+            }
+
+            piece_index += 1;
         }
 
         // Send remaining chunks if more than one
@@ -2679,7 +3087,19 @@ impl InteractionsHandler {
                     current_prev.clone(),
                     false,
                 );
-                let chunk_body = serde_json::to_vec(&chunk_req).map_err(|e| {
+                let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
+                    guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    )
+                })?;
+                let df = route.drop_fields.for_model(model);
+                crate::drop_fields_from_value(&mut chunk_body_value, &df);
+                let chunk_body = serde_json::to_vec(&chunk_body_value).map_err(|e| {
                     guard.abort_internal(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -2692,6 +3112,21 @@ impl InteractionsHandler {
 
                 guard.egress_dump(&chunk_body, &egress_headers);
 
+                // InFlightStore: update piece body, mark ResponseStarted
+                {
+                    let mut store = self.v2_store.write().await;
+                    if let Err(e) = store.set_piece_body(&batch_id, piece_index, chunk_body.clone())
+                    {
+                        tracing::warn!(error = %e, "set_piece_body failed");
+                    }
+                    if let Err(e) = store.mark_response_started(&batch_id, piece_index) {
+                        tracing::warn!(error = %e, "mark_response_started failed");
+                    }
+                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                        tracing::warn!(error = %e, "v2 store save failed before chunk send");
+                    }
+                }
+
                 let builder = build_interactions_headers(
                     self.get_client(route.proxy.as_deref())
                         .post(url)
@@ -2699,20 +3134,54 @@ impl InteractionsHandler {
                     route.api_key.as_deref(),
                     request_headers,
                 );
-                let upstream = builder.body(chunk_body).send().await.map_err(|e| {
-                    guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    )
-                })?;
+                let upstream = match builder.body(chunk_body).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let acked_ids = {
+                            let mut store = self.v2_store.write().await;
+                            let ids = store
+                                .fail_batch(
+                                    &batch_id,
+                                    format!("chunk {piece_index} send error: {e}"),
+                                )
+                                .unwrap_or_default();
+                            let _ = store.save_to_disk(&self.v2_path).await;
+                            ids
+                        };
+                        for id in &acked_ids {
+                            let _ = self.cancel_interaction(id, route).await;
+                        }
+                        return Err(guard.abort_upstream(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            stream,
+                            e,
+                        ));
+                    }
+                };
                 let upstream_status = upstream.status();
                 let response_headers = response_headers_to_pairs(upstream.headers());
                 if !upstream_status.is_success() {
                     let error_body = upstream.text().await.unwrap_or_default();
+
+                    // Fail batch, cancel acked pieces
+                    let acked_ids = {
+                        let mut store = self.v2_store.write().await;
+                        let ids = store
+                            .fail_batch(
+                                &batch_id,
+                                format!("chunk {piece_index} HTTP {}", upstream_status.as_u16()),
+                            )
+                            .unwrap_or_default();
+                        let _ = store.save_to_disk(&self.v2_path).await;
+                        ids
+                    };
+                    for id in &acked_ids {
+                        let _ = self.cancel_interaction(id, route).await;
+                    }
+
                     guard.finish_with_upstream_error(
                         upstream_status.as_u16(),
                         start.elapsed().as_millis() as u64,
@@ -2735,22 +3204,53 @@ impl InteractionsHandler {
                         .body(Body::from(body))
                         .map_err(|err| AppError::Internal(err.to_string()));
                 }
-                let response_bytes = upstream.bytes().await.map_err(|e| {
-                    guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    )
-                })?;
+                let response_bytes = match upstream.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let acked_ids = {
+                            let mut store = self.v2_store.write().await;
+                            let ids = store
+                                .fail_batch(
+                                    &batch_id,
+                                    format!("chunk {piece_index} body read error: {e}"),
+                                )
+                                .unwrap_or_default();
+                            let _ = store.save_to_disk(&self.v2_path).await;
+                            ids
+                        };
+                        for id in &acked_ids {
+                            let _ = self.cancel_interaction(id, route).await;
+                        }
+                        return Err(guard.abort_upstream(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            stream,
+                            e,
+                        ));
+                    }
+                };
                 total_response_bytes += response_bytes.len();
                 let validated =
                     match crate::validate_upstream_body(response_bytes, guard.request_id()) {
                         Ok(v) => v,
                         Err((e, dump)) => {
                             guard.response_dump(dump, 502, true, response_headers.clone());
+                            let acked_ids = {
+                                let mut store = self.v2_store.write().await;
+                                let ids = store
+                                    .fail_batch(
+                                        &batch_id,
+                                        format!("chunk {piece_index} validation error: {e}"),
+                                    )
+                                    .unwrap_or_default();
+                                let _ = store.save_to_disk(&self.v2_path).await;
+                                ids
+                            };
+                            for id in &acked_ids {
+                                let _ = self.cancel_interaction(id, route).await;
+                            }
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -2763,52 +3263,85 @@ impl InteractionsHandler {
                     };
                 guard.response_dump(validated.dump, 200, false, response_headers.clone());
                 let response_text = validated.text;
-                let interaction: Interaction =
-                    serde_json::from_str(&response_text).map_err(|e| {
-                        guard.abort_internal(
+                let interaction: Interaction = match serde_json::from_str(&response_text) {
+                    Ok(inter) => inter,
+                    Err(e) => {
+                        let acked_ids = {
+                            let mut store = self.v2_store.write().await;
+                            let ids = store
+                                .fail_batch(
+                                    &batch_id,
+                                    format!("chunk {piece_index} parse error: {e}"),
+                                )
+                                .unwrap_or_default();
+                            let _ = store.save_to_disk(&self.v2_path).await;
+                            ids
+                        };
+                        for id in &acked_ids {
+                            let _ = self.cancel_interaction(id, route).await;
+                        }
+                        return Err(guard.abort_internal(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),
                             upstream_label,
                             direction,
                             stream,
                             e,
-                        )
-                    })?;
+                        ));
+                    }
+                };
+                let int_id = interaction.id.clone();
                 current_prev = Some(interaction.id.clone());
                 last_id = Some(interaction.id.clone());
                 all_int_ids.push(interaction.id.clone());
                 last_interaction = Some(interaction);
+
+                // InFlightStore: mark sent and acked
+                {
+                    let mut store = self.v2_store.write().await;
+                    if let Err(e) = store.mark_sent(&batch_id, piece_index, int_id.clone()) {
+                        tracing::warn!(error = %e, "mark_sent failed");
+                    }
+                    if let Err(e) = store.ack_piece(&batch_id, piece_index, int_id.clone()) {
+                        tracing::warn!(error = %e, "ack_piece failed");
+                    }
+                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                        tracing::warn!(error = %e, "v2 store save failed after chunk ack");
+                    }
+                }
+
+                piece_index += 1;
             }
         }
 
-        // Persist interaction chain in v2 store so frontier can find it on replay.
+        // Complete batch: InFlightStore creates ClientInteractionNode
+        let _client_node = {
+            let mut store = self.v2_store.write().await;
+            match store.complete_batch(&batch_id) {
+                Ok(node) => {
+                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                        tracing::warn!(error = %e, "v2 store save failed after batch completion");
+                    }
+                    node
+                }
+                Err(e) => {
+                    return Err(guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        stream,
+                        e,
+                    ));
+                }
+            }
+        };
+
+        // Update session with final interaction_id
         {
             let mut store = self.v2_store.write().await;
             let now = crate::session::unix_now();
-            let mut prev_upstream = prev_interaction_id.clone();
-            for upstream_id in &all_int_ids {
-                store
-                    .interactions
-                    .insert_upstream(crate::session::UpstreamInteractionNode {
-                        id: upstream_id.clone(),
-                        prev_id: prev_upstream.clone(),
-                        client_id: session_id.to_string(),
-                        last_seen_utc: now,
-                        expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
-                    });
-                prev_upstream = Some(upstream_id.clone());
-            }
-            if let Some(final_id) = last_id.as_ref() {
-                store
-                    .interactions
-                    .insert_client(crate::session::ClientInteractionNode {
-                        id: final_id.clone(),
-                        prev_id: prev_interaction_id.clone(),
-                        message_hashes: harness_hashes.clone(),
-                        system_instruction_hash,
-                        upstream_ids: all_int_ids.clone(),
-                        last_seen_utc: now,
-                    });
+            if let Some(ref final_id) = last_id {
                 store
                     .sessions
                     .entry(session_id.to_string())
@@ -5709,6 +6242,308 @@ If you don't know the answer, say so honestly.";
             prev_id.and_then(|v| v.as_str()),
             Some("prev-1"),
             "first chunk must carry prev_interaction_id = \"prev-1\" (RED: current code sends null)"
+        );
+    }
+
+    /// RED: non-streaming split_system_instruction does not cancel acked pieces
+    /// when a later chunk fails. Upstream interactions leak.
+    #[tokio::test]
+    async fn split_system_instruction_non_streaming_cancels_acked_on_failure() {
+        use crate::diagnostics::{
+            DiagnosticMode, Diagnostics, DiagnosticsConfig, RequestDiagnostics,
+        };
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        // ── Mock upstream: count create requests, fail 3rd, track cancels ──
+        #[derive(Clone)]
+        struct MockState {
+            create_count: Arc<Mutex<usize>>,
+            cancels: Arc<Mutex<Vec<String>>>,
+        }
+
+        let state = MockState {
+            create_count: Arc::new(Mutex::new(0)),
+            cancels: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        async fn create_handler(
+            axum::extract::State(state): axum::extract::State<MockState>,
+        ) -> impl IntoResponse {
+            let mut count = state.create_count.lock().unwrap();
+            *count += 1;
+            if *count >= 3 {
+                // Chunk 2 (third request) fails with 502
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": {"message": "upstream failure"}})),
+                )
+                    .into_response()
+            } else {
+                Json(serde_json::json!({
+                    "id": format!("int-{}", *count),
+                    "status": "completed",
+                    "steps": [{"type": "model_output", "content": [{"type": "text", "text": "ok"}]}],
+                    "usage": {"total_input_tokens": 1, "total_output_tokens": 1}
+                }))
+                .into_response()
+            }
+        }
+
+        async fn cancel_handler(
+            axum::extract::State(state): axum::extract::State<MockState>,
+            Path(id): Path<String>,
+        ) -> impl IntoResponse {
+            let id_clean = id.strip_suffix("/cancel").unwrap_or(&id).to_string();
+            state.cancels.lock().unwrap().push(id_clean);
+            axum::http::StatusCode::OK
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/interactions/models/test-model:create",
+                post(create_handler),
+            )
+            .route("/v1/interactions/{*rest}", post(cancel_handler))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // ── Construct InteractionsHandler with error-mode diagnostics ──
+        let diag = Diagnostics::new(DiagnosticsConfig {
+            stats_mode: DiagnosticMode::Error,
+            ..DiagnosticsConfig::default()
+        });
+        let handler = super::InteractionsHandler {
+            clients: std::collections::HashMap::from([("".into(), reqwest::Client::new())]),
+            diagnostics: diag,
+            v2_store: Arc::new(tokio::sync::RwLock::new(StoreV2::new())),
+            v2_path: Arc::new(std::path::PathBuf::from(
+                "/tmp/inf-splitter-test-cancel.toml",
+            )),
+            error_translation: Arc::new([]),
+        };
+
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: Some(format!("http://{addr}/v1/interactions")),
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: ["test-model"].iter().map(|&s| s.into()).collect(),
+            drop_fields: Default::default(),
+            proxy: None,
+            proxy_limit: Some(60),
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+
+        let url = format!("http://{addr}/v1/interactions/models/test-model:create");
+
+        // Three paragraphs, each ~50 bytes, limit 60 → splits to 3 parts
+        let long_sys = "First paragraph is long enough to take some bytes for this.\n\nSecond paragraph also long enough for the test we run.\n\nThird paragraph should trigger a third chunk split.";
+
+        let guard = RequestDiagnostics::new(&handler.diagnostics, "test", "test-model");
+
+        // ── Act ──
+        let result = handler
+            .send_split_system_instruction(
+                long_sys,
+                &url,
+                &route,
+                "test-session",
+                &[],
+                vec![0xDEAD],
+                None,
+                60,
+                "test-model",
+                "test-upstream",
+                b"{}",
+                "request",
+                &axum::http::HeaderMap::new(),
+                crate::config::Protocol::Anthropic,
+                guard,
+                None,
+                None,
+                false,
+            )
+            .await;
+
+        // ── Assert: error returned (third chunk failed) ──
+        let response = result.expect("send_split_system_instruction must return Response");
+        assert!(
+            response.status().is_server_error() || response.status().is_client_error(),
+            "expected error status from third chunk failure, got {}",
+            response.status()
+        );
+
+        // ── GREEN: cancels called for acked pieces ──
+        let cancels = state.cancels.lock().unwrap();
+        assert!(
+            cancels.contains(&"int-1".to_string()) && cancels.contains(&"int-2".to_string()),
+            "GREEN: failed batch must cancel acked pieces int-1, int-2, got cancels={cancels:?}"
+        );
+    }
+
+    /// RED: streaming split_system_instruction does not cancel acked pieces
+    /// when a later chunk fails.
+    #[tokio::test]
+    async fn split_system_instruction_streaming_cancels_acked_on_failure() {
+        use crate::diagnostics::{
+            DiagnosticMode, Diagnostics, DiagnosticsConfig, RequestDiagnostics,
+        };
+        use axum::body::Body;
+        use axum::extract::{Path, State};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        // ── Mock upstream: count create requests, fail 3rd with 502, track cancels ──
+        #[derive(Clone)]
+        struct MockState {
+            create_count: Arc<Mutex<usize>>,
+            cancels: Arc<Mutex<Vec<String>>>,
+        }
+
+        let state = MockState {
+            create_count: Arc::new(Mutex::new(0)),
+            cancels: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        async fn create_handler(
+            axum::extract::State(state): axum::extract::State<MockState>,
+        ) -> impl IntoResponse {
+            let mut count = state.create_count.lock().unwrap();
+            *count += 1;
+            if *count >= 3 {
+                // Chunk 2 (third request) fails with 502
+                Response::builder()
+                    .status(axum::http::StatusCode::BAD_GATEWAY)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "upstream failure"}}).to_string(),
+                    ))
+                    .unwrap()
+            } else {
+                // Return SSE stream with interaction.created
+                let id = format!("int-{}", *count);
+                let sse_body = format!(
+                    "data: {{\"event_type\":\"interaction.created\",\"interaction\":{{\"id\":\"{id}\",\"status\":\"in_progress\"}}}}\n\ndata: [DONE]\n\n"
+                );
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .header(axum::http::header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from(sse_body))
+                    .unwrap()
+            }
+        }
+
+        async fn cancel_handler(
+            axum::extract::State(state): axum::extract::State<MockState>,
+            Path(id): Path<String>,
+        ) -> impl IntoResponse {
+            let id_clean = id.strip_suffix("/cancel").unwrap_or(&id).to_string();
+            state.cancels.lock().unwrap().push(id_clean);
+            axum::http::StatusCode::OK
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/interactions/models/test-model:create",
+                post(create_handler),
+            )
+            .route("/v1/interactions/{*rest}", post(cancel_handler))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // ── Construct InteractionsHandler ──
+        let diag = Diagnostics::new(DiagnosticsConfig {
+            stats_mode: DiagnosticMode::Error,
+            ..DiagnosticsConfig::default()
+        });
+        let handler = super::InteractionsHandler {
+            clients: std::collections::HashMap::from([("".into(), reqwest::Client::new())]),
+            diagnostics: diag,
+            v2_store: Arc::new(tokio::sync::RwLock::new(StoreV2::new())),
+            v2_path: Arc::new(std::path::PathBuf::from(
+                "/tmp/inf-splitter-test-stream-cancel.toml",
+            )),
+            error_translation: Arc::new([]),
+        };
+
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: Some(format!("http://{addr}/v1/interactions")),
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: ["test-model"].iter().map(|&s| s.into()).collect(),
+            drop_fields: Default::default(),
+            proxy: None,
+            proxy_limit: Some(60),
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+
+        let url = format!("http://{addr}/v1/interactions/models/test-model:create");
+
+        let long_sys = "First paragraph is long enough to take some bytes for this.\n\nSecond paragraph also long enough for the test we run.\n\nThird paragraph should trigger a third chunk split.";
+
+        let guard = RequestDiagnostics::new(&handler.diagnostics, "test", "test-model");
+
+        // ── Act ──
+        let result = handler
+            .send_split_system_instruction(
+                long_sys,
+                &url,
+                &route,
+                "test-session",
+                &[],
+                vec![0xDEAD],
+                None,
+                60,
+                "test-model",
+                "test-upstream",
+                b"{}",
+                "request",
+                &axum::http::HeaderMap::new(),
+                crate::config::Protocol::Anthropic,
+                guard,
+                None,
+                None,
+                true,
+            )
+            .await;
+
+        // ── Assert: error returned ──
+        let response = result.expect("send_split_system_instruction must return Response");
+        assert!(
+            response.status().is_server_error() || response.status().is_client_error(),
+            "expected error status from third chunk failure, got {}",
+            response.status()
+        );
+
+        // ── GREEN: cancels called for acked pieces ──
+        let cancels = state.cancels.lock().unwrap();
+        assert!(
+            cancels.contains(&"int-1".to_string()) && cancels.contains(&"int-2".to_string()),
+            "GREEN: streaming failed batch must cancel acked pieces int-1, int-2, got cancels={cancels:?}"
         );
     }
 }

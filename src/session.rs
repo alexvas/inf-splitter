@@ -724,36 +724,30 @@ impl StoreV2 {
             .remove(batch_id)
             .ok_or_else(|| format!("batch {batch_id} not found"))?;
 
-        // Collect Acked interaction_ids in piece order
-        let upstream_ids: Vec<String> = batch
-            .pieces
-            .iter()
-            .filter_map(|p| match &p.status {
-                InFlightStatus::Acked { interaction_id } => Some(interaction_id.clone()),
-                _ => None,
-            })
-            .collect();
-
-        if upstream_ids.len() != batch.pieces.len() {
-            return Err(format!(
-                "batch {batch_id} cannot complete: {} of {} pieces are Acked",
-                upstream_ids.len(),
-                batch.pieces.len()
-            ));
-        }
-
         let now = unix_now();
         // Insert UpstreamInteractionNodes in chain order
+        let mut upstream_ids = Vec::with_capacity(batch.pieces.len());
         let mut prev_upstream = batch.prev_interaction_id.clone();
-        for upstream_id in &upstream_ids {
-            self.interactions.insert_upstream(UpstreamInteractionNode {
-                id: upstream_id.clone(),
-                prev_id: prev_upstream.clone(),
-                client_id: format!("{}:chunk-{}", batch.id, upstream_id),
-                last_seen_utc: now,
-                expires_at_utc: now + DEFAULT_SESSION_TTL_SECS,
-            });
-            prev_upstream = Some(upstream_id.clone());
+        for piece in &batch.pieces {
+            match &piece.status {
+                InFlightStatus::Acked { interaction_id } => {
+                    self.interactions.insert_upstream(UpstreamInteractionNode {
+                        id: interaction_id.clone(),
+                        prev_id: prev_upstream.clone(),
+                        client_id: format!("{}:chunk-{}", batch.id, piece.index),
+                        last_seen_utc: now,
+                        expires_at_utc: now + DEFAULT_SESSION_TTL_SECS,
+                    });
+                    upstream_ids.push(interaction_id.clone());
+                    prev_upstream = Some(interaction_id.clone());
+                }
+                _ => {
+                    return Err(format!(
+                        "batch {} cannot complete: piece {} is not Acked",
+                        batch_id, piece.index
+                    ));
+                }
+            }
         }
 
         let final_id = upstream_ids.last().cloned().unwrap_or_default();
@@ -1340,8 +1334,10 @@ mod tests {
         // Upstream nodes inserted in chain order
         let up_a = store.interactions.get_upstream("int-A").unwrap();
         assert_eq!(up_a.prev_id, None);
+        assert_eq!(up_a.client_id, "batch-1:chunk-0");
         let up_b = store.interactions.get_upstream("int-B").unwrap();
         assert_eq!(up_b.prev_id.as_deref(), Some("int-A"));
+        assert_eq!(up_b.client_id, "batch-1:chunk-1");
 
         // Batch removed
         assert!(store.in_flight.is_empty());
@@ -1390,6 +1386,9 @@ mod tests {
         let client = store.complete_batch("batch-1").unwrap();
         assert_eq!(client.system_instruction_hash, Some(0xDEAD));
         assert_eq!(client.id, "int-A");
+
+        let up = store.interactions.get_upstream("int-A").unwrap();
+        assert_eq!(up.client_id, "batch-1:chunk-0");
     }
 
     #[test]

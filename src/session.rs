@@ -797,6 +797,7 @@ impl StoreV2 {
         // Remove upstream nodes for Acked pieces
         for id in &acked_ids {
             self.interactions.upstreams.remove(id);
+            self.interactions.upstream_to_clients.remove(id);
         }
 
         // Mark all non-Acked pieces as Failed
@@ -1948,5 +1949,89 @@ mod tests {
             node.last_seen_utc
         );
         let _ = store.save_to_disk(&path).await;
+    }
+
+    /// RED: fail_batch removes upstream nodes from upstreams but NOT from
+    /// upstream_to_clients. To demonstrate, manually insert a client node
+    /// that references the Acked piece's interaction_id, then fail_batch.
+    #[test]
+    fn fail_batch_cleans_upstream_to_clients_index() {
+        let mut store = StoreV2::new();
+
+        // Step 1: complete_batch creates upstream "up-A" + client "cli-A"
+        {
+            store.create_batch(
+                "batch-A".into(),
+                "session-1".into(),
+                None,
+                vec![0xA],
+                None,
+                vec![InFlightPiece {
+                    index: 0,
+                    content_hash: 1,
+                    request_body: vec![],
+                    status: InFlightStatus::Acked {
+                        interaction_id: "up-A".into(),
+                    },
+                }],
+            );
+            store.complete_batch("batch-A").unwrap();
+        }
+
+        // Step 2: create batch-B with single Acked piece (interaction_id="up-B")
+        store.create_batch(
+            "batch-B".into(),
+            "session-1".into(),
+            None,
+            vec![0xB],
+            None,
+            vec![InFlightPiece {
+                index: 0,
+                content_hash: 2,
+                request_body: vec![],
+                status: InFlightStatus::Acked {
+                    interaction_id: "up-B".into(),
+                },
+            }],
+        );
+
+        // Manually insert a client node referencing up-B to simulate
+        // a scenario where upstream_to_clients has an entry that
+        // fail_batch should clean up but currently doesn't.
+        store.interactions.insert_client(ClientInteractionNode {
+            id: "orphan-client".into(),
+            prev_id: None,
+            message_hashes: vec![0xB],
+            system_instruction_hash: None,
+            upstream_ids: vec!["up-B".into()],
+            last_seen_utc: 1,
+        });
+
+        // Step 3: fail_batch("batch-B")
+        let _acked = store
+            .fail_batch("batch-B", "test error".to_string())
+            .unwrap();
+
+        // up-B removed from upstreams
+        assert!(
+            store.interactions.upstreams.get("up-B").is_none(),
+            "up-B must be removed from upstreams"
+        );
+        // up-A still in upstreams
+        assert!(
+            store.interactions.upstreams.get("up-A").is_some(),
+            "up-A must survive in upstreams"
+        );
+        // up-A still in upstream_to_clients
+        assert_eq!(
+            store.interactions.upstream_to_clients.get("up-A"),
+            Some(&vec!["up-A".to_string()]),
+            "up-A entry in upstream_to_clients must survive"
+        );
+        // GREEN: up-B cleaned from upstream_to_clients by fail_batch
+        assert!(
+            store.interactions.upstream_to_clients.get("up-B").is_none(),
+            "GREEN: fail_batch cleaned upstream_to_clients for up-B"
+        );
     }
 }

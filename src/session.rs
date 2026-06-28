@@ -96,6 +96,7 @@ pub struct InFlightBatch {
     pub session_id: String,
     pub prev_interaction_id: Option<String>,
     pub message_hashes: Vec<u64>,
+    pub system_instruction_hash: Option<u64>,
     pub pieces: Vec<InFlightPiece>,
     pub created_utc: u64,
     pub updated_utc: u64,
@@ -604,6 +605,7 @@ impl StoreV2 {
         session_id: String,
         prev_interaction_id: Option<String>,
         message_hashes: Vec<u64>,
+        system_instruction_hash: Option<u64>,
         pieces: Vec<InFlightPiece>,
     ) {
         let now = unix_now();
@@ -614,6 +616,7 @@ impl StoreV2 {
                 session_id,
                 prev_interaction_id,
                 message_hashes,
+                system_instruction_hash,
                 pieces,
                 created_utc: now,
                 updated_utc: now,
@@ -758,7 +761,7 @@ impl StoreV2 {
             id: final_id,
             prev_id: batch.prev_interaction_id,
             message_hashes: batch.message_hashes,
-            system_instruction_hash: None,
+            system_instruction_hash: batch.system_instruction_hash,
             upstream_ids,
             last_seen_utc: now,
         };
@@ -1247,6 +1250,7 @@ mod tests {
             session_id: session_id.to_string(),
             prev_interaction_id: prev_id.map(String::from),
             message_hashes: hashes,
+            system_instruction_hash: None,
             pieces,
             created_utc: 100,
             updated_utc: 100,
@@ -1329,6 +1333,7 @@ mod tests {
         let client = store.complete_batch("batch-1").unwrap();
         assert_eq!(client.id, "int-B");
         assert_eq!(client.prev_id, None);
+        assert_eq!(client.system_instruction_hash, None);
         assert_eq!(client.message_hashes, vec![0x10]);
         assert_eq!(client.upstream_ids, vec!["int-A", "int-B"]);
 
@@ -1346,6 +1351,45 @@ mod tests {
             store.sessions["sess-1"].last_interaction_id.as_deref(),
             Some("int-B")
         );
+    }
+
+    #[test]
+    fn inflight_complete_batch_propagates_system_instruction_hash() {
+        let mut store = StoreV2::new();
+        store.sessions.insert(
+            "sess-1".to_string(),
+            SessionInfo {
+                client_session_id: "sess-1".to_string(),
+                last_interaction_id: None,
+                last_seen_utc: 0,
+                expires_at_utc: 200,
+            },
+        );
+        // Manually construct a batch with system_instruction_hash = Some(0xDEAD)
+        store.in_flight.insert(
+            "batch-1".to_string(),
+            InFlightBatch {
+                id: "batch-1".to_string(),
+                session_id: "sess-1".to_string(),
+                prev_interaction_id: None,
+                message_hashes: vec![0xA],
+                system_instruction_hash: Some(0xDEAD),
+                pieces: vec![InFlightPiece {
+                    index: 0,
+                    content_hash: 0,
+                    request_body: vec![],
+                    status: InFlightStatus::Acked {
+                        interaction_id: "int-A".into(),
+                    },
+                }],
+                created_utc: 100,
+                updated_utc: 100,
+            },
+        );
+
+        let client = store.complete_batch("batch-1").unwrap();
+        assert_eq!(client.system_instruction_hash, Some(0xDEAD));
+        assert_eq!(client.id, "int-A");
     }
 
     #[test]
@@ -1542,6 +1586,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 prev_interaction_id: None,
                 message_hashes: vec![0x10],
+                system_instruction_hash: None,
                 pieces: vec![
                     InFlightPiece {
                         index: 0,

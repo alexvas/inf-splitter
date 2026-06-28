@@ -212,6 +212,13 @@ impl InteractionsHandler {
             full_idx
         };
         let new_count = harness.len(); // total harness messages (for split-send compatibility)
+        let system_instruction_hash = if prev_id.is_none() {
+            system
+                .as_ref()
+                .map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+        } else {
+            None
+        };
         let params = interactions_lib::build_interactions_request_anthropic(
             &cleaned_messages,
             start_index,
@@ -298,6 +305,7 @@ impl InteractionsHandler {
             &session_id,
             new_count,
             hashes.clone(),
+            system_instruction_hash,
             stream,
             &model,
             endpoint,
@@ -506,6 +514,14 @@ impl InteractionsHandler {
             &session_id,
             new_count,
             hashes.clone(),
+            if prev_id.is_none() {
+                params
+                    .system_instruction
+                    .as_ref()
+                    .map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+            } else {
+                None
+            },
             stream,
             &model,
             endpoint,
@@ -764,6 +780,7 @@ impl InteractionsHandler {
         session_id: &str,
         new_count: usize,
         harness_hashes: Vec<u64>,
+        system_instruction_hash: Option<u64>,
         stream: bool,
         model: &str,
         upstream_label: &str,
@@ -908,7 +925,7 @@ impl InteractionsHandler {
                     id: interaction_id.clone(),
                     prev_id: None,
                     message_hashes: harness_hashes.clone(),
-                    system_instruction_hash: None,
+                    system_instruction_hash,
                     upstream_ids: vec![interaction_id.clone()],
                     last_seen_utc: now,
                 });
@@ -1347,6 +1364,15 @@ impl InteractionsHandler {
             })
             .collect();
 
+        let system_instruction_hash = if params.previous_interaction_id.is_none() {
+            params
+                .system_instruction
+                .as_ref()
+                .map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+        } else {
+            None
+        };
+
         {
             let mut store = self.v2_store.write().await;
             store.create_batch(
@@ -1354,6 +1380,7 @@ impl InteractionsHandler {
                 session_id.to_string(),
                 params.previous_interaction_id.clone(),
                 harness_hashes.clone(),
+                system_instruction_hash,
                 pieces,
             );
             if let Err(e) = store.save_to_disk(&self.v2_path).await {
@@ -1747,6 +1774,11 @@ impl InteractionsHandler {
         let mut total_response_bytes: usize = 0;
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
+        let system_instruction_hash = if prev_interaction_id.is_none() {
+            Some(xxhash_rust::xxh3::xxh3_64(sys.as_bytes()))
+        } else {
+            None
+        };
         // Split system_instruction on natural boundaries
         let sys_parts = match split_text_for_limit(sys, limit) {
             Ok(parts) => parts,
@@ -2032,7 +2064,7 @@ impl InteractionsHandler {
                         id: final_id.clone(),
                         prev_id: prev_interaction_id.clone(),
                         message_hashes: harness_hashes.clone(),
-                        system_instruction_hash: None,
+                        system_instruction_hash,
                         upstream_ids: all_int_ids.clone(),
                         last_seen_utc: now,
                     });

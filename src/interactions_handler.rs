@@ -141,7 +141,7 @@ impl InteractionsHandler {
             interactions_lib::filter_harness_messages(&cleaned_messages, Protocol::Anthropic);
         let hashes: Vec<u64> = harness
             .iter()
-            .map(|m| interactions_lib::hash_harness_message(m))
+            .map(interactions_lib::hash_harness_message)
             .collect();
 
         let frontier = {
@@ -364,7 +364,7 @@ impl InteractionsHandler {
             interactions_lib::filter_harness_messages(&cleaned_messages, Protocol::OpenAi);
         let hashes: Vec<u64> = harness
             .iter()
-            .map(|m| interactions_lib::hash_harness_message(m))
+            .map(interactions_lib::hash_harness_message)
             .collect();
 
         let frontier = {

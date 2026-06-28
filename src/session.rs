@@ -134,6 +134,12 @@ pub struct Frontier {
     pub matched_client_id: Option<String>,
 }
 
+impl Default for InteractionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InteractionStore {
     pub fn new() -> Self {
         Self {
@@ -319,10 +325,10 @@ pub fn find_frontier(
                     *best_known = is_known;
                 } else if prefix_len == *best_len {
                     // Tie-break: newest last_seen_utc, then lexicographically smallest id
-                    let best_utc = (*best_node).last_seen_utc;
+                    let best_utc = best_node.last_seen_utc;
                     let cur_utc = terminal_client.last_seen_utc;
                     if cur_utc > best_utc
-                        || (cur_utc == best_utc && terminal_client.id < (*best_node).id)
+                        || (cur_utc == best_utc && terminal_client.id < best_node.id)
                     {
                         *best_node = terminal_client;
                         *best_known = is_known;
@@ -462,6 +468,12 @@ pub struct StoreV2 {
     pub in_flight: HashMap<String, InFlightBatch>,
 }
 
+impl Default for StoreV2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StoreV2 {
     pub fn new() -> Self {
         Self {
@@ -483,10 +495,10 @@ impl StoreV2 {
         // Detect old v1 format (no version=2 field)
         let check: toml::Value =
             toml::from_str(&raw).map_err(|e| format!("failed to parse session TOML: {e}"))?;
-        if !check
+        if check
             .get("version")
             .and_then(|v| v.as_integer())
-            .is_some_and(|v| v == 2)
+            .is_none_or(|v| v != 2)
         {
             tracing::warn!(
                 path = %path.display(),
@@ -511,7 +523,7 @@ impl StoreV2 {
 
         // Rebuild derived indexes from persisted client nodes
         let clients = std::mem::take(&mut store.interactions.clients);
-        for (_, node) in &clients {
+        for node in clients.values() {
             for (idx, &hash) in node.message_hashes.iter().enumerate() {
                 store.interactions.hash_index.entry(hash).or_default().push(
                     ClientInteractionPosition {

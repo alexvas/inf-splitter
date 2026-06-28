@@ -442,7 +442,7 @@ sequenceDiagram
 
     Proxy->>Upstream: POST chunk1
     Upstream-->>Proxy: 200 (SSE stream begins)
-    Proxy->>Proxy: P1 → Sent{req_hash, interaction_id: "int-B"}
+    Proxy->>Proxy: P1 → ResponseStarted → Sent{int-B}
     Proxy->>Disk: save_to_disk() — P1=Sent persisted
 
     Note over Proxy: 💥 CRASH — SSE stream not drained

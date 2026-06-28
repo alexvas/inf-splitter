@@ -28,7 +28,7 @@ use crate::interactions_types::{
     CreateModelInteractionParams, Interaction, InteractionSseEvent, InteractionsInput, Step,
     StepDeltaData,
 };
-use crate::session::{self, SessionStore, StoreV2};
+use crate::session::{self, StoreV2};
 use crate::sse;
 use anyllm_translate::anthropic::{ContentBlock, MessageResponse, Role, StopReason, Usage};
 use anyllm_translate::openai::{
@@ -58,7 +58,6 @@ fn clamp_max_tokens(n: u64) -> u32 {
 pub struct InteractionsHandler {
     clients: HashMap<String, HttpClient>,
     diagnostics: Diagnostics,
-    session_store: Arc<SessionStore>,
     v2_store: Arc<RwLock<StoreV2>>,
     v2_path: Arc<PathBuf>,
     error_translation: Arc<[crate::config::ErrorTranslationRule]>,
@@ -68,14 +67,12 @@ impl InteractionsHandler {
     pub fn new(
         config: &Config,
         diagnostics: Diagnostics,
-        session_store: Arc<SessionStore>,
         v2_store: Arc<RwLock<StoreV2>>,
         v2_path: PathBuf,
     ) -> Result<Self, AppError> {
         Ok(Self {
             clients: crate::build_client_map(config)?,
             diagnostics,
-            session_store,
             v2_store,
             v2_path: Arc::new(v2_path),
             error_translation: config.error_translation.clone().into(),
@@ -138,9 +135,6 @@ impl InteractionsHandler {
         } else {
             messages
         };
-
-        // Ensure session exists in old store for backward compat
-        let _ = self.session_store.get_or_create(&session_id).await;
 
         // Filter harness messages (Anthropic: user only) and hash them
         let harness =
@@ -364,9 +358,6 @@ impl InteractionsHandler {
         } else {
             messages
         };
-
-        // Ensure session exists in old store for backward compat
-        let _ = self.session_store.get_or_create(&session_id).await;
 
         // Filter harness messages (OpenAI: system, developer, user, tool) and hash them
         let harness =
@@ -670,7 +661,7 @@ impl InteractionsHandler {
     }
 
     /// Fetch and translate an existing interaction (exact retry recovery).
-    async fn replay_interaction(
+    async fn _replay_interaction(
         &self,
         interaction_id: &str,
         route: &RouteTarget,
@@ -896,19 +887,7 @@ impl InteractionsHandler {
             }
         };
 
-        // Update session (old store for backward compat)
         let interaction_id = interaction.id.clone();
-        self.session_store
-            .update(session_id, interaction_id.clone(), new_count, false)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    session_id = %session_id,
-                    error = %e,
-                    "session update failed after successful upstream interaction"
-                );
-                AppError::Internal(format!("session update failed: {e}"))
-            })?;
 
         // Store in v2 interaction tree
         {
@@ -994,7 +973,7 @@ impl InteractionsHandler {
         &self,
         upstream: reqwest::Response,
         session_id: &str,
-        new_count: usize,
+        _new_count: usize,
         model: &str,
         upstream_label: &str,
         direction: &str,
@@ -1006,7 +985,6 @@ impl InteractionsHandler {
         let response_headers = response_headers_to_pairs(upstream.headers());
         let mut byte_stream = upstream.bytes_stream();
         let mut buffer = String::new();
-        let mut interaction_id = String::new();
         let mut total_bytes: usize = 0;
         let mut dump_buffer: Vec<u8> = Vec::new();
         let mut last_active_index: Option<u32> = None;
@@ -1014,8 +992,7 @@ impl InteractionsHandler {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
 
         let model_owned = model.to_string();
-        let session_store = self.session_store.clone();
-        let sid = session_id.to_string();
+        let _sid = session_id.to_string();
         let dir = direction.to_string();
         let label = upstream_label.to_string();
         let start = std::time::Instant::now();
@@ -1023,14 +1000,6 @@ impl InteractionsHandler {
         let dump_enabled = self.diagnostics.dump_enabled();
         let session_hdr_name = Self::session_header_name(ingress);
         let session_hdr_value = session_id.to_string();
-
-        // Mark session pending before starting stream — if the process crashes
-        // mid-stream, startup recovery will see pending=true and verify the
-        // interaction status. The message_count is advanced eagerly to prevent
-        // racing follow-up requests from re-sending in-flight messages.
-        let _ = session_store
-            .update(&sid, String::new(), new_count, true)
-            .await;
 
         tokio::spawn(async move {
             let mut translator: Option<
@@ -1146,19 +1115,7 @@ impl InteractionsHandler {
                                                     let payload = bytes::Bytes::from(payload);
                                                     if tx.send(Ok(payload)).await.is_err() {
                                                         // Client disconnected before upstream
-                                                        // stream completed — no egress/response
-                                                        // dump is recorded because the upstream
-                                                        // response was never fully received.
-                                                        if interaction_id.is_empty() {
-                                                            let _ = session_store
-                                                                .update(
-                                                                    &sid,
-                                                                    String::new(),
-                                                                    new_count,
-                                                                    false,
-                                                                )
-                                                                .await;
-                                                        }
+                                                        // stream completed.
                                                         let duration_ms =
                                                             start.elapsed().as_millis() as u64;
                                                         guard.finish(
@@ -1198,13 +1155,9 @@ impl InteractionsHandler {
                                     }
                                     // Eagerly persist interaction_id from interaction.created
                                     // so client-disconnect recovery has a valid ID to probe.
-                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
+                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(_ev)) =
                                         serde_json::from_str::<InteractionSseEvent>(data)
                                     {
-                                        interaction_id = ev.interaction.id.clone();
-                                        let _ = session_store
-                                            .update(&sid, ev.interaction.id, new_count, true)
-                                            .await;
                                     }
                                 }
                             }
@@ -1243,20 +1196,6 @@ impl InteractionsHandler {
             // Flush remaining OpenAI chunks on stream end
             if translator.is_some() {
                 let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
-            }
-
-            // Update session after stream completes
-            if !interaction_id.is_empty() {
-                if let Err(e) = session_store
-                    .update(&sid, interaction_id, new_count, false)
-                    .await
-                {
-                    tracing::error!(
-                        session_id = %sid,
-                        error = %e,
-                        "session update failed after successful upstream stream"
-                    );
-                }
             }
 
             // Response dump for streaming
@@ -1693,23 +1632,6 @@ impl InteractionsHandler {
             }
         };
 
-        // Update old session store for backward compat
-        {
-            let final_id = &client_node.id;
-            let harness_count = harness_hashes.len();
-            if let Err(e) = self
-                .session_store
-                .update(session_id, final_id.clone(), harness_count, false)
-                .await
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "old session store update failed after split-send"
-                );
-            }
-        }
-
         // Merge all piece responses
         let merged = Self::merge_interaction_responses(&all_interactions, &client_node.id);
         let resp = interactions_lib::build_response_from_interaction(&merged, model, ingress)
@@ -1806,7 +1728,7 @@ impl InteractionsHandler {
         route: &RouteTarget,
         session_id: &str,
         chunks: &[Vec<crate::interactions_types::Content>],
-        harness_hashes: Vec<u64>,
+        _harness_hashes: Vec<u64>,
         limit: usize,
         model: &str,
         upstream_label: &str,
@@ -1969,20 +1891,6 @@ impl InteractionsHandler {
             current_prev = Some(int_id.clone());
             last_id = Some(int_id.clone());
             last_interaction = Some(interaction);
-
-            // Checkpoint session after each system-instruction chunk
-            // so retries don't re-send already-created interaction chain.
-            if let Err(e) = self
-                .session_store
-                .update(session_id, int_id, harness_hashes.len(), true)
-                .await
-            {
-                tracing::error!(
-                    session_id = %session_id,
-                    error = %e,
-                    "session update failed after system-instruction chunk"
-                );
-            }
         }
 
         // Send remaining chunks if more than one
@@ -2093,20 +2001,6 @@ impl InteractionsHandler {
                 last_id = Some(interaction.id.clone());
                 last_interaction = Some(interaction);
             }
-        }
-
-        if let Some(ref final_id) = last_id {
-            self.session_store
-                .update(session_id, final_id.clone(), harness_hashes.len(), false)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        session_id = %session_id,
-                        error = %e,
-                        "session update failed after successful split-system-instruction"
-                    );
-                    AppError::Internal(format!("session update failed: {e}"))
-                })?;
         }
 
         if stream {
@@ -2265,42 +2159,14 @@ impl InteractionsHandler {
     ) -> Result<Response, AppError> {
         match action {
             ControlAction::CleanAll => {
-                // Clear old v1 store
-                let all = match self.session_store.remove_all().await {
-                    Ok(all) => all,
-                    Err(e) => {
-                        let error = format!("session clean-all failed: {e}");
-                        return Err(guard.abort_internal(
-                            0,
-                            0,
-                            "control-action",
-                            "clean-all",
-                            false,
-                            error,
-                        ));
-                    }
-                };
-
-                // Collect v1 interaction ids for cancellation
-                let mut upstream_ids: Vec<String> = all
-                    .iter()
-                    .filter_map(|(_sid, state)| {
-                        if state.interaction_id.is_empty() {
-                            None
-                        } else {
-                            Some(state.interaction_id.clone())
-                        }
-                    })
-                    .collect();
-
                 // Collect v2 upstream ids and clean v2 store
-                {
+                let upstream_ids = {
                     let mut v2 = self.v2_store.write().await;
-                    let v2_ids = v2.all_upstream_ids();
-                    upstream_ids.extend(v2_ids);
+                    let ids = v2.all_upstream_ids();
                     v2.clean_all();
                     let _ = v2.save_to_disk(&self.v2_path).await;
-                }
+                    ids
+                };
 
                 let mut cancelled = 0usize;
                 let mut deleted = 0usize;
@@ -2317,18 +2183,16 @@ impl InteractionsHandler {
                         deleted += 1;
                     }
                 }
-                let total = all.len() + upstream_ids.len().saturating_sub(all.len());
+                let total = upstream_ids.len();
                 let msg = if errors.is_empty() {
                     format!(
                         "Cleaned all {} sessions ({} cancelled, {} deleted)",
-                        total.max(all.len()),
-                        cancelled,
-                        deleted
+                        total, cancelled, deleted
                     )
                 } else {
                     format!(
                         "Cleaned all {} sessions ({} cancelled, {} deleted). Errors: {}",
-                        total.max(all.len()),
+                        total,
                         cancelled,
                         deleted,
                         errors.join("; ")
@@ -2342,21 +2206,6 @@ impl InteractionsHandler {
                 ))
             }
             ControlAction::ExtendLifetime(until) => {
-                match self.session_store.extend_lifetime(session_id, *until).await {
-                    Ok(()) => (),
-                    Err(e) => {
-                        let error = format!("session extend failed: {e}");
-                        return Err(guard.abort_internal(
-                            0,
-                            0,
-                            "control-action",
-                            "extend-lifetime",
-                            false,
-                            error,
-                        ));
-                    }
-                };
-                // Also update v2 session metadata
                 {
                     let mut v2 = self.v2_store.write().await;
                     v2.extend_lifetime(session_id, *until);
@@ -4096,10 +3945,8 @@ If you don't know the answer, say so honestly.";
         .expect("test config");
         let diagnostics = Diagnostics::new(DiagnosticsConfig::default());
         let tmp_path = std::env::temp_dir().join("test-resolve-session-id.toml");
-        let session_store = Arc::new(SessionStore::new(tmp_path.clone()));
         let v2_store = Arc::new(tokio::sync::RwLock::new(StoreV2::new()));
-        InteractionsHandler::new(&config, diagnostics, session_store, v2_store, tmp_path)
-            .expect("build handler")
+        InteractionsHandler::new(&config, diagnostics, v2_store, tmp_path).expect("build handler")
     }
 
     #[tokio::test]

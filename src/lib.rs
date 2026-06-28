@@ -36,7 +36,6 @@ use crate::error::AppError;
 use crate::interactions_handler::InteractionsHandler;
 use crate::openai::OpenAiHandler;
 use crate::router::{router, AppState};
-use crate::session::SessionStore;
 
 /// Build a single reqwest HTTP client with the given timeout and optional proxy URL.
 pub(crate) fn build_http_client(
@@ -293,16 +292,6 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
                 "config/interactions-sessions.toml".to_string()
             }
         });
-    let session_store = Arc::new(SessionStore::new(std::path::PathBuf::from(&session_path)));
-    // Recover sessions from disk
-    let loaded = session_store.load_from_disk().await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to load session store, starting fresh");
-        Vec::new()
-    });
-    if !loaded.is_empty() {
-        tracing::info!(count = loaded.len(), "recovered sessions from disk");
-    }
-
     let v2_path = std::path::PathBuf::from(format!("{}.v2", session_path));
     let v2_store = Arc::new(tokio::sync::RwLock::new(
         crate::session::StoreV2::load_from_disk(&v2_path)
@@ -320,7 +309,6 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
     let interactions = InteractionsHandler::new(
         config.as_ref(),
         diagnostics.clone(),
-        session_store.clone(),
         v2_store.clone(),
         v2_path.clone(),
     )?;
@@ -402,7 +390,6 @@ pub async fn build_app(config: Config, diagnostics: Diagnostics) -> Result<Route
         openai,
         anthropic,
         interactions,
-        session_store,
         health_client,
         health_cache: Arc::new(Mutex::new(None)),
     };

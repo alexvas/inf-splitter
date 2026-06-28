@@ -18,7 +18,6 @@ use crate::diagnostics::Diagnostics;
 use crate::error::AppError;
 use crate::interactions_handler::InteractionsHandler;
 use crate::openai::OpenAiHandler;
-use crate::session::SessionStore;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,7 +26,6 @@ pub struct AppState {
     pub openai: OpenAiHandler,
     pub anthropic: AnthropicHandler,
     pub interactions: InteractionsHandler,
-    pub session_store: Arc<SessionStore>,
     pub health_client: reqwest::Client,
     pub health_cache: Arc<Mutex<Option<(Instant, HealthResponse)>>>,
 }

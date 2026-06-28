@@ -6,8 +6,6 @@
 
 use std::collections::HashSet;
 
-use crate::session::SessionStore;
-
 /// Result of scanning incoming messages for control commands.
 #[derive(Debug)]
 pub struct ControlResult {
@@ -84,45 +82,6 @@ pub fn scan_control_messages(
         cleaned_messages: cleaned,
         stripped_count: stripped,
         action,
-    }
-}
-
-/// Execute a control action.
-pub async fn execute_control_action(
-    action: &ControlAction,
-    session_id: &str,
-    store: &SessionStore,
-    cancel_fn: impl Fn(&str) -> Result<(), String>,
-    delete_fn: impl Fn(&str) -> Result<(), String>,
-) -> Result<String, String> {
-    match action {
-        ControlAction::CleanAll => {
-            let all = store.remove_all().await?;
-            let mut cancelled = 0usize;
-            let mut deleted = 0usize;
-            for (_sid, state) in &all {
-                if !state.interaction_id.is_empty() {
-                    // Silently ignore errors — "already gone" is fine
-                    let _ = cancel_fn(&state.interaction_id);
-                    let _ = delete_fn(&state.interaction_id);
-                    cancelled += 1;
-                    deleted += 1;
-                }
-            }
-            Ok(format!(
-                "Cleaned all {} sessions ({} cancelled, {} deleted)",
-                all.len(),
-                cancelled,
-                deleted
-            ))
-        }
-        ControlAction::ExtendLifetime(until) => {
-            store.extend_lifetime(session_id, *until).await?;
-            Ok(format!(
-                "Session {} lifetime extended to UTC {}",
-                session_id, until
-            ))
-        }
     }
 }
 

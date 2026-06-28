@@ -2534,7 +2534,7 @@ impl InteractionsHandler {
         };
         let mut last_id: Option<String> = None;
         let mut last_interaction: Option<Interaction> = None;
-        let mut current_prev: Option<String> = None;
+        let mut current_prev: Option<String> = prev_interaction_id.clone();
         let mut all_int_ids: Vec<String> = Vec::new();
 
         // Send empty interactions with system_instruction chunks
@@ -5595,5 +5595,120 @@ If you don't know the answer, say so honestly.";
         let out_str = std::str::from_utf8(&out).unwrap();
         assert!(out_str.contains("Hello"), "first piece content must appear");
         assert!(!out_str.contains("int-A"), "old id must be substituted");
+    }
+
+    // ── send_split_system_instruction non-streaming prev_id bug ───
+
+    /// RED: current_prev starts as None instead of prev_interaction_id.clone().
+    /// First chunk should carry prev_interaction_id upstream to continue chain.
+    #[tokio::test]
+    async fn split_system_instruction_non_streaming_carries_prev_id_on_first_chunk() {
+        use crate::config::{Protocol, RouteTarget};
+        use crate::diagnostics::{Diagnostics, RequestDiagnostics};
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        // ── Mock upstream: captures all POST bodies ──
+        #[derive(Clone)]
+        struct Captures(Vec<serde_json::Value>);
+        type SharedCaptures = Arc<Mutex<Vec<serde_json::Value>>>;
+
+        let captured: SharedCaptures = Arc::new(Mutex::new(Vec::new()));
+
+        async fn handler(
+            State(captures): State<SharedCaptures>,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            captures.lock().unwrap().push(body);
+            Json(serde_json::json!({
+                "id": format!("int-{}", captures.lock().unwrap().len()),
+                "status": "completed",
+                "steps": [{"type": "model_output", "content": [{"type": "text", "text": "ok"}]}],
+                "usage": {"total_input_tokens": 1, "total_output_tokens": 1}
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/interactions/models/test-model:create", post(handler))
+            .with_state(captured.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // ── Construct InteractionsHandler ──
+        let handler = super::InteractionsHandler {
+            clients: std::collections::HashMap::from([("".into(), reqwest::Client::new())]),
+            diagnostics: Diagnostics::new_noop(),
+            v2_store: Arc::new(tokio::sync::RwLock::new(StoreV2::new())),
+            v2_path: Arc::new(std::path::PathBuf::from("/tmp/inf-splitter-test-v2.toml")),
+            error_translation: Arc::new([]),
+        };
+
+        let route = RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: None,
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: ["test-model"].iter().map(|&s| s.into()).collect(),
+            drop_fields: Default::default(),
+            proxy: None,
+            proxy_limit: Some(200),
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+
+        let url = format!("http://{addr}/v1/interactions/models/test-model:create");
+
+        // Multi-line system_instruction to force split under limit=200
+        let long_sys = "Line one.\nLine two here with extra.\n\nParagraph two starts here with more text.\nFinal line.";
+
+        let guard = RequestDiagnostics::new(&handler.diagnostics, "test", "test-model");
+
+        // ── Act ──
+        let result = handler
+            .send_split_system_instruction(
+                long_sys,
+                &url,
+                &route,
+                "test-session",
+                &[],
+                vec![0xDEAD],
+                Some("prev-1".into()),
+                200,
+                "test-model",
+                "test-upstream",
+                b"{}",
+                "request",
+                &axum::http::HeaderMap::new(),
+                Protocol::Anthropic,
+                guard,
+                None,
+                None,
+                false,
+            )
+            .await;
+
+        let response = result.expect("send_split_system_instruction must succeed");
+        let status = response.status();
+        assert!(status.is_success(), "expected 2xx, got {status}");
+
+        // ── Assert: first chunk carries prev_id ──
+        let bodies = captured.lock().unwrap();
+        assert!(!bodies.is_empty(), "expected at least one upstream request");
+        let first = &bodies[0];
+        let prev_id = first.get("previous_interaction_id");
+        assert_eq!(
+            prev_id.and_then(|v| v.as_str()),
+            Some("prev-1"),
+            "first chunk must carry prev_interaction_id = \"prev-1\" (RED: current code sends null)"
+        );
     }
 }

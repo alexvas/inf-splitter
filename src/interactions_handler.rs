@@ -432,7 +432,7 @@ impl InteractionsHandler {
             // a system/developer role on a new chain.
             let sys_hash = if prev_id.is_none() {
                 harness
-                    .get(0)
+                    .first()
                     .and_then(|msg| msg.get("role").and_then(|r| r.as_str()))
                     .filter(|role| matches!(*role, "system" | "developer"))
                     .map(|_| hashes[0])

@@ -447,15 +447,14 @@ sequenceDiagram
 
     Note over Proxy: 💥 CRASH — SSE stream not drained
 
-    Note over Proxy: --- Recovery ---
+    Note over Proxy: --- Startup ---
     Proxy->>Disk: load v2 store
     Proxy->>Proxy: InFlightBatch: P0=Acked{int-A}, P1=Sent{int-B}
-    Proxy->>Proxy: P0 trusted
-    Proxy->>Upstream: GET /v1beta/interactions/int-B
-    Upstream-->>Proxy: 404 Not Found
-    Proxy->>Proxy: P1 → Failed (interaction gone)
-    Proxy->>Proxy: cancel P0: POST /int-A/cancel (best-effort)
-    Proxy->>Disk: save_to_disk() — batch failed
+    Proxy->>Proxy: P1 not Acked → batch incomplete
+    Proxy->>Proxy: discard_all_inflight() → remove batch
+    Proxy->>Disk: save_to_disk() — cleanup done
+
+    Note over Proxy,Client: No GET probes. No cancel requests. Just discard.
 
     Note over Proxy,Client: Client retries later...
 

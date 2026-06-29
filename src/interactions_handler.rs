@@ -6641,4 +6641,202 @@ If you don't know the answer, say so honestly.";
             );
         }
     }
+
+    /// Client disconnects mid-split → proxy continues batch to completion.
+    /// Inserts UpstreamInteractionNodes + ClientInteractionNode. Retry via
+    /// find_frontier + replay_from_client_node returns merged result.
+    #[tokio::test]
+    async fn split_send_completes_after_client_disconnect() {
+        use crate::diagnostics::{
+            DiagnosticMode, Diagnostics, DiagnosticsConfig, RequestDiagnostics,
+        };
+        use axum::extract::Path;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        // ── Mock upstream ──
+        #[derive(Clone)]
+        struct MockState {
+            created: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+            next_id: Arc<Mutex<usize>>,
+        }
+
+        let state = MockState {
+            created: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            next_id: Arc::new(Mutex::new(0)),
+        };
+
+        async fn create_handler(
+            axum::extract::State(state): axum::extract::State<MockState>,
+        ) -> impl IntoResponse {
+            let mut n = state.next_id.lock().unwrap();
+            let id = format!("int-{n}");
+            *n += 1;
+            let body = serde_json::json!({
+                "id": &id,
+                "status": "completed",
+                "steps": [{"type": "model_output", "content": [{"type": "text", "text": format!("response from {id}")}]}],
+                "usage": {"total_input_tokens": 10, "total_output_tokens": 20}
+            });
+            state.created.lock().unwrap().insert(id, body.clone());
+            (axum::http::StatusCode::OK, Json(body)).into_response()
+        }
+
+        async fn get_handler(
+            axum::extract::State(state): axum::extract::State<MockState>,
+            Path(id): Path<String>,
+        ) -> impl IntoResponse {
+            let map = state.created.lock().unwrap();
+            match map.get(&id) {
+                Some(body) => (axum::http::StatusCode::OK, Json(body.clone())).into_response(),
+                None => (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "not found"})),
+                )
+                    .into_response(),
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1/interactions");
+        let app = Router::new()
+            .route(
+                "/v1/interactions/models/test-model:create",
+                post(create_handler),
+            )
+            .route("/v1/interactions/{*path}", get(get_handler))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // ── Handler setup ──
+        let diag = Diagnostics::new(DiagnosticsConfig {
+            stats_mode: DiagnosticMode::Error,
+            ..DiagnosticsConfig::default()
+        });
+        let handler = super::InteractionsHandler {
+            clients: std::collections::HashMap::from([("".into(), reqwest::Client::new())]),
+            diagnostics: diag,
+            v2_store: Arc::new(tokio::sync::RwLock::new(StoreV2::new())),
+            v2_path: Arc::new(std::path::PathBuf::from(
+                "/tmp/inf-splitter-test-disconnect.toml",
+            )),
+            error_translation: Arc::new([]),
+        };
+
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: Some(format!("http://{addr}/v1/interactions")),
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: ["test-model"].iter().map(|&s| s.into()).collect(),
+            drop_fields: Default::default(),
+            proxy: None,
+            proxy_limit: Some(200),
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+
+        let url = format!("http://{addr}/v1/interactions/models/test-model:create");
+
+        // System instruction ~180 bytes → 2-way split with limit=200 (effective ~128)
+        let long_sys = std::iter::repeat("System instruction paragraph that is long enough. ")
+            .take(4)
+            .collect::<String>();
+        // ~216 bytes, should split into 2 chunks
+        assert!(long_sys.len() > 128, "system must exceed effective limit");
+
+        let guard = RequestDiagnostics::new(&handler.diagnostics, "test", "test-model");
+
+        let hashes = vec![crate::interactions::hash_system_instruction(&long_sys)];
+
+        // ── First request: simulate by calling send_split_system_instruction ──
+        let result = handler
+            .send_split_system_instruction(
+                &long_sys,
+                &url,
+                &route,
+                "test-session",
+                &[],
+                hashes.clone(),
+                None,
+                200,
+                "test-model",
+                "test-upstream",
+                b"{}",
+                "request",
+                &axum::http::HeaderMap::new(),
+                crate::config::Protocol::Anthropic,
+                guard,
+                None,
+                None,
+                false,
+            )
+            .await;
+
+        let response = result.expect("send_split_system_instruction must succeed");
+        assert_eq!(response.status(), 200, "first split-send must return 200");
+
+        // ── Simulate client disconnect: drop response, verify batch completed ──
+        drop(response);
+
+        // ── Assert: ClientInteractionNode exists in store ──
+        {
+            let store = handler.v2_store.read().await;
+            let client_count = store.interactions.clients.len();
+            assert!(
+                client_count > 0,
+                "GREEN: store must contain ClientInteractionNode after split-send completes. \
+                 client_count={client_count}"
+            );
+            // Also verify upstream nodes exist
+            let upstream_count = store.interactions.upstreams.len();
+            assert!(
+                upstream_count >= 2,
+                "GREEN: store must contain at least 2 UpstreamInteractionNodes. \
+                 upstream_count={upstream_count}"
+            );
+        }
+
+        // ── Second request: retry via find_frontier + replay ──
+        let frontier = {
+            let store = handler.v2_store.read().await;
+            super::session::find_frontier(&hashes, None, None, &store.interactions)
+        };
+
+        assert!(
+            frontier.all_known,
+            "GREEN: retry find_frontier must be all_known, got frontier={frontier:?}"
+        );
+        let matched_id = frontier
+            .matched_client_id
+            .expect("GREEN: matched_client_id must be Some");
+
+        let guard2 = RequestDiagnostics::new(&handler.diagnostics, "test", "test-model");
+        let replay_response = handler
+            .replay_from_client_node(
+                &matched_id,
+                &route,
+                "test-session",
+                "test-model",
+                crate::config::Protocol::Anthropic,
+                &axum::http::HeaderMap::new(),
+                guard2,
+            )
+            .await
+            .expect("replay_from_client_node must succeed");
+
+        assert_eq!(
+            replay_response.status(),
+            200,
+            "GREEN: replay must return 200"
+        );
+    }
 }

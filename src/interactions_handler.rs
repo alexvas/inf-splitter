@@ -1663,17 +1663,13 @@ impl InteractionsHandler {
             let upstream = match builder.body(chunk_body).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(&batch_id, format!("chunk {i} send error: {e}"))
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            format!("chunk {i} send error: {e}"),
+                            route,
+                        )
+                        .await;
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -1690,15 +1686,13 @@ impl InteractionsHandler {
                 let error_body = upstream.text().await.unwrap_or_default();
 
                 // Fail the batch: cancel ACKed pieces
-                let mut store = self.v2_store.write().await;
-                let acked_ids = store
-                    .fail_batch(&batch_id, format!("chunk {i} HTTP {}", status.as_u16()))
-                    .unwrap_or_default();
-                let _ = store.save_to_disk(&self.v2_path).await;
-                drop(store);
-                for id in &acked_ids {
-                    let _ = self.cancel_interaction(id, route).await;
-                }
+                let _ = self
+                    .fail_batch_and_cancel(
+                        &batch_id,
+                        format!("chunk {i} HTTP {}", status.as_u16()),
+                        route,
+                    )
+                    .await;
 
                 guard.finish_with_upstream_error(
                     status.as_u16(),
@@ -1810,17 +1804,13 @@ impl InteractionsHandler {
                             }
                         }
                         Err(e) => {
-                            let acked_ids = {
-                                let mut store = self.v2_store.write().await;
-                                let ids = store
-                                    .fail_batch(&batch_id, format!("chunk {i} stream error: {e}"))
-                                    .unwrap_or_default();
-                                let _ = store.save_to_disk(&self.v2_path).await;
-                                ids
-                            };
-                            for id in &acked_ids {
-                                let _ = self.cancel_interaction(id, route).await;
-                            }
+                            let _ = self
+                                .fail_batch_and_cancel(
+                                    &batch_id,
+                                    format!("chunk {i} stream error: {e}"),
+                                    route,
+                                )
+                                .await;
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -1848,17 +1838,13 @@ impl InteractionsHandler {
                 let response_bytes = match upstream.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
-                        let acked_ids = {
-                            let mut store = self.v2_store.write().await;
-                            let ids = store
-                                .fail_batch(&batch_id, format!("chunk {i} body read error: {e}"))
-                                .unwrap_or_default();
-                            let _ = store.save_to_disk(&self.v2_path).await;
-                            ids
-                        };
-                        for id in &acked_ids {
-                            let _ = self.cancel_interaction(id, route).await;
-                        }
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                &batch_id,
+                                format!("chunk {i} body read error: {e}"),
+                                route,
+                            )
+                            .await;
                         return Err(guard.abort_upstream(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),
@@ -1874,20 +1860,13 @@ impl InteractionsHandler {
                         Ok(v) => v,
                         Err((e, dump)) => {
                             guard.response_dump(dump, 502, true, response_headers.clone());
-                            let acked_ids = {
-                                let mut store = self.v2_store.write().await;
-                                let ids = store
-                                    .fail_batch(
-                                        &batch_id,
-                                        format!("chunk {i} validation error: {e}"),
-                                    )
-                                    .unwrap_or_default();
-                                let _ = store.save_to_disk(&self.v2_path).await;
-                                ids
-                            };
-                            for id in &acked_ids {
-                                let _ = self.cancel_interaction(id, route).await;
-                            }
+                            let _ = self
+                                .fail_batch_and_cancel(
+                                    &batch_id,
+                                    format!("chunk {i} validation error: {e}"),
+                                    route,
+                                )
+                                .await;
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -1904,17 +1883,13 @@ impl InteractionsHandler {
                     match serde_json::from_str(&response_text) {
                         Ok(inter) => inter,
                         Err(e) => {
-                            let acked_ids = {
-                                let mut store = self.v2_store.write().await;
-                                let ids = store
-                                    .fail_batch(&batch_id, format!("chunk {i} parse error: {e}"))
-                                    .unwrap_or_default();
-                                let _ = store.save_to_disk(&self.v2_path).await;
-                                ids
-                            };
-                            for id in &acked_ids {
-                                let _ = self.cancel_interaction(id, route).await;
-                            }
+                            let _ = self
+                                .fail_batch_and_cancel(
+                                    &batch_id,
+                                    format!("chunk {i} parse error: {e}"),
+                                    route,
+                                )
+                                .await;
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -2145,11 +2120,8 @@ impl InteractionsHandler {
         let mut total_response_bytes: usize = 0;
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
-        let system_instruction_hash = if prev_interaction_id.is_none() {
-            Some(crate::interactions::hash_system_instruction(sys))
-        } else {
-            None
-        };
+        let system_instruction_hash =
+            compute_system_hash(prev_interaction_id.as_deref(), Some(sys));
         // Split system_instruction on natural boundaries, accounting for
         // envelope overhead (model, previous_interaction_id, stream, etc.)
         let envelope_overhead = {
@@ -2925,11 +2897,8 @@ impl InteractionsHandler {
         let mut total_response_bytes: usize = 0;
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
-        let system_instruction_hash = if prev_interaction_id.is_none() {
-            Some(crate::interactions::hash_system_instruction(sys))
-        } else {
-            None
-        };
+        let system_instruction_hash =
+            compute_system_hash(prev_interaction_id.as_deref(), Some(sys));
         // Split system_instruction on natural boundaries, accounting for
         // envelope overhead (model, previous_interaction_id, stream, etc.)
         let envelope_overhead = {
@@ -3662,6 +3631,26 @@ impl InteractionsHandler {
         }
     }
 
+    /// Fail a batch (cancel all pending pieces), persist, and cancel ACKed
+    /// upstream interactions.
+    async fn fail_batch_and_cancel(
+        &self,
+        batch_id: &str,
+        reason: String,
+        route: &RouteTarget,
+    ) -> Vec<String> {
+        let acked_ids = {
+            let mut store = self.v2_store.write().await;
+            let ids = store.fail_batch(batch_id, reason).unwrap_or_default();
+            let _ = store.save_to_disk(&self.v2_path).await;
+            ids
+        };
+        for id in &acked_ids {
+            let _ = self.cancel_interaction(id, route).await;
+        }
+        acked_ids
+    }
+
     /// Execute a control action and return the response.
     async fn handle_control_action(
         &self,
@@ -4374,6 +4363,15 @@ fn build_interaction_url(route: &RouteTarget, suffix: &str) -> String {
         Some(q) if !q.is_empty() => format!("{base}{suffix}?{q}"),
         _ => format!("{base}{suffix}"),
     }
+}
+
+/// Derive system_instruction_hash from normalized system instruction.
+/// Returns None when prev_id is set (continuing chain — hash irrelevant).
+fn compute_system_hash(prev_id: Option<&str>, system_instruction: Option<&str>) -> Option<u64> {
+    if prev_id.is_some() {
+        return None;
+    }
+    system_instruction.map(crate::interactions::hash_system_instruction)
 }
 
 /// Split text into chunks that each fit under `limit` bytes.

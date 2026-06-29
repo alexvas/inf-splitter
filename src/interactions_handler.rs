@@ -2027,8 +2027,19 @@ impl InteractionsHandler {
         } else {
             None
         };
-        // Split system_instruction on natural boundaries
-        let sys_parts = match split_text_for_limit(sys, limit) {
+        // Split system_instruction on natural boundaries, accounting for
+        // envelope overhead (model, previous_interaction_id, stream, etc.)
+        let envelope_overhead = {
+            let dummy = crate::interactions::build_chunk_request(
+                model,
+                vec![],
+                Some(String::new()),
+                prev_interaction_id.clone(),
+                true,
+            );
+            serde_json::to_vec(&dummy).map(|v| v.len()).unwrap_or(0)
+        };
+        let sys_parts = match split_text_for_limit(sys, limit, envelope_overhead) {
             Ok(parts) => parts,
             Err(msg) => {
                 return Err(guard.abort_bad_request(
@@ -2797,8 +2808,19 @@ impl InteractionsHandler {
         } else {
             None
         };
-        // Split system_instruction on natural boundaries
-        let sys_parts = match split_text_for_limit(sys, limit) {
+        // Split system_instruction on natural boundaries, accounting for
+        // envelope overhead (model, previous_interaction_id, stream, etc.)
+        let envelope_overhead = {
+            let dummy = crate::interactions::build_chunk_request(
+                model,
+                vec![],
+                Some(String::new()),
+                prev_interaction_id.clone(),
+                stream,
+            );
+            serde_json::to_vec(&dummy).map(|v| v.len()).unwrap_or(0)
+        };
+        let sys_parts = match split_text_for_limit(sys, limit, envelope_overhead) {
             Ok(parts) => parts,
             Err(msg) => {
                 return Err(guard.abort_bad_request(
@@ -4233,16 +4255,22 @@ fn build_interaction_url(route: &RouteTarget, suffix: &str) -> String {
 /// Split text into chunks that each fit under `limit` bytes.
 /// Uses hierarchical boundaries: \\n\\n → \\n → . → ! → ? → , → ; → char.
 /// Each chunk is as large as possible while staying under the limit.
-fn split_text_for_limit(text: &str, limit: usize) -> Result<Vec<String>, String> {
-    if text.len() <= limit {
+fn split_text_for_limit(text: &str, limit: usize, overhead: usize) -> Result<Vec<String>, String> {
+    let effective_limit = limit.saturating_sub(overhead);
+    if effective_limit == 0 {
+        return Err(format!(
+            "Envelope overhead {overhead} exceeds proxy limit {limit}, cannot fit system instruction"
+        ));
+    }
+    if text.len() <= effective_limit {
         return Ok(vec![text.to_string()]);
     }
 
     let delimiters: &[&str] = &["\n\n", "\n", ". ", "! ", "? ", ", ", "; ", " "];
-    let chunks = split_by_best_delimiter(text, limit, delimiters);
-    if chunks.is_empty() || chunks.iter().any(|c| c.len() > limit) {
+    let chunks = split_by_best_delimiter(text, effective_limit, delimiters);
+    if chunks.is_empty() || chunks.iter().any(|c| c.len() > effective_limit) {
         Err(format!(
-            "Unable to split system instruction under limit {} bytes",
+            "Unable to split system instruction under limit {} bytes (effective {effective_limit} after {overhead} overhead)",
             limit
         ))
     } else {
@@ -4608,7 +4636,7 @@ mod tests {
 
     #[test]
     fn split_text_under_limit_single_chunk() {
-        let result = split_text_for_limit("Hello world", 1024).unwrap();
+        let result = split_text_for_limit("Hello world", 1024, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "Hello world");
     }
@@ -4617,14 +4645,14 @@ mod tests {
     fn split_text_exact_limit_single_chunk() {
         let text = "Hello!";
         let limit = text.len();
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], text);
     }
 
     #[test]
     fn split_text_empty() {
-        let result = split_text_for_limit("", 100).unwrap();
+        let result = split_text_for_limit("", 100, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "");
     }
@@ -4635,7 +4663,7 @@ mod tests {
         // "First paragraph" is 15 bytes, "Second paragraph" is 17 bytes
         // Total is 15 + 2 + 17 = 34 bytes
         let limit = 20;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], "First paragraph");
         assert_eq!(result[1], "Second paragraph");
@@ -4645,7 +4673,7 @@ mod tests {
     fn split_text_at_single_newline() {
         let text = "Line one\nLine two\nLine three";
         let limit = 14;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         // "Line one" = 8, "Line one\nLine two" = 8+1+8=17 > 14 → split
         // "Line two" = 8, "Line two\nLine three" = 8+1+10=19 > 14 → split
         assert_eq!(result.len(), 3);
@@ -4658,7 +4686,7 @@ mod tests {
     fn split_text_at_dot_space() {
         let text = "First sentence. Second sentence. Third one here";
         let limit = 25;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         // "First sentence" = 14, "First sentence. Second sentence" = 14+2+16=32 > 25
         assert!(!result.is_empty());
         assert_eq!(result[0], "First sentence");
@@ -4671,7 +4699,7 @@ mod tests {
         // Chunks should be as large as possible under the limit.
         let text = "AA\nBB\nCC";
         let limit = 5; // "AA\nBB" = 5 bytes exactly, "AA\nBB\nCC" = 8 > 5
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], "AA\nBB");
         assert_eq!(result[1], "CC");
@@ -4681,7 +4709,7 @@ mod tests {
     fn all_chunks_under_limit() {
         let text = "Chunk one\nChunk two\nChunk three\nChunk four";
         let limit = 15;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         for chunk in &result {
             assert!(
                 chunk.len() <= limit,
@@ -4698,7 +4726,7 @@ mod tests {
         // A single word with no delimiters, longer than the limit
         let text = "SuperCaliFragilisticExpialidociousNoSpacesOrPunctuation";
         let limit = 10;
-        let result = split_text_for_limit(text, limit);
+        let result = split_text_for_limit(text, limit, 0);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -4710,7 +4738,7 @@ mod tests {
         // Text has no \n\n but has \n — should fall back to single newline
         let text = "AAA\nBBB\nCCC";
         let limit = 6; // "AAA\nBBB" = 7 > 6 → split, "BBB\nCCC" = 7 > 6 → split
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], "AAA");
         assert_eq!(result[1], "BBB");
@@ -4721,7 +4749,7 @@ mod tests {
     fn split_text_comma_delimiter() {
         let text = "item one, item two, item three";
         let limit = 15;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         // "item one" = 8, "item one, item two" = 8+2+9=19 > 15 → split
         assert_eq!(result[0], "item one");
     }
@@ -4730,7 +4758,7 @@ mod tests {
     fn split_text_semicolon_delimiter() {
         let text = "alpha; beta; gamma";
         let limit = 10;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         // "alpha" = 5, "alpha; beta" = 5+2+4=11 > 10 → split
         assert_eq!(result[0], "alpha");
     }
@@ -4739,7 +4767,7 @@ mod tests {
     fn split_text_exclamation_delimiter() {
         let text = "Wow! Great! Amazing";
         let limit = 10;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         // "Wow" = 3, "Wow! Great" = 3+2+5=10 ≤ 10 → fits
         // "Wow! Great! Amazing" = 10+2+7=19 > 10 → split
         assert_eq!(result.len(), 2);
@@ -4751,7 +4779,7 @@ mod tests {
     fn split_text_question_delimiter() {
         let text = "What? When? Where?";
         let limit = 12;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         // "What" = 4, "What? When" = 4+2+4=10 ≤ 12 → fits
         // "What? When? Where" = 10+2+5=17 > 12 → split
         assert_eq!(result.len(), 2);
@@ -4768,7 +4796,7 @@ You should always be polite and concise.
 
 If you don't know the answer, say so honestly.";
         let limit = 80;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         assert_eq!(result.len(), 2);
         for chunk in &result {
             assert!(chunk.len() <= limit);
@@ -5041,7 +5069,7 @@ If you don't know the answer, say so honestly.";
     fn split_text_single_paragraph_fits() {
         let text = "You are a helpful and concise assistant.";
         let limit = text.len();
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         assert_eq!(result.len(), 1);
     }
 
@@ -5049,7 +5077,7 @@ If you don't know the answer, say so honestly.";
     fn split_text_narrow_limit_forces_word_splitting() {
         let text = "Hello world";
         let limit = 3; // Even individual words are > 3 bytes
-        let result = split_text_for_limit(text, limit);
+        let result = split_text_for_limit(text, limit, 0);
         // "Hello" is 5 bytes > 3, and "Hello" has no delimiters → unsplittable
         assert!(result.is_err());
     }
@@ -5059,7 +5087,7 @@ If you don't know the answer, say so honestly.";
         // Verify space delimiter works as last resort
         let text = "one two three four five";
         let limit = 10;
-        let result = split_text_for_limit(text, limit).unwrap();
+        let result = split_text_for_limit(text, limit, 0).unwrap();
         // Each chunk should be ≤ limit
         for chunk in &result {
             assert!(chunk.len() <= limit);
@@ -5365,7 +5393,7 @@ If you don't know the answer, say so honestly.";
         // Mixed content: splittable parts + one unsplittable word
         // Without fix, the unsplittable word is silently dropped and Ok is returned
         let text = "hello world SUPERCALIFRAGILISTICEXPEALIDOCIOUS foo bar";
-        let result = split_text_for_limit(text, 10);
+        let result = split_text_for_limit(text, 10, 0);
         assert!(
             result.is_err(),
             "unsplittable contiguous segment must cause an error"
@@ -6351,14 +6379,14 @@ If you don't know the answer, say so honestly.";
             model_names: ["test-model"].iter().map(|&s| s.into()).collect(),
             drop_fields: Default::default(),
             proxy: None,
-            proxy_limit: Some(60),
+            proxy_limit: Some(200),
             control_clean_all: None,
             control_extend_lifetime: None,
         };
 
         let url = format!("http://{addr}/v1/interactions/models/test-model:create");
 
-        // Three paragraphs, each ~50 bytes, limit 60 → splits to 3 parts
+        // Three paragraphs, each ~50 bytes, limit 150, effective ~78 after envelope overhead → splits to 3 parts
         let long_sys = "First paragraph is long enough to take some bytes for this.\n\nSecond paragraph also long enough for the test we run.\n\nThird paragraph should trigger a third chunk split.";
 
         let guard = RequestDiagnostics::new(&handler.diagnostics, "test", "test-model");
@@ -6373,7 +6401,7 @@ If you don't know the answer, say so honestly.";
                 &[],
                 vec![0xDEAD],
                 None,
-                60,
+                150,
                 "test-model",
                 "test-upstream",
                 b"{}",
@@ -6506,7 +6534,7 @@ If you don't know the answer, say so honestly.";
             model_names: ["test-model"].iter().map(|&s| s.into()).collect(),
             drop_fields: Default::default(),
             proxy: None,
-            proxy_limit: Some(60),
+            proxy_limit: Some(200),
             control_clean_all: None,
             control_extend_lifetime: None,
         };
@@ -6527,7 +6555,7 @@ If you don't know the answer, say so honestly.";
                 &[],
                 vec![0xDEAD],
                 None,
-                60,
+                150,
                 "test-model",
                 "test-upstream",
                 b"{}",
@@ -6555,5 +6583,62 @@ If you don't know the answer, say so honestly.";
             cancels.contains(&"int-1".to_string()) && cancels.contains(&"int-2".to_string()),
             "GREEN: streaming failed batch must cancel acked pieces int-1, int-2, got cancels={cancels:?}"
         );
+    }
+
+    /// split_text_for_limit accounts for envelope overhead (model,
+    /// previous_interaction_id, input, stream, JSON keys) so that
+    /// serialized CreateModelInteractionParams fits under proxy_limit.
+    #[test]
+    fn split_text_parts_fit_in_envelope_under_proxy_limit() {
+        let limit = 1000usize;
+
+        // Build ~3000 bytes of text that will split into multiple parts.
+        let sentence = "The quick brown fox jumps over the lazy dog. "; // 45 bytes
+        let text = sentence.repeat(67); // 45*67 = 3015 bytes
+        assert!(
+            text.len() > 3000,
+            "text must be > 3000 bytes, got {}",
+            text.len()
+        );
+
+        // Compute envelope overhead with same params build_chunk_request uses
+        let envelope_overhead = {
+            let dummy = crate::interactions::build_chunk_request(
+                "test-model",
+                vec![],
+                Some(String::new()),
+                Some("prev-123".into()),
+                false,
+            );
+            serde_json::to_vec(&dummy).map(|v| v.len()).unwrap_or(0)
+        };
+
+        let parts = split_text_for_limit(&text, limit, envelope_overhead)
+            .unwrap_or_else(|e| panic!("split_text_for_limit failed: {e}"));
+        assert!(
+            parts.len() > 1,
+            "must split into multiple parts, got {}",
+            parts.len()
+        );
+
+        for (i, part) in parts.iter().enumerate() {
+            let params = crate::interactions::build_chunk_request(
+                "test-model",
+                vec![],
+                Some(part.clone()),
+                Some("prev-123".into()),
+                false,
+            );
+            let body = serde_json::to_vec(&params)
+                .unwrap_or_else(|e| panic!("serialize failed for part {i}: {e}"));
+            assert!(
+                body.len() <= limit,
+                "GREEN: part {i} serialized body {body_len} <= limit {limit}. \
+                 text_len={txt_len}, overhead={overhead}",
+                body_len = body.len(),
+                txt_len = part.len(),
+                overhead = body.len().saturating_sub(part.len()),
+            );
+        }
     }
 }

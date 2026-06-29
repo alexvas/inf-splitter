@@ -1521,6 +1521,66 @@ mod tests {
         assert!(not_found.is_none());
     }
 
+    /// GAP 4: concurrent identical split requests converge on one InFlightBatch.
+    /// Match/create is atomic under shared store lock.
+    #[tokio::test]
+    async fn concurrent_identical_splits_converge_on_single_batch() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let store = Arc::new(Mutex::new(StoreV2::new()));
+        let session_id = "sess-1";
+        let prev_id = Some("int-0");
+        let hashes = vec![0xAA];
+        let sys_hash = None::<u64>;
+
+        let task = |store: Arc<Mutex<StoreV2>>, batch_name: &str| {
+            let store = store.clone();
+            let sid = session_id.to_string();
+            let pid = prev_id.map(String::from);
+            let h = hashes.clone();
+            let batch_name = batch_name.to_string();
+            tokio::spawn(async move {
+                let mut s = store.lock().await;
+                if let Some(b) = s.find_matching_batch(&sid, pid.as_deref(), &h, sys_hash) {
+                    return b.id.clone();
+                }
+                s.create_batch(batch_name.clone(), sid, pid, h, sys_hash, vec![]);
+                batch_name
+            })
+        };
+
+        let (r1, r2) = tokio::join!(
+            task(store.clone(), "batch-A"),
+            task(store.clone(), "batch-B"),
+        );
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+
+        assert_eq!(r1, r2, "concurrent tasks must converge on same batch");
+        assert_eq!(store.lock().await.in_flight.len(), 1, "exactly one batch");
+
+        // Different prev_id → creates separate batch (no convergence)
+        {
+            let mut s = store.lock().await;
+            let found = s.find_matching_batch("sess-1", Some("int-999"), &[0xAA], None);
+            assert!(found.is_none(), "different prev_id should not match");
+            s.create_batch(
+                "batch-D".to_string(),
+                "sess-1".to_string(),
+                Some("int-999".to_string()),
+                vec![0xAA],
+                None,
+                vec![],
+            );
+            assert_eq!(
+                s.in_flight.len(),
+                2,
+                "different prev_id creates separate batch"
+            );
+        }
+    }
+
     #[test]
     fn inflight_single_piece_batch() {
         let mut store = StoreV2::new();

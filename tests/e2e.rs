@@ -2269,3 +2269,160 @@ proxy_limit = "1k"
         "streaming response must not expose intermediate interaction id int-A: {body_text}"
     );
 }
+
+/// RED: second client during in-flight split-send creates duplicate batch.
+/// Spec GAP 3: proxy must detect in-flight batch and wait, not create duplicate.
+#[tokio::test]
+async fn retry_during_in_flight_split_waits_and_returns_merged() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use tokio::net::TcpListener;
+
+    // ── Mock upstream: chunk0 fast, chunk1 with 500ms delay ──
+    #[derive(Clone)]
+    struct MockState {
+        post_count: Arc<AtomicUsize>,
+        interactions: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+        delay_after: Arc<AtomicUsize>, // delay when post_count reaches this value
+    }
+
+    async fn create_handler(State(state): State<MockState>) -> impl IntoResponse {
+        let count = state.post_count.fetch_add(1, Ordering::SeqCst);
+        let id = format!("int-ff-{count}");
+        let delay_after = state.delay_after.load(Ordering::SeqCst);
+        if delay_after > 0 && count == delay_after {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let body = serde_json::json!({
+            "id": &id,
+            "status": "completed",
+            "steps": [{"type": "model_output", "content": [{"type": "text", "text": format!("response {count}")}]}],
+            "usage": {"total_input_tokens": 10, "total_output_tokens": 20}
+        });
+        state.interactions.lock().unwrap().insert(id, body.clone());
+        (axum::http::StatusCode::OK, Json(body)).into_response()
+    }
+
+    async fn get_handler(
+        State(state): State<MockState>,
+        Path(id): Path<String>,
+    ) -> impl IntoResponse {
+        let map = state.interactions.lock().unwrap();
+        match map.get(&id) {
+            Some(body) => (axum::http::StatusCode::OK, Json(body.clone())).into_response(),
+            None => (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not found"})),
+            )
+                .into_response(),
+        }
+    }
+
+    let state = MockState {
+        post_count: Arc::new(AtomicUsize::new(0)),
+        interactions: Arc::new(Mutex::new(HashMap::new())),
+        delay_after: Arc::new(AtomicUsize::new(2)), // delay second POST (chunk1)
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/v1beta/interactions",
+            post(create_handler).get(get_handler),
+        )
+        .route(
+            "/v1beta/interactions/{*rest}",
+            post(create_handler).get(get_handler),
+        )
+        .with_state(state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // ── Proxy with proxy_limit to trigger split-send ──
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    // ── Three large user messages trigger content-level split (> 1024 limit) ──
+    // Each message ~700 bytes → fits in chunk with envelope (~800 < 1024)
+    // Three total ~2100+envelope > 1024 → 3-way split
+    let msg_text = "X ".repeat(350);
+    let request_json = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": msg_text},
+            {"role": "user", "content": msg_text},
+            {"role": "user", "content": msg_text}
+        ]
+    });
+
+    // ── Launch two concurrent requests ──
+    // ── Proxy with proxy_limit to trigger split-send ──
+    let url = format!("http://{proxy_addr}/v1/messages");
+    let session_id = String::from("shared-session-for-test");
+    let req_a = request_json.clone();
+    let req_b = request_json.clone();
+
+    // Use spawn for true concurrent scheduling
+    let url_a = url.clone();
+    let url_b = url.clone();
+    let sid_a = session_id.clone();
+    let sid_b = session_id.clone();
+    let h_a = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url_a)
+            .header("X-Client-Request-Id", &sid_a)
+            .json(&req_a)
+            .send()
+            .await
+    });
+    let h_b = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url_b)
+            .header("X-Client-Request-Id", &sid_b)
+            .json(&req_b)
+            .send()
+            .await
+    });
+    let a = h_a.await.expect("task A").expect("client A");
+    let b = h_b.await.expect("task B").expect("client B");
+
+    let status_a = a.status();
+    let status_b = b.status();
+    let body_a = a.text().await.unwrap_or_default();
+    let body_b = b.text().await.unwrap_or_default();
+
+    assert_eq!(
+        status_a,
+        reqwest::StatusCode::OK,
+        "client A: {status_a} {body_a}"
+    );
+    assert_eq!(
+        status_b,
+        reqwest::StatusCode::OK,
+        "client B: {status_b} {body_b}"
+    );
+
+    // ── GREEN: only 3 POSTs to upstream (not 6 from duplicate batch) ──
+    let final_count = state.post_count.load(Ordering::SeqCst);
+    assert_eq!(
+        final_count, 3,
+        "GREEN: upstream received {final_count} POSTs (expected 3). \
+         Duplicate batch detected and waited."
+    );
+}

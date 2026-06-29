@@ -627,17 +627,19 @@ impl StoreV2 {
 
     // ── InFlightStore operations ─────────────────────────────────
 
-    /// Find an in-flight batch matching session + prev_id + message_hashes.
+    /// Find an in-flight batch matching session + prev_id + message_hashes + system_instruction_hash.
     pub fn find_matching_batch(
         &self,
         session_id: &str,
         prev_interaction_id: Option<&str>,
         message_hashes: &[u64],
+        system_instruction_hash: Option<u64>,
     ) -> Option<&InFlightBatch> {
         self.in_flight.values().find(|b| {
             b.session_id == session_id
                 && b.prev_interaction_id.as_deref() == prev_interaction_id
                 && b.message_hashes == message_hashes
+                && b.system_instruction_hash == system_instruction_hash
         })
     }
 
@@ -1511,11 +1513,11 @@ mod tests {
             ),
         );
 
-        let found = store.find_matching_batch("sess-1", Some("int-0"), &[0xA]);
+        let found = store.find_matching_batch("sess-1", Some("int-0"), &[0xA], None);
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, "batch-1");
 
-        let not_found = store.find_matching_batch("sess-1", Some("int-0"), &[0xB]);
+        let not_found = store.find_matching_batch("sess-1", Some("int-0"), &[0xB], None);
         assert!(not_found.is_none());
     }
 

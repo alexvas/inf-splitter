@@ -145,6 +145,9 @@ impl InteractionsHandler {
             .map(interactions_lib::hash_harness_message)
             .collect();
 
+        // Extract system instruction early for in-flight matching
+        let system = interactions_lib::extract_anthropic_system(&body_val);
+
         let frontier = {
             let store = self.v2_store.read().await;
             session::find_frontier(&hashes, None, None, &store.interactions)
@@ -175,6 +178,30 @@ impl InteractionsHandler {
         // Build prev_id from frontier
         let prev_id = frontier.previous_interaction_id.as_deref();
 
+        // If an in-flight batch exists for these hashes, wait for it to complete
+        let system_instruction_hash = if prev_id.is_none() {
+            system
+                .as_ref()
+                .map(|s| crate::interactions::hash_system_instruction(s))
+        } else {
+            None
+        };
+        if let Some(response) = self
+            .wait_for_inflight_batch(
+                &session_id,
+                prev_id,
+                &hashes,
+                system_instruction_hash,
+                route,
+                &model,
+                Protocol::Anthropic,
+                request_headers,
+            )
+            .await?
+        {
+            return Ok(response);
+        }
+
         // Extract typed scalars from ingress body
         let stream = body_val
             .get("stream")
@@ -185,7 +212,6 @@ impl InteractionsHandler {
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .map(clamp_max_tokens);
-        let system = interactions_lib::extract_anthropic_system(&body_val);
         let (tools, tool_choice) = interactions_lib::extract_anthropic_tools(&body_val);
 
         // Zero harness messages on a new chain: nothing to send
@@ -213,13 +239,6 @@ impl InteractionsHandler {
             full_idx
         };
         let new_count = harness.len(); // total harness messages (for split-send compatibility)
-        let system_instruction_hash = if prev_id.is_none() {
-            system
-                .as_ref()
-                .map(|s| crate::interactions::hash_system_instruction(s))
-        } else {
-            None
-        };
         let params = interactions_lib::build_interactions_request_anthropic(
             &cleaned_messages,
             start_index,
@@ -406,6 +425,36 @@ impl InteractionsHandler {
 
         // Build prev_id from frontier
         let prev_id = frontier.previous_interaction_id.as_deref();
+
+        // If an in-flight batch exists for these hashes, wait for it to complete
+        {
+            // Derive system_instruction_hash from first harness message if it's
+            // a system/developer role on a new chain.
+            let sys_hash = if prev_id.is_none() {
+                harness
+                    .get(0)
+                    .and_then(|msg| msg.get("role").and_then(|r| r.as_str()))
+                    .filter(|role| matches!(*role, "system" | "developer"))
+                    .map(|_| hashes[0])
+            } else {
+                None
+            };
+            if let Some(response) = self
+                .wait_for_inflight_batch(
+                    &session_id,
+                    prev_id,
+                    &hashes,
+                    sys_hash,
+                    route,
+                    &model,
+                    Protocol::OpenAi,
+                    request_headers,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
+        }
 
         // Extract typed scalars from ingress body
         let stream = body_val
@@ -637,6 +686,94 @@ impl InteractionsHandler {
                     .map_err(|e| AppError::Internal(e.to_string()))?,
             ))
             .map_err(|err| AppError::Internal(err.to_string()))
+    }
+
+    /// Poll-wait for a matching in-flight batch to complete, then replay from
+    /// the resulting ClientInteractionNode. Returns None if no matching batch
+    /// exists (caller proceeds with a new request normally).
+    async fn wait_for_inflight_batch(
+        &self,
+        session_id: &str,
+        prev_id: Option<&str>,
+        message_hashes: &[u64],
+        system_instruction_hash: Option<u64>,
+        route: &RouteTarget,
+        model: &str,
+        ingress: Protocol,
+        request_headers: &HeaderMap,
+    ) -> Result<Option<Response>, AppError> {
+        // Use write lock for atomicity: creation of batch in split-send
+        // also holds write lock, so we won't miss a concurrently created batch.
+        let batch_id = {
+            let store = self.v2_store.write().await;
+            let m = store
+                .find_matching_batch(session_id, prev_id, message_hashes, system_instruction_hash)
+                .map(|b| b.id.clone());
+            m
+        };
+
+        let batch_id = match batch_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Poll until batch completes or ClientInteractionNode exists
+        let poll_start = std::time::Instant::now();
+        loop {
+            let (complete, frontier_ready) = {
+                let store = self.v2_store.read().await;
+                let done = store.batch_is_complete(&batch_id);
+                let frontier = session::find_frontier(
+                    message_hashes,
+                    prev_id,
+                    system_instruction_hash,
+                    &store.interactions,
+                );
+                (done, frontier.all_known)
+            };
+            if complete || frontier_ready {
+                break;
+            }
+            if poll_start.elapsed() > std::time::Duration::from_secs(30) {
+                return Ok(None);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // Batch completed → ClientInteractionNode should exist
+        let frontier = {
+            let store = self.v2_store.read().await;
+            session::find_frontier(
+                message_hashes,
+                prev_id,
+                system_instruction_hash,
+                &store.interactions,
+            )
+        };
+
+        if frontier.all_known {
+            if let Some(ref client_id) = frontier.matched_client_id {
+                let guard = crate::diagnostics::RequestDiagnostics::new(
+                    &self.diagnostics,
+                    &route.section,
+                    model,
+                );
+                let response = self
+                    .replay_from_client_node(
+                        client_id,
+                        route,
+                        session_id,
+                        model,
+                        ingress,
+                        request_headers,
+                        guard,
+                    )
+                    .await?;
+                return Ok(Some(response));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Fetch a single upstream interaction via GET.
@@ -1450,6 +1587,89 @@ impl InteractionsHandler {
 
         {
             let mut store = self.v2_store.write().await;
+
+            // Double-check: another client may have created this batch
+            // between the handler's pre-check and this point.
+            let matching = store.find_matching_batch(
+                session_id,
+                params.previous_interaction_id.as_deref(),
+                &harness_hashes,
+                system_instruction_hash,
+            );
+            if let Some(existing) = matching {
+                let existing_id = existing.id.clone();
+                drop(store);
+                // Wait until the batch is complete OR the ClientInteractionNode exists
+                // (batch removed by complete_batch).
+                let poll_start = std::time::Instant::now();
+                loop {
+                    let (complete, node_exists) = {
+                        let store = self.v2_store.read().await;
+                        let done = store.batch_is_complete(&existing_id);
+                        let frontier = session::find_frontier(
+                            &harness_hashes,
+                            params.previous_interaction_id.as_deref(),
+                            system_instruction_hash,
+                            &store.interactions,
+                        );
+                        (done, frontier.all_known)
+                    };
+                    if complete || node_exists {
+                        break;
+                    }
+                    if poll_start.elapsed() > std::time::Duration::from_secs(30) {
+                        return Err(guard.abort_internal(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            stream,
+                            "timeout waiting for duplicate batch",
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                // Batch completed → replay from ClientInteractionNode
+                let frontier = {
+                    let store = self.v2_store.read().await;
+                    session::find_frontier(
+                        &harness_hashes,
+                        params.previous_interaction_id.as_deref(),
+                        system_instruction_hash,
+                        &store.interactions,
+                    )
+                };
+                if frontier.all_known {
+                    if let Some(ref client_id) = frontier.matched_client_id {
+                        let guard2 = crate::diagnostics::RequestDiagnostics::new(
+                            &self.diagnostics,
+                            &route.section,
+                            model,
+                        );
+                        return self
+                            .replay_from_client_node(
+                                client_id,
+                                route,
+                                session_id,
+                                model,
+                                ingress,
+                                request_headers,
+                                guard2,
+                            )
+                            .await;
+                    }
+                }
+                // Shouldn't happen: batch completed but no ClientInteractionNode
+                return Err(guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    stream,
+                    "duplicate batch completed without ClientInteractionNode",
+                ));
+            }
+
             store.create_batch(
                 batch_id.clone(),
                 session_id.to_string(),

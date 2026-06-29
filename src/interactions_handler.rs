@@ -2578,9 +2578,7 @@ impl InteractionsHandler {
                 }
             };
 
-            if i == 0 {
-                final_id = Some(int_id.clone());
-            }
+            final_id = Some(int_id.clone());
             all_int_ids.push(int_id.clone());
             current_prev = Some(int_id.clone());
 
@@ -2865,6 +2863,7 @@ impl InteractionsHandler {
                         ));
                     }
                 };
+                final_id = Some(int_id.clone());
                 all_int_ids.push(int_id.clone());
                 current_prev = Some(int_id.clone());
 

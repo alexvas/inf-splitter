@@ -2426,3 +2426,149 @@ proxy_limit = "1k"
          Duplicate batch detected and waited."
     );
 }
+
+// ── Phase 8: Streaming + system_instruction split ──
+
+/// GAP 5: streaming content split with system_instruction present.
+/// Verifies intermediate IDs are substituted and only final ID visible.
+// ── Phase 7.5: Streaming + system_instruction split ──
+
+#[tokio::test]
+async fn streaming_system_instruction_split_uses_final_id() {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+
+    let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let request_count_clone = request_count.clone();
+
+    fn make_sse(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .map(|v| format!("data: {}\n\n", serde_json::to_string(v).unwrap()))
+            .collect()
+    }
+
+    let sse_s1 = make_sse(&[
+        serde_json::json!({"event_type":"interaction.created","interaction":{"id":"int-S1","status":"in_progress"}}),
+        serde_json::json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+        serde_json::json!({"event_type":"step.delta","delta":{"type":"text","text":"first "},"index":0}),
+        serde_json::json!({"event_type":"step.stop","index":0}),
+        serde_json::json!({"event_type":"interaction.completed","interaction":{"id":"int-S1","status":"completed","usage":{"total_input_tokens":5,"total_output_tokens":5}}}),
+    ]);
+    let sse_s2 = make_sse(&[
+        serde_json::json!({"event_type":"interaction.created","interaction":{"id":"int-S2","status":"in_progress"}}),
+        serde_json::json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+        serde_json::json!({"event_type":"step.delta","delta":{"type":"text","text":"second "},"index":0}),
+        serde_json::json!({"event_type":"step.stop","index":0}),
+        serde_json::json!({"event_type":"interaction.completed","interaction":{"id":"int-S2","status":"completed","usage":{"total_input_tokens":5,"total_output_tokens":5}}}),
+    ]);
+    let sse_a = make_sse(&[
+        serde_json::json!({"event_type":"interaction.created","interaction":{"id":"int-A","status":"in_progress"}}),
+        serde_json::json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+        serde_json::json!({"event_type":"step.delta","delta":{"type":"text","text":"third"},"index":0}),
+        serde_json::json!({"event_type":"step.stop","index":0}),
+        serde_json::json!({"event_type":"interaction.completed","interaction":{"id":"int-A","status":"completed","usage":{"total_input_tokens":5,"total_output_tokens":5}}}),
+    ]);
+
+    let app = axum::Router::new().route(
+        "/v1beta/interactions",
+        axum::routing::post(move |axum::Json(_body): axum::Json<serde_json::Value>| {
+            let count = request_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = match count {
+                0 => sse_s1.clone(),
+                1 => sse_s2.clone(),
+                _ => sse_a.clone(),
+            };
+            async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let config = format!(
+        r#"
+listen_port = 0
+
+[gemini]
+endpoint_interactions = "http://{upstream_addr}/v1beta/interactions"
+models = "gemini-3.1-flash-lite"
+proxy_limit = "1k"
+"#
+    );
+    let proxy_addr = spawn_router(&config).await;
+
+    // 3 user messages ~840 bytes each → each fills its own content chunk
+    let msg = "hello world ".repeat(70); // ~840 bytes
+    let request = serde_json::json!({
+        "model": "gemini-3.1-flash-lite",
+        "max_tokens": 64,
+        "stream": true,
+        "system": "You are a helpful assistant.",
+        "messages": [
+            {"role": "user", "content": msg},
+            {"role": "user", "content": msg},
+            {"role": "user", "content": msg}
+        ]
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "streaming system_instruction split failed with {status}: {body_text}"
+    );
+
+    // Must contain content from all three chunks
+    assert!(
+        body_text.contains("first"),
+        "response missing first chunk content: {body_text}"
+    );
+    assert!(
+        body_text.contains("second"),
+        "response missing second chunk content: {body_text}"
+    );
+    assert!(
+        body_text.contains("third"),
+        "response missing third chunk content: {body_text}"
+    );
+
+    // Must NOT expose intermediate interaction ids
+    assert!(
+        !body_text.contains("int-S1"),
+        "response must not expose intermediate id int-S1: {body_text}"
+    );
+    assert!(
+        !body_text.contains("int-S2"),
+        "response must not expose intermediate id int-S2: {body_text}"
+    );
+
+    // Must use final interaction id (last chunk's id)
+    assert!(
+        body_text.contains("int-A"),
+        "response must contain final interaction id int-A: {body_text}"
+    );
+
+    // Exactly 3 upstream POSTs
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "expected exactly 3 upstream POSTs, got {}",
+        request_count.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+// ── Phase 7.5: Streaming + system_instruction split ──

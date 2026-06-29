@@ -119,6 +119,8 @@ pub struct InteractionStore {
     pub hash_index: HashMap<u64, Vec<ClientInteractionPosition>>,
     /// upstream_id → client ids referencing it (derived index).
     pub upstream_to_clients: HashMap<String, Vec<String>>,
+    /// prev_id → child client_id (reverse index for O(1) chain traversal).
+    pub prev_to_client: HashMap<String, String>,
 }
 
 /// Result of frontier selection.
@@ -148,6 +150,7 @@ impl InteractionStore {
             upstreams: HashMap::new(),
             hash_index: HashMap::new(),
             upstream_to_clients: HashMap::new(),
+            prev_to_client: HashMap::new(),
         }
     }
 
@@ -180,6 +183,10 @@ impl InteractionStore {
                 .entry(upstream_id.clone())
                 .or_default()
                 .push(node.id.clone());
+        }
+        // Index prev_to_client for O(1) chain traversal
+        if let Some(ref prev_id) = node.prev_id {
+            self.prev_to_client.insert(prev_id.clone(), node.id.clone());
         }
         self.clients.insert(node.id.clone(), node);
     }
@@ -399,12 +406,7 @@ pub fn find_frontier(
 
 /// Find the next client node in chain (child of `node`).
 fn next_in_chain<'a>(node: &ClientInteractionNode, store: &'a InteractionStore) -> Option<&'a str> {
-    for client in store.clients.values() {
-        if client.prev_id.as_deref() == Some(&node.id) {
-            return Some(&client.id);
-        }
-    }
-    None
+    store.prev_to_client.get(&node.id).map(|s| s.as_str())
 }
 
 /// Walk backward from a node to find the node whose prev_id matches.
@@ -526,6 +528,7 @@ impl StoreV2 {
                 upstreams: doc.interactions.upstreams,
                 hash_index: HashMap::new(),
                 upstream_to_clients: HashMap::new(),
+                prev_to_client: HashMap::new(),
             },
             in_flight: doc.in_flight,
         };
@@ -548,6 +551,13 @@ impl StoreV2 {
                     .entry(upstream_id.clone())
                     .or_default()
                     .push(node.id.clone());
+            }
+            // Rebuild prev_to_client reverse index
+            if let Some(ref prev_id) = node.prev_id {
+                store
+                    .interactions
+                    .prev_to_client
+                    .insert(prev_id.clone(), node.id.clone());
             }
         }
         store.interactions.clients = clients;
@@ -2032,6 +2042,53 @@ mod tests {
         assert!(
             store.interactions.upstream_to_clients.get("up-B").is_none(),
             "GREEN: fail_batch cleaned upstream_to_clients for up-B"
+        );
+    }
+
+    /// RED: next_in_chain uses prev_to_client index for O(1) lookup.
+    /// Without insert_client populating the index, returns None even for
+    /// a valid chain.
+    #[test]
+    fn next_in_chain_is_constant_time() {
+        let mut store = super::InteractionStore::new();
+        let now = crate::session::unix_now();
+
+        // Build chain A → B → C
+        let node_a = ClientInteractionNode {
+            id: "A".into(),
+            prev_id: None,
+            message_hashes: vec![1],
+            system_instruction_hash: Some(0xAAAA),
+            upstream_ids: vec!["up-a".into()],
+            last_seen_utc: now,
+        };
+        let node_b = ClientInteractionNode {
+            id: "B".into(),
+            prev_id: Some("A".into()),
+            message_hashes: vec![2],
+            system_instruction_hash: None,
+            upstream_ids: vec!["up-b".into()],
+            last_seen_utc: now,
+        };
+        let node_c = ClientInteractionNode {
+            id: "C".into(),
+            prev_id: Some("B".into()),
+            message_hashes: vec![3],
+            system_instruction_hash: None,
+            upstream_ids: vec!["up-c".into()],
+            last_seen_utc: now,
+        };
+
+        store.insert_client(node_a.clone());
+        store.insert_client(node_b.clone());
+        store.insert_client(node_c.clone());
+
+        // ── RED: will be None without prev_to_client being populated ──
+        let next = super::next_in_chain(&node_b, &store);
+        assert_eq!(
+            next,
+            Some("C"),
+            "RED: prev_to_client not populated by insert_client, got {next:?}"
         );
     }
 }

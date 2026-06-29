@@ -2278,4 +2278,83 @@ mod tests {
             "all hashes match a client chain, must be all_known=true"
         );
     }
+
+    #[test]
+    fn find_matching_batch_openai_sys_hash_mismatch() {
+        let mut store = StoreV2::new();
+
+        let converted_system = "Be helpful\nFoo";
+        let correct_hash = Some(crate::interactions::hash_system_instruction(
+            converted_system,
+        ));
+        let harness_message = serde_json::json!({"role": "system", "content": "Be helpful\nFoo"});
+        let harness_hashes = vec![crate::interactions::hash_harness_message(&harness_message)];
+        let wrong_hash = Some(harness_hashes[0]);
+
+        store.create_batch(
+            "batch-1".into(),
+            "sess-1".into(),
+            None,
+            harness_hashes.clone(),
+            correct_hash,
+            vec![],
+        );
+
+        let result_wrong = store.find_matching_batch("sess-1", None, &harness_hashes, wrong_hash);
+        assert!(
+            result_wrong.is_none(),
+            "RED: find_matching_batch with wrong_hash (hashes[0]) must not find batch-1. \
+             correct_hash={correct_hash:?} wrong_hash={wrong_hash:?}"
+        );
+
+        let result_correct =
+            store.find_matching_batch("sess-1", None, &harness_hashes, correct_hash);
+        assert!(
+            result_correct.is_some(),
+            "GREEN: find_matching_batch with correct_hash must find batch-1"
+        );
+    }
+
+    #[test]
+    fn find_frontier_skips_chain_on_wrong_system_instruction_hash() {
+        let mut store = InteractionStore::new();
+
+        store.insert_client(ClientInteractionNode {
+            id: "client-1".into(),
+            prev_id: None,
+            message_hashes: vec![100, 101, 102],
+            system_instruction_hash: Some(42),
+            upstream_ids: vec!["up-1".into()],
+            last_seen_utc: 100,
+        });
+
+        let incoming_hashes = [100, 101, 102];
+        let wrong_sys_hash = Some(99);
+        let correct_sys_hash = Some(42);
+
+        // Act A: wrong system_instruction_hash
+        let frontier = find_frontier(&incoming_hashes, None, wrong_sys_hash, &store);
+        assert!(
+            !frontier.all_known,
+            "RED: with wrong sys_hash={:?}, all_known must be false (chain skipped)",
+            wrong_sys_hash
+        );
+        assert_eq!(
+            frontier.matched_client_id, None,
+            "RED: with wrong sys_hash, matched_client_id must be None"
+        );
+
+        // Act B: correct system_instruction_hash
+        let frontier = find_frontier(&incoming_hashes, None, correct_sys_hash, &store);
+        assert!(
+            frontier.all_known,
+            "GREEN: with correct sys_hash={:?}, all_known must be true",
+            correct_sys_hash
+        );
+        assert_eq!(
+            frontier.matched_client_id.as_deref(),
+            Some("client-1"),
+            "GREEN: with correct sys_hash, must match client-1"
+        );
+    }
 }

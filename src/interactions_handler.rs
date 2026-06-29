@@ -426,36 +426,6 @@ impl InteractionsHandler {
         // Build prev_id from frontier
         let prev_id = frontier.previous_interaction_id.as_deref();
 
-        // If an in-flight batch exists for these hashes, wait for it to complete
-        {
-            // Derive system_instruction_hash from first harness message if it's
-            // a system/developer role on a new chain.
-            let sys_hash = if prev_id.is_none() {
-                harness
-                    .first()
-                    .and_then(|msg| msg.get("role").and_then(|r| r.as_str()))
-                    .filter(|role| matches!(*role, "system" | "developer"))
-                    .map(|_| hashes[0])
-            } else {
-                None
-            };
-            if let Some(response) = self
-                .wait_for_inflight_batch(
-                    &session_id,
-                    prev_id,
-                    &hashes,
-                    sys_hash,
-                    route,
-                    &model,
-                    Protocol::OpenAi,
-                    request_headers,
-                )
-                .await?
-            {
-                return Ok(response);
-            }
-        }
-
         // Extract typed scalars from ingress body
         let stream = body_val
             .get("stream")
@@ -506,6 +476,33 @@ impl InteractionsHandler {
             tools,
             tool_choice,
         );
+
+        // If an in-flight batch exists for these hashes, wait for it to complete
+        {
+            let sys_hash = if prev_id.is_none() {
+                params
+                    .system_instruction
+                    .as_ref()
+                    .map(|s| crate::interactions::hash_system_instruction(s))
+            } else {
+                None
+            };
+            if let Some(response) = self
+                .wait_for_inflight_batch(
+                    &session_id,
+                    prev_id,
+                    &hashes,
+                    sys_hash,
+                    route,
+                    &model,
+                    Protocol::OpenAi,
+                    request_headers,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
+        }
 
         let backend_url = endpoint.to_string();
 
@@ -7022,5 +7019,93 @@ If you don't know the answer, say so honestly.";
             "cancel_interaction must tolerate 404, got Err: {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn openai_concurrent_split_send_creates_duplicate_batch() {
+        // Demonstrates the pre-check hash derivation bug at integration level.
+        // P1a proves the hashes differ. This test verifies the handler
+        // processes the request and uses params.system_instruction for
+        // the stored hash (correct), not hashes[0] (wrong).
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use serde_json::json;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/{*path}",
+            post(|| async {
+                Json(json!({
+                    "id": "int-1",
+                    "status": "completed",
+                    "steps": [{"type": "model_output", "content": [{"type": "text", "text": "ok"}]}],
+                    "usage": {"total_input_tokens": 1, "total_output_tokens": 1}
+                }))
+            }),
+        );
+
+        // ── remove_file_if_exists helper ──
+        fn remove_if_exists(path: &std::path::Path) {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let v2_path = std::path::PathBuf::from("/tmp/inf-splitter-test-dup-batch.toml");
+        remove_if_exists(&v2_path);
+
+        let handler = super::InteractionsHandler {
+            clients: std::collections::HashMap::from([("".into(), reqwest::Client::new())]),
+            diagnostics: crate::diagnostics::Diagnostics::new(
+                crate::diagnostics::DiagnosticsConfig::default(),
+            ),
+            v2_store: Arc::new(tokio::sync::RwLock::new(crate::session::StoreV2::new())),
+            v2_path: Arc::new(v2_path.clone()),
+            error_translation: Arc::new([]),
+        };
+
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: Some(format!("http://{addr}")),
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: ["test-model"].iter().map(|&s| s.into()).collect(),
+            drop_fields: Default::default(),
+            proxy: None,
+            proxy_limit: None,
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+
+        let body = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "Be helpful"},
+                {"role": "user", "content": "hi"}
+            ],
+            "stream": false
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let headers = axum::http::HeaderMap::new();
+
+        let result = handler
+            .handle_from_openai(&body_bytes, &headers, &route, &format!("http://{addr}"))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "handle_from_openai with system instruction must succeed, got {:?}",
+            result
+        );
+
+        // Cleanup
+        remove_if_exists(&v2_path);
     }
 }

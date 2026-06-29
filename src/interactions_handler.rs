@@ -147,7 +147,7 @@ impl InteractionsHandler {
 
         let frontier = {
             let store = self.v2_store.read().await;
-            session::find_frontier(&hashes, None, &store.interactions)
+            session::find_frontier(&hashes, None, None, &store.interactions)
         };
 
         // If all messages are known, replay from upstream
@@ -379,7 +379,7 @@ impl InteractionsHandler {
 
         let frontier = {
             let store = self.v2_store.read().await;
-            session::find_frontier(&hashes, None, &store.interactions)
+            session::find_frontier(&hashes, None, None, &store.interactions)
         };
 
         // If all messages are known, replay from upstream
@@ -6290,7 +6290,7 @@ If you don't know the answer, say so honestly.";
         use crate::diagnostics::{
             DiagnosticMode, Diagnostics, DiagnosticsConfig, RequestDiagnostics,
         };
-        use axum::extract::{Path, State};
+        use axum::extract::Path;
         use axum::response::IntoResponse;
         use axum::routing::post;
         use axum::{Json, Router};
@@ -6439,10 +6439,10 @@ If you don't know the answer, say so honestly.";
             DiagnosticMode, Diagnostics, DiagnosticsConfig, RequestDiagnostics,
         };
         use axum::body::Body;
-        use axum::extract::{Path, State};
+        use axum::extract::Path;
         use axum::response::{IntoResponse, Response};
         use axum::routing::post;
-        use axum::{Json, Router};
+        use axum::Router;
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 

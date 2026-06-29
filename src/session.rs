@@ -248,6 +248,7 @@ impl InteractionStore {
 pub fn find_frontier(
     hashes: &[u64],
     incoming_prev_id: Option<&str>,
+    incoming_system_instruction_hash: Option<u64>,
     store: &InteractionStore,
 ) -> Frontier {
     if hashes.is_empty() {
@@ -280,6 +281,15 @@ pub fn find_frontier(
         }
         if client0.message_hashes[pos0.message_index] != hashes[0] {
             continue;
+        }
+
+        // Check system_instruction_hash matches root of this candidate's chain
+        if let Some(incoming_hash) = incoming_system_instruction_hash {
+            let root = find_chain_root(client0, store);
+            if root.system_instruction_hash != Some(incoming_hash) {
+                // system_instruction changed — skip this candidate, force fork
+                continue;
+            }
         }
 
         // Walk forward through the client chain
@@ -407,6 +417,21 @@ pub fn find_frontier(
 /// Find the next client node in chain (child of `node`).
 fn next_in_chain<'a>(node: &ClientInteractionNode, store: &'a InteractionStore) -> Option<&'a str> {
     store.prev_to_client.get(&node.id).map(|s| s.as_str())
+}
+
+/// Walk backward from `client` along prev_id to find the chain root.
+fn find_chain_root<'a>(
+    client: &'a ClientInteractionNode,
+    store: &'a InteractionStore,
+) -> &'a ClientInteractionNode {
+    let mut current = client;
+    while let Some(prev_id) = &current.prev_id {
+        match store.clients.get(prev_id) {
+            Some(prev) => current = prev,
+            None => break,
+        }
+    }
+    current
 }
 
 /// Walk backward from a node to find the node whose prev_id matches.
@@ -1013,7 +1038,7 @@ mod tests {
         store.insert_client(make_client_node("C1", None, vec![0xA], vec!["int-1"]));
         store.insert_client(make_client_node("C2", Some("C1"), vec![0xB], vec!["int-2"]));
 
-        let frontier = find_frontier(&[0xA, 0xB, 0xC], None, &store);
+        let frontier = find_frontier(&[0xA, 0xB, 0xC], None, None, &store);
         assert_eq!(frontier.index, 2, "first 2 hashes known");
         assert_eq!(frontier.previous_interaction_id.as_deref(), Some("C2"));
         assert!(!frontier.all_known);
@@ -1031,7 +1056,7 @@ mod tests {
         ));
         // No chain contains 0xA, so prefix [0xA, 0xB] can't start
 
-        let frontier = find_frontier(&[0xA, 0xB], None, &store);
+        let frontier = find_frontier(&[0xA, 0xB], None, None, &store);
         assert_eq!(frontier.index, 0, "0xA is unknown, must be frontier=0");
         assert!(frontier.previous_interaction_id.is_none());
     }
@@ -1049,7 +1074,7 @@ mod tests {
         ));
 
         // Incoming: [0xA, 0xB, 0xD] with incoming prev_id = C0
-        let frontier = find_frontier(&[0xA, 0xB, 0xD], Some("C0"), &store);
+        let frontier = find_frontier(&[0xA, 0xB, 0xD], Some("C0"), None, &store);
         assert_eq!(frontier.index, 0, "fork — re-send from beginning");
         // Fork at C1's parent = C0
         assert_eq!(
@@ -1074,7 +1099,7 @@ mod tests {
         // Incoming: [0xA, 0xB, 0xD]
         // 0xA matches C1 boundary, 0xB matches C2 position 0
         // 0xC is absent from incoming (C2 suffix divergence)
-        let frontier = find_frontier(&[0xA, 0xB, 0xD], None, &store);
+        let frontier = find_frontier(&[0xA, 0xB, 0xD], None, None, &store);
         // Expect fork: C2's parent = C1
         assert_eq!(frontier.previous_interaction_id.as_deref(), Some("C1"));
         assert_eq!(
@@ -1094,7 +1119,7 @@ mod tests {
         store.insert_client(node_a);
         store.insert_client(node_b);
 
-        let frontier = find_frontier(&[0x1], Some("prev-0"), &store);
+        let frontier = find_frontier(&[0x1], Some("prev-0"), None, &store);
         // Both have same last_seen_utc, "int-A" < "int-B" lexicographically
         assert_eq!(frontier.previous_interaction_id.as_deref(), Some("prev-0"));
         assert!(frontier.all_known);
@@ -1111,7 +1136,7 @@ mod tests {
             vec!["int-A"],
         ));
 
-        let frontier = find_frontier(&[0x10], Some("int-0"), &store);
+        let frontier = find_frontier(&[0x10], Some("int-0"), None, &store);
         assert!(frontier.all_known, "all hashes known, must be all_known");
         assert_eq!(frontier.matched_client_id.as_deref(), Some("int-A"));
         assert_eq!(frontier.index, 1);
@@ -1127,7 +1152,7 @@ mod tests {
             vec!["int-A", "int-B"],
         ));
 
-        let frontier = find_frontier(&[0xA, 0xB], Some("int-0"), &store);
+        let frontier = find_frontier(&[0xA, 0xB], Some("int-0"), None, &store);
         assert!(frontier.all_known);
         assert_eq!(frontier.matched_client_id.as_deref(), Some("int-B"));
     }
@@ -1144,7 +1169,7 @@ mod tests {
             vec!["up-A", "up-B"],
         ));
 
-        let frontier = find_frontier(&[0xCA, 0xFE], None, &store);
+        let frontier = find_frontier(&[0xCA, 0xFE], None, None, &store);
         assert!(
             frontier.all_known,
             "stateless all_known must work for non-root nodes"
@@ -1241,7 +1266,7 @@ mod tests {
             expires_at_utc: 200,
         };
 
-        let frontier = find_frontier(&[0xA], None, &store);
+        let frontier = find_frontier(&[0xA], None, None, &store);
         // Frontier is all_known — matched_client_id comes from InteractionStore
         assert!(frontier.all_known);
         assert_eq!(frontier.matched_client_id.as_deref(), Some("int-new"));
@@ -2089,6 +2114,55 @@ mod tests {
             next,
             Some("C"),
             "RED: prev_to_client not populated by insert_client, got {next:?}"
+        );
+    }
+
+    /// If incoming system_instruction_hash differs from chain root's stored hash,
+    /// find_frontier forks (index=0, prev_id=None) instead of extending the chain.
+    #[test]
+    fn frontier_forks_on_system_instruction_hash_mismatch() {
+        let mut store = super::InteractionStore::new();
+        let now = crate::session::unix_now();
+
+        // Chain: root → child, root has system_instruction_hash=0xSYS1
+        let root = ClientInteractionNode {
+            id: "int-root".into(),
+            prev_id: None,
+            message_hashes: vec![0xA, 0xB],
+            system_instruction_hash: Some(0x1111),
+            upstream_ids: vec!["up-1".into()],
+            last_seen_utc: now,
+        };
+        let child = ClientInteractionNode {
+            id: "int-child".into(),
+            prev_id: Some("int-root".into()),
+            message_hashes: vec![0xC],
+            system_instruction_hash: None,
+            upstream_ids: vec!["up-2".into()],
+            last_seen_utc: now,
+        };
+
+        store.insert_client(root);
+        store.insert_client(child);
+
+        // Client sends [0xA, 0xB, 0xC] with different system_instruction_hash
+        let frontier = find_frontier(&[0xA, 0xB, 0xC], None, Some(0x2222), &store);
+
+        assert_eq!(
+            frontier.index, 0,
+            "must fork at index 0, got {}",
+            frontier.index
+        );
+        assert_eq!(
+            frontier.previous_interaction_id, None,
+            "must fork with prev_id=None, got {:?}",
+            frontier.previous_interaction_id
+        );
+        assert!(!frontier.all_known, "all_known must be false when forking");
+        assert_eq!(
+            frontier.matched_client_id, None,
+            "matched_client_id must be None when forking, got {:?}",
+            frontier.matched_client_id
         );
     }
 }

@@ -1728,20 +1728,13 @@ impl InteractionsHandler {
                         Ok(chunk_bytes) => {
                             total_response_bytes += chunk_bytes.len();
                             if let Err(e) = sse_buf.push(i, &chunk_bytes) {
-                                let acked_ids = {
-                                    let mut store = self.v2_store.write().await;
-                                    let ids = store
-                                        .fail_batch(
-                                            &batch_id,
-                                            format!("SSE buffer overflow: {e:?}"),
-                                        )
-                                        .unwrap_or_default();
-                                    let _ = store.save_to_disk(&self.v2_path).await;
-                                    ids
-                                };
-                                for id in &acked_ids {
-                                    let _ = self.cancel_interaction(id, route).await;
-                                }
+                                let _ = self
+                                    .fail_batch_and_cancel(
+                                        &batch_id,
+                                        format!("SSE buffer overflow: {e:?}"),
+                                        route,
+                                    )
+                                    .await;
                                 return Err(guard.abort_upstream(
                                     start.elapsed().as_millis() as u64,
                                     ingress_body.len(),
@@ -1777,22 +1770,15 @@ impl InteractionsHandler {
                                 }
                             }
                             if line_buf.len() > MAX_SSE_BUFFER_BYTES {
-                                let acked_ids = {
-                                    let mut store = self.v2_store.write().await;
-                                    let ids = store
-                                        .fail_batch(
-                                            &batch_id,
-                                            format!(
-                                                "SSE buffer exceeded max line length for chunk {i}"
-                                            ),
-                                        )
-                                        .unwrap_or_default();
-                                    let _ = store.save_to_disk(&self.v2_path).await;
-                                    ids
-                                };
-                                for id in &acked_ids {
-                                    let _ = self.cancel_interaction(id, route).await;
-                                }
+                                let _ = self
+                                    .fail_batch_and_cancel(
+                                        &batch_id,
+                                        format!(
+                                            "SSE buffer exceeded max line length for chunk {i}"
+                                        ),
+                                        route,
+                                    )
+                                    .await;
                                 return Err(guard.abort_upstream(
                                     start.elapsed().as_millis() as u64,
                                     ingress_body.len(),
@@ -2253,17 +2239,13 @@ impl InteractionsHandler {
             let upstream = match builder.body(chunk_body).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(&batch_id, format!("chunk {piece_index} send error: {e}"))
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            format!("chunk {piece_index} send error: {e}"),
+                            route,
+                        )
+                        .await;
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -2280,20 +2262,13 @@ impl InteractionsHandler {
                 let error_body = upstream.text().await.unwrap_or_default();
 
                 // Fail batch, cancel acked pieces
-                let acked_ids = {
-                    let mut store = self.v2_store.write().await;
-                    let ids = store
-                        .fail_batch(
-                            &batch_id,
-                            format!("chunk {piece_index} HTTP {}", status.as_u16()),
-                        )
-                        .unwrap_or_default();
-                    let _ = store.save_to_disk(&self.v2_path).await;
-                    ids
-                };
-                for id in &acked_ids {
-                    let _ = self.cancel_interaction(id, route).await;
-                }
+                let _ = self
+                    .fail_batch_and_cancel(
+                        &batch_id,
+                        format!("chunk {piece_index} HTTP {}", status.as_u16()),
+                        route,
+                    )
+                    .await;
 
                 guard.finish_with_upstream_error(
                     status.as_u16(),
@@ -2326,17 +2301,13 @@ impl InteractionsHandler {
                         total_response_bytes += chunk_bytes.len();
                         // Buffer raw bytes
                         if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
-                            let acked_ids = {
-                                let mut store = self.v2_store.write().await;
-                                let ids = store
-                                    .fail_batch(&batch_id, format!("SSE buffer overflow: {e:?}"))
-                                    .unwrap_or_default();
-                                let _ = store.save_to_disk(&self.v2_path).await;
-                                ids
-                            };
-                            for id in &acked_ids {
-                                let _ = self.cancel_interaction(id, route).await;
-                            }
+                            let _ = self
+                                .fail_batch_and_cancel(
+                                    &batch_id,
+                                    format!("SSE buffer overflow: {e:?}"),
+                                    route,
+                                )
+                                .await;
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -2373,20 +2344,13 @@ impl InteractionsHandler {
                             }
                         }
                         if buffer.len() > MAX_SSE_BUFFER_BYTES {
-                            let acked_ids = {
-                                let mut store = self.v2_store.write().await;
-                                let ids = store
-                                    .fail_batch(
-                                        &batch_id,
-                                        "SSE buffer exceeded max line length".to_string(),
-                                    )
-                                    .unwrap_or_default();
-                                let _ = store.save_to_disk(&self.v2_path).await;
-                                ids
-                            };
-                            for id in &acked_ids {
-                                let _ = self.cancel_interaction(id, route).await;
-                            }
+                            let _ = self
+                                .fail_batch_and_cancel(
+                                    &batch_id,
+                                    "SSE buffer exceeded max line length".to_string(),
+                                    route,
+                                )
+                                .await;
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -2398,20 +2362,13 @@ impl InteractionsHandler {
                         }
                     }
                     Err(e) => {
-                        let acked_ids = {
-                            let mut store = self.v2_store.write().await;
-                            let ids = store
-                                .fail_batch(
-                                    &batch_id,
-                                    format!("chunk {piece_index} stream error: {e}"),
-                                )
-                                .unwrap_or_default();
-                            let _ = store.save_to_disk(&self.v2_path).await;
-                            ids
-                        };
-                        for id in &acked_ids {
-                            let _ = self.cancel_interaction(id, route).await;
-                        }
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                &batch_id,
+                                format!("chunk {piece_index} stream error: {e}"),
+                                route,
+                            )
+                            .await;
                         return Err(guard.abort_upstream(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),
@@ -2427,21 +2384,13 @@ impl InteractionsHandler {
             let int_id = match chunk_int_id {
                 Some(id) => id,
                 None => {
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(
-                                &batch_id,
-                                "no interaction.created event in streaming chunk response"
-                                    .to_string(),
-                            )
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            "no interaction.created event in streaming chunk response".to_string(),
+                            route,
+                        )
+                        .await;
                     return Err(guard.abort_internal(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -2534,20 +2483,13 @@ impl InteractionsHandler {
                 let upstream = match builder.body(chunk_body).send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        let acked_ids = {
-                            let mut store = self.v2_store.write().await;
-                            let ids = store
-                                .fail_batch(
-                                    &batch_id,
-                                    format!("chunk {piece_index} send error: {e}"),
-                                )
-                                .unwrap_or_default();
-                            let _ = store.save_to_disk(&self.v2_path).await;
-                            ids
-                        };
-                        for id in &acked_ids {
-                            let _ = self.cancel_interaction(id, route).await;
-                        }
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                &batch_id,
+                                format!("chunk {piece_index} send error: {e}"),
+                                route,
+                            )
+                            .await;
                         return Err(guard.abort_upstream(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),
@@ -2564,20 +2506,13 @@ impl InteractionsHandler {
                     let error_body = upstream.text().await.unwrap_or_default();
 
                     // Fail batch, cancel acked pieces
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(
-                                &batch_id,
-                                format!("chunk {piece_index} HTTP {}", status.as_u16()),
-                            )
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            format!("chunk {piece_index} HTTP {}", status.as_u16()),
+                            route,
+                        )
+                        .await;
 
                     guard.finish_with_upstream_error(
                         status.as_u16(),
@@ -2610,20 +2545,13 @@ impl InteractionsHandler {
                         Ok(chunk_bytes) => {
                             total_response_bytes += chunk_bytes.len();
                             if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
-                                let acked_ids = {
-                                    let mut store = self.v2_store.write().await;
-                                    let ids = store
-                                        .fail_batch(
-                                            &batch_id,
-                                            format!("SSE buffer overflow: {e:?}"),
-                                        )
-                                        .unwrap_or_default();
-                                    let _ = store.save_to_disk(&self.v2_path).await;
-                                    ids
-                                };
-                                for id in &acked_ids {
-                                    let _ = self.cancel_interaction(id, route).await;
-                                }
+                                let _ = self
+                                    .fail_batch_and_cancel(
+                                        &batch_id,
+                                        format!("SSE buffer overflow: {e:?}"),
+                                        route,
+                                    )
+                                    .await;
                                 return Err(guard.abort_upstream(
                                     start.elapsed().as_millis() as u64,
                                     ingress_body.len(),
@@ -2659,20 +2587,13 @@ impl InteractionsHandler {
                                 }
                             }
                             if buffer.len() > MAX_SSE_BUFFER_BYTES {
-                                let acked_ids = {
-                                    let mut store = self.v2_store.write().await;
-                                    let ids = store
-                                        .fail_batch(
-                                            &batch_id,
-                                            "SSE buffer exceeded max line length".to_string(),
-                                        )
-                                        .unwrap_or_default();
-                                    let _ = store.save_to_disk(&self.v2_path).await;
-                                    ids
-                                };
-                                for id in &acked_ids {
-                                    let _ = self.cancel_interaction(id, route).await;
-                                }
+                                let _ = self
+                                    .fail_batch_and_cancel(
+                                        &batch_id,
+                                        "SSE buffer exceeded max line length".to_string(),
+                                        route,
+                                    )
+                                    .await;
                                 return Err(guard.abort_upstream(
                                     start.elapsed().as_millis() as u64,
                                     ingress_body.len(),
@@ -2684,20 +2605,13 @@ impl InteractionsHandler {
                             }
                         }
                         Err(e) => {
-                            let acked_ids = {
-                                let mut store = self.v2_store.write().await;
-                                let ids = store
-                                    .fail_batch(
-                                        &batch_id,
-                                        format!("chunk {piece_index} stream error: {e}"),
-                                    )
-                                    .unwrap_or_default();
-                                let _ = store.save_to_disk(&self.v2_path).await;
-                                ids
-                            };
-                            for id in &acked_ids {
-                                let _ = self.cancel_interaction(id, route).await;
-                            }
+                            let _ = self
+                                .fail_batch_and_cancel(
+                                    &batch_id,
+                                    format!("chunk {piece_index} stream error: {e}"),
+                                    route,
+                                )
+                                .await;
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -2713,21 +2627,14 @@ impl InteractionsHandler {
                 let int_id = match chunk_int_id {
                     Some(id) => id,
                     None => {
-                        let acked_ids = {
-                            let mut store = self.v2_store.write().await;
-                            let ids = store
-                                .fail_batch(
-                                    &batch_id,
-                                    "no interaction.created event in streaming chunk response"
-                                        .to_string(),
-                                )
-                                .unwrap_or_default();
-                            let _ = store.save_to_disk(&self.v2_path).await;
-                            ids
-                        };
-                        for id in &acked_ids {
-                            let _ = self.cancel_interaction(id, route).await;
-                        }
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                &batch_id,
+                                "no interaction.created event in streaming chunk response"
+                                    .to_string(),
+                                route,
+                            )
+                            .await;
                         return Err(guard.abort_internal(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),
@@ -3031,17 +2938,13 @@ impl InteractionsHandler {
             let upstream = match builder.body(chunk_body).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(&batch_id, format!("chunk {piece_index} send error: {e}"))
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            format!("chunk {piece_index} send error: {e}"),
+                            route,
+                        )
+                        .await;
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -3058,20 +2961,13 @@ impl InteractionsHandler {
                 let error_body = upstream.text().await.unwrap_or_default();
 
                 // Fail batch, cancel acked pieces
-                let acked_ids = {
-                    let mut store = self.v2_store.write().await;
-                    let ids = store
-                        .fail_batch(
-                            &batch_id,
-                            format!("chunk {piece_index} HTTP {}", upstream_status.as_u16()),
-                        )
-                        .unwrap_or_default();
-                    let _ = store.save_to_disk(&self.v2_path).await;
-                    ids
-                };
-                for id in &acked_ids {
-                    let _ = self.cancel_interaction(id, route).await;
-                }
+                let _ = self
+                    .fail_batch_and_cancel(
+                        &batch_id,
+                        format!("chunk {piece_index} HTTP {}", upstream_status.as_u16()),
+                        route,
+                    )
+                    .await;
 
                 guard.finish_with_upstream_error(
                     upstream_status.as_u16(),
@@ -3097,20 +2993,13 @@ impl InteractionsHandler {
             let response_bytes = match upstream.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(
-                                &batch_id,
-                                format!("chunk {piece_index} body read error: {e}"),
-                            )
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            format!("chunk {piece_index} body read error: {e}"),
+                            route,
+                        )
+                        .await;
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -3127,20 +3016,13 @@ impl InteractionsHandler {
                 Ok(v) => v,
                 Err((e, dump)) => {
                     guard.response_dump(dump, 502, true, response_headers.clone());
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(
-                                &batch_id,
-                                format!("chunk {piece_index} validation error: {e}"),
-                            )
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            format!("chunk {piece_index} validation error: {e}"),
+                            route,
+                        )
+                        .await;
                     return Err(guard.abort_upstream(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -3156,17 +3038,13 @@ impl InteractionsHandler {
             let interaction: Interaction = match serde_json::from_str(&response_text) {
                 Ok(inter) => inter,
                 Err(e) => {
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(&batch_id, format!("chunk {piece_index} parse error: {e}"))
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            format!("chunk {piece_index} parse error: {e}"),
+                            route,
+                        )
+                        .await;
                     return Err(guard.abort_internal(
                         start.elapsed().as_millis() as u64,
                         ingress_body.len(),
@@ -3260,20 +3138,13 @@ impl InteractionsHandler {
                 let upstream = match builder.body(chunk_body).send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        let acked_ids = {
-                            let mut store = self.v2_store.write().await;
-                            let ids = store
-                                .fail_batch(
-                                    &batch_id,
-                                    format!("chunk {piece_index} send error: {e}"),
-                                )
-                                .unwrap_or_default();
-                            let _ = store.save_to_disk(&self.v2_path).await;
-                            ids
-                        };
-                        for id in &acked_ids {
-                            let _ = self.cancel_interaction(id, route).await;
-                        }
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                &batch_id,
+                                format!("chunk {piece_index} send error: {e}"),
+                                route,
+                            )
+                            .await;
                         return Err(guard.abort_upstream(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),
@@ -3290,20 +3161,13 @@ impl InteractionsHandler {
                     let error_body = upstream.text().await.unwrap_or_default();
 
                     // Fail batch, cancel acked pieces
-                    let acked_ids = {
-                        let mut store = self.v2_store.write().await;
-                        let ids = store
-                            .fail_batch(
-                                &batch_id,
-                                format!("chunk {piece_index} HTTP {}", upstream_status.as_u16()),
-                            )
-                            .unwrap_or_default();
-                        let _ = store.save_to_disk(&self.v2_path).await;
-                        ids
-                    };
-                    for id in &acked_ids {
-                        let _ = self.cancel_interaction(id, route).await;
-                    }
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            &batch_id,
+                            format!("chunk {piece_index} HTTP {}", upstream_status.as_u16()),
+                            route,
+                        )
+                        .await;
 
                     guard.finish_with_upstream_error(
                         upstream_status.as_u16(),
@@ -3330,20 +3194,13 @@ impl InteractionsHandler {
                 let response_bytes = match upstream.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
-                        let acked_ids = {
-                            let mut store = self.v2_store.write().await;
-                            let ids = store
-                                .fail_batch(
-                                    &batch_id,
-                                    format!("chunk {piece_index} body read error: {e}"),
-                                )
-                                .unwrap_or_default();
-                            let _ = store.save_to_disk(&self.v2_path).await;
-                            ids
-                        };
-                        for id in &acked_ids {
-                            let _ = self.cancel_interaction(id, route).await;
-                        }
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                &batch_id,
+                                format!("chunk {piece_index} body read error: {e}"),
+                                route,
+                            )
+                            .await;
                         return Err(guard.abort_upstream(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),
@@ -3360,20 +3217,13 @@ impl InteractionsHandler {
                         Ok(v) => v,
                         Err((e, dump)) => {
                             guard.response_dump(dump, 502, true, response_headers.clone());
-                            let acked_ids = {
-                                let mut store = self.v2_store.write().await;
-                                let ids = store
-                                    .fail_batch(
-                                        &batch_id,
-                                        format!("chunk {piece_index} validation error: {e}"),
-                                    )
-                                    .unwrap_or_default();
-                                let _ = store.save_to_disk(&self.v2_path).await;
-                                ids
-                            };
-                            for id in &acked_ids {
-                                let _ = self.cancel_interaction(id, route).await;
-                            }
+                            let _ = self
+                                .fail_batch_and_cancel(
+                                    &batch_id,
+                                    format!("chunk {piece_index} validation error: {e}"),
+                                    route,
+                                )
+                                .await;
                             return Err(guard.abort_upstream(
                                 start.elapsed().as_millis() as u64,
                                 ingress_body.len(),
@@ -3389,20 +3239,13 @@ impl InteractionsHandler {
                 let interaction: Interaction = match serde_json::from_str(&response_text) {
                     Ok(inter) => inter,
                     Err(e) => {
-                        let acked_ids = {
-                            let mut store = self.v2_store.write().await;
-                            let ids = store
-                                .fail_batch(
-                                    &batch_id,
-                                    format!("chunk {piece_index} parse error: {e}"),
-                                )
-                                .unwrap_or_default();
-                            let _ = store.save_to_disk(&self.v2_path).await;
-                            ids
-                        };
-                        for id in &acked_ids {
-                            let _ = self.cancel_interaction(id, route).await;
-                        }
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                &batch_id,
+                                format!("chunk {piece_index} parse error: {e}"),
+                                route,
+                            )
+                            .await;
                         return Err(guard.abort_internal(
                             start.elapsed().as_millis() as u64,
                             ingress_body.len(),

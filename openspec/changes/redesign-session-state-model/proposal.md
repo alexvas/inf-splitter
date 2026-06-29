@@ -106,6 +106,7 @@ struct InFlightBatch {
     session_id: String,
     prev_interaction_id: Option<String>,
     message_hashes: Vec<u64>,
+    system_instruction_hash: Option<u64>,
     pieces: Vec<InFlightPiece>,
     created_utc: u64,
     updated_utc: u64,

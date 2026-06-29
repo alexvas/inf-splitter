@@ -2227,4 +2227,55 @@ mod tests {
             frontier.matched_client_id
         );
     }
+
+    #[test]
+    fn frontier_rejects_collision_by_chain_order() {
+        let mut store = InteractionStore::new();
+
+        // Node A: prev_id=None, hashes=[0xA, 0xB]
+        // Node B: prev_id=Some("int-Z"), hashes=[0xC, 0xB] ← 0xB collision with A
+        // Both share hash 0xB at index 1, but differ at index 0
+        store.insert_client(make_client_node(
+            "int-A",
+            None,
+            vec![0xA, 0xB],
+            vec!["up-A"],
+        ));
+        store.insert_client(make_client_node(
+            "int-B",
+            Some("int-Z"),
+            vec![0xC, 0xB],
+            vec!["up-B"],
+        ));
+
+        // Client sends [0xA, 0xB]
+        // hash_index lookup:
+        //   0xA → [pos(int-A, 0)]
+        //   0xB → [pos(int-A, 1), pos(int-B, 1)]
+        //
+        // Outer loop iterates candidates[0] (0xA lookups): only int-A
+        // Chain validation on int-A:
+        //   - message_hashes[0] = 0xA == hashes[0] ✓
+        //   - message_hashes[1] = 0xB == hashes[1] ✓
+        //   → prefix_len=2, all_known=true
+        //
+        // int-B is never visited (its index-0 hash is 0xC, not 0xA)
+        let frontier = find_frontier(&[0xA, 0xB], None, None, &store);
+
+        assert_eq!(
+            frontier.matched_client_id.as_deref(),
+            Some("int-A"),
+            "must select int-A (chain order match), got {:?}",
+            frontier.matched_client_id
+        );
+        assert_eq!(
+            frontier.index, 2,
+            "must match both hashes, got {}",
+            frontier.index
+        );
+        assert!(
+            frontier.all_known,
+            "all hashes match a client chain, must be all_known=true"
+        );
+    }
 }

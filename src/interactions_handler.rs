@@ -3699,7 +3699,9 @@ impl InteractionsHandler {
             &HeaderMap::new(),
         );
         match builder.send().await {
-            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND => {
+                Ok(())
+            }
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -7056,6 +7058,63 @@ If you don't know the answer, say so honestly.";
             replay_response.status(),
             200,
             "GREEN: replay must return 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_interaction_tolerates_404() {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        // Mock upstream: POST /int-X/cancel returns 404
+        async fn cancel_handler() -> impl axum::response::IntoResponse {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": "not found"})),
+            )
+        }
+
+        let app = Router::new().route("/{*path}", post(cancel_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let handler = super::InteractionsHandler {
+            clients: std::collections::HashMap::from([("".into(), reqwest::Client::new())]),
+            diagnostics: crate::diagnostics::Diagnostics::new(
+                crate::diagnostics::DiagnosticsConfig::default(),
+            ),
+            v2_store: Arc::new(tokio::sync::RwLock::new(crate::session::StoreV2::new())),
+            v2_path: Arc::new(std::path::PathBuf::from(
+                "/tmp/inf-splitter-test-cancel-404.toml",
+            )),
+            error_translation: Arc::new([]),
+        };
+
+        let route = crate::config::RouteTarget {
+            section: "test".into(),
+            endpoint_openai: None,
+            endpoint_anthropic: None,
+            endpoint_interactions: Some(format!("http://{addr}")),
+            api_key: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            model_names: ["test-model"].iter().map(|&s| s.into()).collect(),
+            drop_fields: Default::default(),
+            proxy: None,
+            proxy_limit: None,
+            control_clean_all: None,
+            control_extend_lifetime: None,
+        };
+
+        let result = handler.cancel_interaction("int-X", &route).await;
+
+        assert!(
+            result.is_ok(),
+            "cancel_interaction must tolerate 404, got Err: {:?}",
+            result
         );
     }
 }

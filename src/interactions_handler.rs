@@ -1637,19 +1637,8 @@ impl InteractionsHandler {
                 )
             })?;
 
-            // Update piece body and mark ResponseStarted
-            {
-                let mut store = self.v2_store.write().await;
-                if let Err(e) = store.set_piece_body(&batch_id, i, chunk_body.clone()) {
-                    tracing::warn!(error = %e, "set_piece_body failed");
-                }
-                if let Err(e) = store.mark_response_started(&batch_id, i) {
-                    tracing::warn!(error = %e, "mark_response_started failed");
-                }
-                if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                    tracing::warn!(error = %e, "v2 store save failed before chunk send");
-                }
-            }
+            self.mark_started_and_persist(&batch_id, i, &chunk_body)
+                .await;
 
             guard.egress_dump(&chunk_body, &egress_headers);
 
@@ -2210,19 +2199,8 @@ impl InteractionsHandler {
 
             guard.egress_dump(&chunk_body, &egress_headers);
 
-            // InFlightStore: update piece body, mark ResponseStarted
-            {
-                let mut store = self.v2_store.write().await;
-                if let Err(e) = store.set_piece_body(&batch_id, piece_index, chunk_body.clone()) {
-                    tracing::warn!(error = %e, "set_piece_body failed");
-                }
-                if let Err(e) = store.mark_response_started(&batch_id, piece_index) {
-                    tracing::warn!(error = %e, "mark_response_started failed");
-                }
-                if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                    tracing::warn!(error = %e, "v2 store save failed before chunk send");
-                }
-            }
+            self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
+                .await;
 
             let builder = build_interactions_headers(
                 self.get_client(route.proxy.as_deref())
@@ -2453,20 +2431,8 @@ impl InteractionsHandler {
 
                 guard.egress_dump(&chunk_body, &egress_headers);
 
-                // InFlightStore: update piece body, mark ResponseStarted
-                {
-                    let mut store = self.v2_store.write().await;
-                    if let Err(e) = store.set_piece_body(&batch_id, piece_index, chunk_body.clone())
-                    {
-                        tracing::warn!(error = %e, "set_piece_body failed");
-                    }
-                    if let Err(e) = store.mark_response_started(&batch_id, piece_index) {
-                        tracing::warn!(error = %e, "mark_response_started failed");
-                    }
-                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                        tracing::warn!(error = %e, "v2 store save failed before chunk send");
-                    }
-                }
+                self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
+                    .await;
 
                 let builder = build_interactions_headers(
                     self.get_client(route.proxy.as_deref())
@@ -2902,19 +2868,8 @@ impl InteractionsHandler {
 
             guard.egress_dump(&chunk_body, &egress_headers);
 
-            // InFlightStore: update piece body, mark ResponseStarted
-            {
-                let mut store = self.v2_store.write().await;
-                if let Err(e) = store.set_piece_body(&batch_id, piece_index, chunk_body.clone()) {
-                    tracing::warn!(error = %e, "set_piece_body failed");
-                }
-                if let Err(e) = store.mark_response_started(&batch_id, piece_index) {
-                    tracing::warn!(error = %e, "mark_response_started failed");
-                }
-                if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                    tracing::warn!(error = %e, "v2 store save failed before chunk send");
-                }
-            }
+            self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
+                .await;
 
             let builder = build_interactions_headers(
                 self.get_client(route.proxy.as_deref())
@@ -3101,20 +3056,8 @@ impl InteractionsHandler {
 
                 guard.egress_dump(&chunk_body, &egress_headers);
 
-                // InFlightStore: update piece body, mark ResponseStarted
-                {
-                    let mut store = self.v2_store.write().await;
-                    if let Err(e) = store.set_piece_body(&batch_id, piece_index, chunk_body.clone())
-                    {
-                        tracing::warn!(error = %e, "set_piece_body failed");
-                    }
-                    if let Err(e) = store.mark_response_started(&batch_id, piece_index) {
-                        tracing::warn!(error = %e, "mark_response_started failed");
-                    }
-                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                        tracing::warn!(error = %e, "v2 store save failed before chunk send");
-                    }
-                }
+                self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
+                    .await;
 
                 let builder = build_interactions_headers(
                     self.get_client(route.proxy.as_deref())
@@ -3782,6 +3725,25 @@ impl InteractionsHandler {
         }
         let sse_bytes = sse_buffer.drain();
         Self::translate_buffered_sse_to_client(&sse_bytes, ingress, model)
+    }
+
+    /// Set piece body, mark response started, and persist store to disk.
+    async fn mark_started_and_persist(
+        &self,
+        batch_id: &str,
+        piece_index: usize,
+        chunk_body: &[u8],
+    ) {
+        let mut store = self.v2_store.write().await;
+        if let Err(e) = store.set_piece_body(batch_id, piece_index, chunk_body.to_vec()) {
+            tracing::warn!(error = %e, "set_piece_body failed");
+        }
+        if let Err(e) = store.mark_response_started(batch_id, piece_index) {
+            tracing::warn!(error = %e, "mark_response_started failed");
+        }
+        if let Err(e) = store.save_to_disk(&self.v2_path).await {
+            tracing::warn!(error = %e, "v2 store save failed before chunk send");
+        }
     }
 
     fn streaming_response_from_interaction(

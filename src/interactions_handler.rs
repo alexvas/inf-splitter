@@ -1957,24 +1957,19 @@ impl InteractionsHandler {
             // Streaming split-send: substitute intermediate interaction IDs with final,
             // translate buffered SSE to client protocol, drain as one coherent stream.
             let final_id = &client_node.id;
-            let mut sse_buf = sse_buffer.take().unwrap();
-            for int_id in &all_int_ids {
-                if int_id != final_id {
-                    sse_buf.substitute_id(int_id, final_id);
-                }
-            }
-            let sse_bytes = sse_buf.drain();
-            let translated = Self::translate_buffered_sse_to_client(&sse_bytes, ingress, model)
-                .map_err(|e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    )
-                })?;
+            let sse_buf = sse_buffer.take().unwrap();
+            let translated =
+                Self::capture_and_translate_sse(sse_buf, &all_int_ids, final_id, ingress, model)
+                    .map_err(|e| {
+                        guard.abort_internal(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            stream,
+                            e,
+                        )
+                    })?;
 
             guard.finish(
                 200,
@@ -2670,25 +2665,18 @@ impl InteractionsHandler {
         let final_id =
             final_id.ok_or_else(|| AppError::Internal("no final interaction id".to_string()))?;
 
-        // Substitute all intermediate interaction IDs with final ID
-        for int_id in &all_int_ids {
-            if int_id != &final_id {
-                sse_buffer.substitute_id(int_id, &final_id);
-            }
-        }
-
-        let sse_bytes = sse_buffer.drain();
-        let translated = Self::translate_buffered_sse_to_client(&sse_bytes, ingress, model)
-            .map_err(|e| {
-                guard.abort_internal(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    true,
-                    e,
-                )
-            })?;
+        let translated =
+            Self::capture_and_translate_sse(sse_buffer, &all_int_ids, &final_id, ingress, model)
+                .map_err(|e| {
+                    guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        e,
+                    )
+                })?;
 
         // Complete batch: InFlightStore creates ClientInteractionNode
         {
@@ -3776,6 +3764,24 @@ impl InteractionsHandler {
         }
 
         Ok(out)
+    }
+
+    /// Substitute intermediate interaction IDs with final ID in SSE buffer,
+    /// drain, and translate to client protocol.
+    fn capture_and_translate_sse(
+        mut sse_buffer: sse::MemSseBuffer,
+        all_int_ids: &[String],
+        final_id: &str,
+        ingress: Protocol,
+        model: &str,
+    ) -> Result<Vec<u8>, String> {
+        for int_id in all_int_ids {
+            if int_id != final_id {
+                sse_buffer.substitute_id(int_id, final_id);
+            }
+        }
+        let sse_bytes = sse_buffer.drain();
+        Self::translate_buffered_sse_to_client(&sse_bytes, ingress, model)
     }
 
     fn streaming_response_from_interaction(

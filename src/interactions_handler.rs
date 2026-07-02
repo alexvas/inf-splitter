@@ -1881,19 +1881,7 @@ impl InteractionsHandler {
             }
             current_prev = Some(interaction_id.clone());
 
-            // Mark Acked
-            {
-                let mut store = self.v2_store.write().await;
-                if let Err(e) = store.mark_sent(&batch_id, i, interaction_id.clone()) {
-                    tracing::warn!(error = %e, "mark_sent failed");
-                }
-                if let Err(e) = store.ack_piece(&batch_id, i, interaction_id.clone()) {
-                    tracing::warn!(error = %e, "ack_piece failed");
-                }
-                if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                    tracing::warn!(error = %e, "v2 store save failed after chunk ack");
-                }
-            }
+            self.ack_and_persist(&batch_id, i, &interaction_id).await;
 
             // After first chunk, rebuild subsequent_envelope with real prev_id
             if i == 0 {
@@ -2379,19 +2367,7 @@ impl InteractionsHandler {
             all_int_ids.push(int_id.clone());
             current_prev = Some(int_id.clone());
 
-            // InFlightStore: mark sent and acked
-            {
-                let mut store = self.v2_store.write().await;
-                if let Err(e) = store.mark_sent(&batch_id, piece_index, int_id.clone()) {
-                    tracing::warn!(error = %e, "mark_sent failed");
-                }
-                if let Err(e) = store.ack_piece(&batch_id, piece_index, int_id.clone()) {
-                    tracing::warn!(error = %e, "ack_piece failed");
-                }
-                if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                    tracing::warn!(error = %e, "v2 store save failed after chunk ack");
-                }
-            }
+            self.ack_and_persist(&batch_id, piece_index, &int_id).await;
 
             piece_index += 1;
         }
@@ -2610,19 +2586,7 @@ impl InteractionsHandler {
                 all_int_ids.push(int_id.clone());
                 current_prev = Some(int_id.clone());
 
-                // InFlightStore: mark sent and acked
-                {
-                    let mut store = self.v2_store.write().await;
-                    if let Err(e) = store.mark_sent(&batch_id, piece_index, int_id.clone()) {
-                        tracing::warn!(error = %e, "mark_sent failed");
-                    }
-                    if let Err(e) = store.ack_piece(&batch_id, piece_index, int_id.clone()) {
-                        tracing::warn!(error = %e, "ack_piece failed");
-                    }
-                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                        tracing::warn!(error = %e, "v2 store save failed after chunk ack");
-                    }
-                }
+                self.ack_and_persist(&batch_id, piece_index, &int_id).await;
 
                 piece_index += 1;
             }
@@ -3004,19 +2968,7 @@ impl InteractionsHandler {
             last_id = Some(int_id.clone());
             last_interaction = Some(interaction);
 
-            // InFlightStore: mark sent and acked
-            {
-                let mut store = self.v2_store.write().await;
-                if let Err(e) = store.mark_sent(&batch_id, piece_index, int_id.clone()) {
-                    tracing::warn!(error = %e, "mark_sent failed");
-                }
-                if let Err(e) = store.ack_piece(&batch_id, piece_index, int_id.clone()) {
-                    tracing::warn!(error = %e, "ack_piece failed");
-                }
-                if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                    tracing::warn!(error = %e, "v2 store save failed after chunk ack");
-                }
-            }
+            self.ack_and_persist(&batch_id, piece_index, &int_id).await;
 
             piece_index += 1;
         }
@@ -3193,19 +3145,7 @@ impl InteractionsHandler {
                 all_int_ids.push(interaction.id.clone());
                 last_interaction = Some(interaction);
 
-                // InFlightStore: mark sent and acked
-                {
-                    let mut store = self.v2_store.write().await;
-                    if let Err(e) = store.mark_sent(&batch_id, piece_index, int_id.clone()) {
-                        tracing::warn!(error = %e, "mark_sent failed");
-                    }
-                    if let Err(e) = store.ack_piece(&batch_id, piece_index, int_id.clone()) {
-                        tracing::warn!(error = %e, "ack_piece failed");
-                    }
-                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                        tracing::warn!(error = %e, "v2 store save failed after chunk ack");
-                    }
-                }
+                self.ack_and_persist(&batch_id, piece_index, &int_id).await;
 
                 piece_index += 1;
             }
@@ -3743,6 +3683,20 @@ impl InteractionsHandler {
         }
         if let Err(e) = store.save_to_disk(&self.v2_path).await {
             tracing::warn!(error = %e, "v2 store save failed before chunk send");
+        }
+    }
+
+    /// Mark piece as sent and acked, persist store to disk.
+    async fn ack_and_persist(&self, batch_id: &str, piece_index: usize, int_id: &str) {
+        let mut store = self.v2_store.write().await;
+        if let Err(e) = store.mark_sent(batch_id, piece_index, int_id.to_string()) {
+            tracing::warn!(error = %e, "mark_sent failed");
+        }
+        if let Err(e) = store.ack_piece(batch_id, piece_index, int_id.to_string()) {
+            tracing::warn!(error = %e, "ack_piece failed");
+        }
+        if let Err(e) = store.save_to_disk(&self.v2_path).await {
+            tracing::warn!(error = %e, "v2 store save failed after chunk ack");
         }
     }
 

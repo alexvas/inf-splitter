@@ -1906,29 +1906,20 @@ impl InteractionsHandler {
             }
         }
 
-        // Complete batch: insert UpstreamInteractionNodes + ClientInteractionNode
-        let client_node = {
-            let mut store = self.v2_store.write().await;
-            match store.complete_batch(&batch_id) {
-                Ok(node) => {
-                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                        tracing::warn!(error = %e, "v2 store save failed after batch completion");
-                    }
-                    node
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "complete_batch failed");
-                    return Err(guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    ));
-                }
-            }
-        };
+        let client_node = self
+            .complete_batch_and_persist(&batch_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "complete_batch failed");
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    stream,
+                    e,
+                )
+            })?;
 
         if stream {
             // Streaming split-send: substitute intermediate interaction IDs with final,
@@ -2608,27 +2599,19 @@ impl InteractionsHandler {
                     )
                 })?;
 
-        // Complete batch: InFlightStore creates ClientInteractionNode
-        {
-            let mut store = self.v2_store.write().await;
-            match store.complete_batch(&batch_id) {
-                Ok(_node) => {
-                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                        tracing::warn!(error = %e, "v2 store save after batch completion");
-                    }
-                }
-                Err(e) => {
-                    return Err(guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        true,
-                        e,
-                    ));
-                }
-            }
-        }
+        let _node = self
+            .complete_batch_and_persist(&batch_id)
+            .await
+            .map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    e,
+                )
+            })?;
 
         // Update session with final interaction_id
         {
@@ -3151,28 +3134,19 @@ impl InteractionsHandler {
             }
         }
 
-        // Complete batch: InFlightStore creates ClientInteractionNode
-        let _client_node = {
-            let mut store = self.v2_store.write().await;
-            match store.complete_batch(&batch_id) {
-                Ok(node) => {
-                    if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                        tracing::warn!(error = %e, "v2 store save failed after batch completion");
-                    }
-                    node
-                }
-                Err(e) => {
-                    return Err(guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    ));
-                }
-            }
-        };
+        let _client_node = self
+            .complete_batch_and_persist(&batch_id)
+            .await
+            .map_err(|e| {
+                guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    stream,
+                    e,
+                )
+            })?;
 
         // Update session with final interaction_id
         {
@@ -3697,6 +3671,23 @@ impl InteractionsHandler {
         }
         if let Err(e) = store.save_to_disk(&self.v2_path).await {
             tracing::warn!(error = %e, "v2 store save failed after chunk ack");
+        }
+    }
+
+    /// Complete batch and persist store to disk.
+    async fn complete_batch_and_persist(
+        &self,
+        batch_id: &str,
+    ) -> Result<session::ClientInteractionNode, String> {
+        let mut store = self.v2_store.write().await;
+        match store.complete_batch(batch_id) {
+            Ok(node) => {
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save failed after batch completion");
+                }
+                Ok(node)
+            }
+            Err(e) => Err(e),
         }
     }
 

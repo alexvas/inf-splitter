@@ -1,0 +1,11 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Rust
+
+rules:
+  proposal:
+    - Keep proposals under 200 words
+    - Include a "Non-goals" section if fits
+  tasks:
+    - "use TDD: RED (tests) -> GREEN (add or fix production code) -> INTROSPECT -> REFINE -> VERIFY"

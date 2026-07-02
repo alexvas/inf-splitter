@@ -50,6 +50,5 @@ All three checks (`fmt`, `clippy`, `test`) must pass before merging. CI runs the
 
 - No authentication on ingress (by design, not accidental)
 - No admin UI or management endpoints beyond `/health`
-- No LiteLLM YAML compatibility layer
 - OS packaging: Linux (.deb via systemd), Windows (zip via WinSW)
 - Docker is a supported deployment target

@@ -905,6 +905,20 @@ The proxy_limit check in system-instruction splitting must measure the full seri
 - AND no subsequent chunk is sent with stale `previous_interaction_id`
 - AND the client receives an appropriate error
 
+## Requirement: Split System Instruction Send Planning
+
+Interactions split-send for oversized system instructions SHALL build one ordered plan for all split pieces before sending upstream. Each planned piece SHALL define its input content, optional system instruction fragment, and whether tools and generation configuration are included. Streaming and non-streaming split-send paths SHALL consume the same plan order when constructing upstream chunk requests.
+
+### Scenario: Streaming and non-streaming use same piece order
+- **WHEN** an interactions request has a system instruction that must be split and multiple content chunks remain
+- **THEN** both streaming and non-streaming split-send construct pieces in this order: each system-instruction fragment first, the first content chunk attached to the final system-instruction piece when present, then remaining content chunks
+- **AND** only the first planned piece includes tools and generation configuration
+
+### Scenario: Planned piece count drives in-flight batch
+- **WHEN** a split system-instruction request creates an in-flight batch
+- **THEN** the batch piece count matches the number of planned split pieces
+- **AND** each sent piece uses its plan index for mark-started and acknowledgement updates
+
 ## Requirement: compute_delta Empty Delta for Exact Retries
 
 When `compute_delta` returns an empty delta (`start_index == ingress_count`) and `previous_interaction_id` is `Some`, the handler must fetch the existing interaction via `GET /v1beta/interactions/{id}` and return its result instead of sending an empty `ContentList` upstream.

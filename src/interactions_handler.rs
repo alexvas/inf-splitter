@@ -1990,504 +1990,11 @@ impl InteractionsHandler {
         }
     }
 
-    /// Split system_instruction across multiple streaming interactions, buffer
-    /// raw SSE in sse::MemSseBuffer, substitute intermediate interaction IDs with
-    /// the final ID, translate to client protocol, and drain.
-    #[allow(clippy::too_many_arguments)]
-    async fn send_split_system_instruction_streaming(
-        &self,
-        sys: &str,
-        url: &str,
-        route: &RouteTarget,
-        session_id: &str,
-        chunks: &[Vec<crate::interactions_types::Content>],
-        harness_hashes: Vec<u64>,
-        prev_interaction_id: Option<String>,
-        limit: usize,
-        model: &str,
-        upstream_label: &str,
-        ingress_body: &[u8],
-        direction: &str,
-        request_headers: &HeaderMap,
-        ingress: Protocol,
-        guard: crate::diagnostics::RequestDiagnostics,
-        tools: Option<Vec<crate::interactions_types::Tool>>,
-        generation_config: Option<crate::interactions_types::GenerationConfig>,
-    ) -> Result<Response, AppError> {
-        let start = std::time::Instant::now();
-        let mut total_response_bytes: usize = 0;
-        let egress_headers =
-            build_interactions_headers_map(route.api_key.as_deref(), request_headers);
-        let system_instruction_hash =
-            compute_system_hash(prev_interaction_id.as_deref(), Some(sys));
-        // Split system_instruction on natural boundaries, accounting for
-        // envelope overhead (model, previous_interaction_id, stream, etc.)
-        let envelope_overhead = {
-            let dummy = crate::interactions::build_chunk_request(
-                model,
-                vec![],
-                Some(String::new()),
-                prev_interaction_id.clone(),
-                true,
-            );
-            serde_json::to_vec(&dummy).map(|v| v.len()).unwrap_or(0)
-        };
-        let sys_parts = match split_text_for_limit(sys, limit, envelope_overhead) {
-            Ok(parts) => parts,
-            Err(msg) => {
-                return Err(guard.abort_bad_request(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    true,
-                    msg,
-                ));
-            }
-        };
-        let mut current_prev: Option<String> = prev_interaction_id.clone();
-        let mut all_int_ids: Vec<String> = Vec::new();
-        let mut sse_buffer = sse::MemSseBuffer::with_limit(sse::DEFAULT_SSE_BUFFER_LIMIT);
-        let mut final_id: Option<String> = None;
-        let mut piece_index: usize = 0;
-
-        // Compute total piece count for InFlightStore batch
-        let extra_chunks = if chunks.len() > 1 {
-            chunks.len() - 1
-        } else {
-            0
-        };
-        let total_pieces = sys_parts.len() + extra_chunks;
-        let batch_id = format!("batch-{}-{}", session_id, crate::session::unix_now());
-        {
-            let pieces: Vec<session::InFlightPiece> = (0..total_pieces)
-                .map(|i| session::InFlightPiece {
-                    index: i,
-                    content_hash: 0,
-                    request_body: vec![],
-                    status: session::InFlightStatus::Pending,
-                })
-                .collect();
-            let mut store = self.v2_store.write().await;
-            store.create_batch(
-                batch_id.clone(),
-                session_id.to_string(),
-                prev_interaction_id.clone(),
-                harness_hashes.clone(),
-                system_instruction_hash,
-                pieces,
-            );
-            if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                tracing::warn!(error = %e, "v2 store save failed after batch creation");
-            }
-        }
-
-        // Send system_instruction chunks as streaming requests
-        for (i, part) in sys_parts.iter().enumerate() {
-            let is_first_chunk = i == 0;
-            let is_last_sys = i == sys_parts.len() - 1;
-            let input_for_chunk = if is_last_sys && !chunks.is_empty() {
-                chunks[0].clone()
-            } else {
-                vec![]
-            };
-            let mut chunk_req = interactions_lib::build_chunk_request(
-                model,
-                input_for_chunk,
-                Some(part.clone()),
-                current_prev.clone(),
-                true,
-            );
-            if is_first_chunk {
-                chunk_req.tools = tools.clone();
-                chunk_req.generation_config = generation_config.clone();
-            }
-            let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
-                guard.abort_internal(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    true,
-                    e,
-                )
-            })?;
-            let df = route.drop_fields.for_model(model);
-            crate::drop_fields_from_value(&mut chunk_body_value, &df);
-            let chunk_body = serde_json::to_vec(&chunk_body_value).map_err(|e| {
-                guard.abort_internal(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    true,
-                    e,
-                )
-            })?;
-
-            guard.egress_dump(&chunk_body, &egress_headers);
-
-            self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
-                .await;
-
-            let upstream = match self
-                .send_chunk(
-                    chunk_body,
-                    url,
-                    route,
-                    &batch_id,
-                    session_id,
-                    ingress,
-                    piece_index,
-                    request_headers,
-                    &guard,
-                    start,
-                    ingress_body,
-                    upstream_label,
-                    direction,
-                    true,
-                )
-                .await
-            {
-                SendChunkOutcome::Success(u, _) => u,
-                SendChunkOutcome::Return(r) => return r,
-            };
-
-            // Read SSE stream from this chunk, buffer in MemSseBuffer
-            let mut byte_stream = upstream.bytes_stream();
-            let mut buffer = String::new();
-            let mut chunk_int_id: Option<String> = None;
-            while let Some(chunk_result) = byte_stream.next().await {
-                match chunk_result {
-                    Ok(chunk_bytes) => {
-                        total_response_bytes += chunk_bytes.len();
-                        // Buffer raw bytes
-                        if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
-                            let _ = self
-                                .fail_batch_and_cancel(
-                                    &batch_id,
-                                    format!("SSE buffer overflow: {e:?}"),
-                                    route,
-                                )
-                                .await;
-                            return Err(guard.abort_upstream(
-                                start.elapsed().as_millis() as u64,
-                                ingress_body.len(),
-                                upstream_label,
-                                direction,
-                                true,
-                                format!("SSE buffer overflow: {:?}", e),
-                            ));
-                        }
-                        // Parse to find interaction.created event
-                        if std::str::from_utf8(&chunk_bytes).is_err() {
-                            continue;
-                        }
-                        buffer.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
-                        if let Some(id) = Self::parse_sse_for_interaction_id(&mut buffer) {
-                            chunk_int_id = Some(id);
-                        }
-                        if buffer.len() > MAX_SSE_BUFFER_BYTES {
-                            let _ = self
-                                .fail_batch_and_cancel(
-                                    &batch_id,
-                                    "SSE buffer exceeded max line length".to_string(),
-                                    route,
-                                )
-                                .await;
-                            return Err(guard.abort_upstream(
-                                start.elapsed().as_millis() as u64,
-                                ingress_body.len(),
-                                upstream_label,
-                                direction,
-                                true,
-                                "SSE buffer exceeded max line length",
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        let _ = self
-                            .fail_batch_and_cancel(
-                                &batch_id,
-                                format!("chunk {piece_index} stream error: {e}"),
-                                route,
-                            )
-                            .await;
-                        return Err(guard.abort_upstream(
-                            start.elapsed().as_millis() as u64,
-                            ingress_body.len(),
-                            upstream_label,
-                            direction,
-                            true,
-                            e,
-                        ));
-                    }
-                }
-            }
-
-            let int_id = match chunk_int_id {
-                Some(id) => id,
-                None => {
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            "no interaction.created event in streaming chunk response".to_string(),
-                            route,
-                        )
-                        .await;
-                    return Err(guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        true,
-                        "no interaction.created event in streaming chunk response",
-                    ));
-                }
-            };
-
-            final_id = Some(int_id.clone());
-            all_int_ids.push(int_id.clone());
-            current_prev = Some(int_id.clone());
-
-            self.ack_and_persist(&batch_id, piece_index, &int_id).await;
-
-            piece_index += 1;
-        }
-
-        // Send remaining content chunks as streaming
-        if chunks.len() > 1 {
-            for chunk in chunks.iter().skip(1) {
-                let chunk_req = interactions_lib::build_chunk_request(
-                    model,
-                    chunk.clone(),
-                    None,
-                    current_prev.clone(),
-                    true,
-                );
-                let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        true,
-                        e,
-                    )
-                })?;
-                let df = route.drop_fields.for_model(model);
-                crate::drop_fields_from_value(&mut chunk_body_value, &df);
-                let chunk_body = serde_json::to_vec(&chunk_body_value).map_err(|e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        true,
-                        e,
-                    )
-                })?;
-
-                guard.egress_dump(&chunk_body, &egress_headers);
-
-                self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
-                    .await;
-
-                let upstream = match self
-                    .send_chunk(
-                        chunk_body,
-                        url,
-                        route,
-                        &batch_id,
-                        session_id,
-                        ingress,
-                        piece_index,
-                        request_headers,
-                        &guard,
-                        start,
-                        ingress_body,
-                        upstream_label,
-                        direction,
-                        true,
-                    )
-                    .await
-                {
-                    SendChunkOutcome::Success(u, _) => u,
-                    SendChunkOutcome::Return(r) => return r,
-                };
-
-                let mut byte_stream = upstream.bytes_stream();
-                let mut buffer = String::new();
-                let mut chunk_int_id: Option<String> = None;
-                while let Some(chunk_result) = byte_stream.next().await {
-                    match chunk_result {
-                        Ok(chunk_bytes) => {
-                            total_response_bytes += chunk_bytes.len();
-                            if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
-                                let _ = self
-                                    .fail_batch_and_cancel(
-                                        &batch_id,
-                                        format!("SSE buffer overflow: {e:?}"),
-                                        route,
-                                    )
-                                    .await;
-                                return Err(guard.abort_upstream(
-                                    start.elapsed().as_millis() as u64,
-                                    ingress_body.len(),
-                                    upstream_label,
-                                    direction,
-                                    true,
-                                    format!("SSE buffer overflow: {:?}", e),
-                                ));
-                            }
-                            if std::str::from_utf8(&chunk_bytes).is_err() {
-                                continue;
-                            }
-                            buffer.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
-                            if let Some(id) = Self::parse_sse_for_interaction_id(&mut buffer) {
-                                chunk_int_id = Some(id);
-                            }
-                            if buffer.len() > MAX_SSE_BUFFER_BYTES {
-                                let _ = self
-                                    .fail_batch_and_cancel(
-                                        &batch_id,
-                                        "SSE buffer exceeded max line length".to_string(),
-                                        route,
-                                    )
-                                    .await;
-                                return Err(guard.abort_upstream(
-                                    start.elapsed().as_millis() as u64,
-                                    ingress_body.len(),
-                                    upstream_label,
-                                    direction,
-                                    true,
-                                    "SSE buffer exceeded max line length",
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            let _ = self
-                                .fail_batch_and_cancel(
-                                    &batch_id,
-                                    format!("chunk {piece_index} stream error: {e}"),
-                                    route,
-                                )
-                                .await;
-                            return Err(guard.abort_upstream(
-                                start.elapsed().as_millis() as u64,
-                                ingress_body.len(),
-                                upstream_label,
-                                direction,
-                                true,
-                                e,
-                            ));
-                        }
-                    }
-                }
-
-                let int_id = match chunk_int_id {
-                    Some(id) => id,
-                    None => {
-                        let _ = self
-                            .fail_batch_and_cancel(
-                                &batch_id,
-                                "no interaction.created event in streaming chunk response"
-                                    .to_string(),
-                                route,
-                            )
-                            .await;
-                        return Err(guard.abort_internal(
-                            start.elapsed().as_millis() as u64,
-                            ingress_body.len(),
-                            upstream_label,
-                            direction,
-                            true,
-                            "no interaction.created event in streaming chunk response",
-                        ));
-                    }
-                };
-                final_id = Some(int_id.clone());
-                all_int_ids.push(int_id.clone());
-                current_prev = Some(int_id.clone());
-
-                self.ack_and_persist(&batch_id, piece_index, &int_id).await;
-
-                piece_index += 1;
-            }
-        }
-
-        let final_id =
-            final_id.ok_or_else(|| AppError::Internal("no final interaction id".to_string()))?;
-
-        let translated =
-            Self::capture_and_translate_sse(sse_buffer, &all_int_ids, &final_id, ingress, model)
-                .map_err(|e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        true,
-                        e,
-                    )
-                })?;
-
-        let _node = self
-            .complete_batch_and_persist(&batch_id)
-            .await
-            .map_err(|e| {
-                guard.abort_internal(
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    upstream_label,
-                    direction,
-                    true,
-                    e,
-                )
-            })?;
-
-        // Update session with final interaction_id
-        {
-            let mut store = self.v2_store.write().await;
-            let now = crate::session::unix_now();
-            store
-                .sessions
-                .entry(session_id.to_string())
-                .and_modify(|s| {
-                    s.last_interaction_id = Some(final_id.clone());
-                    s.last_seen_utc = now;
-                })
-                .or_insert_with(|| crate::session::SessionInfo {
-                    client_session_id: session_id.to_string(),
-                    last_interaction_id: Some(final_id.clone()),
-                    last_seen_utc: now,
-                    expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
-                });
-            if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                tracing::warn!(error = %e, "v2 store save after streaming split-send");
-            }
-        }
-
-        guard.finish(
-            200,
-            start.elapsed().as_millis() as u64,
-            ingress_body.len(),
-            Some(total_response_bytes),
-            upstream_label,
-            direction,
-            true,
-        );
-
-        let content_type = "text/event-stream";
-        Response::builder()
-            .status(200)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(Self::session_header_name(ingress), session_id)
-            .body(Body::from(translated))
-            .map_err(|err| AppError::Internal(err.to_string()))
-    }
-
     /// Split system_instruction across multiple interactions, then send chunks.
+    ///
+    /// Uses `build_split_plans` to construct one ordered piece plan shared by
+    /// streaming and non-streaming paths. Response reading is stream-specific
+    /// (SSE parsing for streaming, JSON body parsing for non-streaming).
     #[allow(clippy::too_many_arguments)]
     async fn send_split_system_instruction(
         &self,
@@ -2510,36 +2017,13 @@ impl InteractionsHandler {
         generation_config: Option<crate::interactions_types::GenerationConfig>,
         stream: bool,
     ) -> Result<Response, AppError> {
-        if stream {
-            return self
-                .send_split_system_instruction_streaming(
-                    sys,
-                    url,
-                    route,
-                    session_id,
-                    chunks,
-                    harness_hashes,
-                    prev_interaction_id,
-                    limit,
-                    model,
-                    upstream_label,
-                    ingress_body,
-                    direction,
-                    request_headers,
-                    ingress,
-                    guard,
-                    tools,
-                    generation_config,
-                )
-                .await;
-        }
-
         let start = std::time::Instant::now();
         let mut total_response_bytes: usize = 0;
         let egress_headers =
             build_interactions_headers_map(route.api_key.as_deref(), request_headers);
         let system_instruction_hash =
             compute_system_hash(prev_interaction_id.as_deref(), Some(sys));
+
         // Split system_instruction on natural boundaries, accounting for
         // envelope overhead (model, previous_interaction_id, stream, etc.)
         let envelope_overhead = {
@@ -2565,18 +2049,26 @@ impl InteractionsHandler {
                 ));
             }
         };
-        let mut last_id: Option<String> = None;
-        let mut last_interaction: Option<Interaction> = None;
+
+        // Build the single ordered plan — shared by stream/non-stream paths
+        let plans = build_split_plans(&sys_parts, chunks);
+        let total_pieces = plans.len();
+
         let mut current_prev: Option<String> = prev_interaction_id.clone();
         let mut all_int_ids: Vec<String> = Vec::new();
 
-        // Compute total piece count for InFlightStore batch
-        let extra_chunks = if chunks.len() > 1 {
-            chunks.len() - 1
+        // Streaming-specific state
+        let mut sse_buffer: Option<sse::MemSseBuffer> = if stream {
+            Some(sse::MemSseBuffer::with_limit(sse::DEFAULT_SSE_BUFFER_LIMIT))
         } else {
-            0
+            None
         };
-        let total_pieces = sys_parts.len() + extra_chunks;
+        let mut final_stream_id: Option<String> = None;
+
+        // Non-streaming-specific state
+        let mut last_id: Option<String> = None;
+        let mut last_interaction: Option<Interaction> = None;
+
         let batch_id = format!("batch-{}-{}", session_id, crate::session::unix_now());
         {
             let pieces: Vec<session::InFlightPiece> = (0..total_pieces)
@@ -2601,28 +2093,20 @@ impl InteractionsHandler {
             }
         }
 
-        let mut piece_index: usize = 0;
-
-        // Send empty interactions with system_instruction chunks
-        for (i, part) in sys_parts.iter().enumerate() {
-            let is_first_chunk = i == 0;
-            let is_last_sys = i == sys_parts.len() - 1;
-            let input_for_chunk = if is_last_sys && !chunks.is_empty() {
-                chunks[0].clone()
-            } else {
-                vec![]
-            };
+        // Single unified loop over the ordered plans
+        for (piece_index, plan) in plans.iter().enumerate() {
             let mut chunk_req = interactions_lib::build_chunk_request(
                 model,
-                input_for_chunk,
-                Some(part.clone()),
+                plan.input.clone(),
+                plan.system_instruction.clone(),
                 current_prev.clone(),
-                false,
+                stream,
             );
-            if is_first_chunk {
+            if plan.include_tools_config {
                 chunk_req.tools = tools.clone();
                 chunk_req.generation_config = generation_config.clone();
             }
+
             let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
                 guard.abort_internal(
                     start.elapsed().as_millis() as u64,
@@ -2651,142 +2135,53 @@ impl InteractionsHandler {
             self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
                 .await;
 
-            let (upstream, response_headers) = match self
-                .send_chunk(
-                    chunk_body,
-                    url,
-                    route,
-                    &batch_id,
-                    session_id,
-                    ingress,
-                    piece_index,
-                    request_headers,
-                    &guard,
-                    start,
-                    ingress_body,
-                    upstream_label,
-                    direction,
-                    stream,
-                )
-                .await
-            {
-                SendChunkOutcome::Success(u, h) => (u, h),
-                SendChunkOutcome::Return(r) => return r,
-            };
-            let response_bytes = match upstream.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            format!("chunk {piece_index} body read error: {e}"),
-                            route,
-                        )
-                        .await;
-                    return Err(guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
+            if stream {
+                let upstream = match self
+                    .send_chunk(
+                        chunk_body,
+                        url,
+                        route,
+                        &batch_id,
+                        session_id,
+                        ingress,
+                        piece_index,
+                        request_headers,
+                        &guard,
+                        start,
+                        ingress_body,
                         upstream_label,
                         direction,
-                        stream,
-                        e,
-                    ));
-                }
-            };
-            total_response_bytes += response_bytes.len();
-            let validated = match crate::validate_upstream_body(response_bytes, guard.request_id())
-            {
-                Ok(v) => v,
-                Err((e, dump)) => {
-                    guard.response_dump(dump, 502, true, response_headers.clone());
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            format!("chunk {piece_index} validation error: {e}"),
-                            route,
-                        )
-                        .await;
-                    return Err(guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    ));
-                }
-            };
-            guard.response_dump(validated.dump, 200, false, response_headers.clone());
-            let response_text = validated.text;
-            let interaction: Interaction = match serde_json::from_str(&response_text) {
-                Ok(inter) => inter,
-                Err(e) => {
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            format!("chunk {piece_index} parse error: {e}"),
-                            route,
-                        )
-                        .await;
-                    return Err(guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    ));
-                }
-            };
-            let int_id = interaction.id.clone();
-            all_int_ids.push(int_id.clone());
-            current_prev = Some(int_id.clone());
-            last_id = Some(int_id.clone());
-            last_interaction = Some(interaction);
-
-            self.ack_and_persist(&batch_id, piece_index, &int_id).await;
-
-            piece_index += 1;
-        }
-
-        // Send remaining chunks if more than one
-        if chunks.len() > 1 {
-            for chunk in chunks.iter().skip(1) {
-                let chunk_req = interactions_lib::build_chunk_request(
-                    model,
-                    chunk.clone(),
-                    None,
-                    current_prev.clone(),
-                    false,
-                );
-                let mut chunk_body_value = serde_json::to_value(&chunk_req).map_err(|e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
+                        true,
                     )
-                })?;
-                let df = route.drop_fields.for_model(model);
-                crate::drop_fields_from_value(&mut chunk_body_value, &df);
-                let chunk_body = serde_json::to_vec(&chunk_body_value).map_err(|e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
+                    .await
+                {
+                    SendChunkOutcome::Success(u, _) => u,
+                    SendChunkOutcome::Return(r) => return r,
+                };
+
+                // Read SSE stream, buffer in MemSseBuffer
+                let int_id = self
+                    .read_streaming_chunk_response(
+                        upstream,
+                        &mut total_response_bytes,
+                        sse_buffer.as_mut().unwrap(),
+                        piece_index,
+                        &batch_id,
+                        route,
+                        &guard,
+                        start,
+                        ingress_body,
                         upstream_label,
                         direction,
-                        stream,
-                        e,
                     )
-                })?;
+                    .await?;
 
-                guard.egress_dump(&chunk_body, &egress_headers);
+                final_stream_id = Some(int_id.clone());
+                all_int_ids.push(int_id.clone());
+                current_prev = Some(int_id.clone());
 
-                self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
-                    .await;
-
+                self.ack_and_persist(&batch_id, piece_index, &int_id).await;
+            } else {
                 let (upstream, response_headers) = match self
                     .send_chunk(
                         chunk_body,
@@ -2802,109 +2197,81 @@ impl InteractionsHandler {
                         ingress_body,
                         upstream_label,
                         direction,
-                        stream,
+                        false,
                     )
                     .await
                 {
                     SendChunkOutcome::Success(u, h) => (u, h),
                     SendChunkOutcome::Return(r) => return r,
                 };
-                let response_bytes = match upstream.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = self
-                            .fail_batch_and_cancel(
-                                &batch_id,
-                                format!("chunk {piece_index} body read error: {e}"),
-                                route,
-                            )
-                            .await;
-                        return Err(guard.abort_upstream(
-                            start.elapsed().as_millis() as u64,
-                            ingress_body.len(),
-                            upstream_label,
-                            direction,
-                            stream,
-                            e,
-                        ));
-                    }
-                };
-                total_response_bytes += response_bytes.len();
-                let validated =
-                    match crate::validate_upstream_body(response_bytes, guard.request_id()) {
-                        Ok(v) => v,
-                        Err((e, dump)) => {
-                            guard.response_dump(dump, 502, true, response_headers.clone());
-                            let _ = self
-                                .fail_batch_and_cancel(
-                                    &batch_id,
-                                    format!("chunk {piece_index} validation error: {e}"),
-                                    route,
-                                )
-                                .await;
-                            return Err(guard.abort_upstream(
-                                start.elapsed().as_millis() as u64,
-                                ingress_body.len(),
-                                upstream_label,
-                                direction,
-                                stream,
-                                e,
-                            ));
-                        }
-                    };
-                guard.response_dump(validated.dump, 200, false, response_headers.clone());
-                let response_text = validated.text;
-                let interaction: Interaction = match serde_json::from_str(&response_text) {
-                    Ok(inter) => inter,
-                    Err(e) => {
-                        let _ = self
-                            .fail_batch_and_cancel(
-                                &batch_id,
-                                format!("chunk {piece_index} parse error: {e}"),
-                                route,
-                            )
-                            .await;
-                        return Err(guard.abort_internal(
-                            start.elapsed().as_millis() as u64,
-                            ingress_body.len(),
-                            upstream_label,
-                            direction,
-                            stream,
-                            e,
-                        ));
-                    }
-                };
+
+                let interaction = self
+                    .read_non_streaming_chunk_response(
+                        upstream,
+                        response_headers,
+                        &mut total_response_bytes,
+                        piece_index,
+                        &batch_id,
+                        route,
+                        &guard,
+                        start,
+                        ingress_body,
+                        upstream_label,
+                        direction,
+                    )
+                    .await?;
+
                 let int_id = interaction.id.clone();
-                current_prev = Some(interaction.id.clone());
-                last_id = Some(interaction.id.clone());
-                all_int_ids.push(interaction.id.clone());
+                all_int_ids.push(int_id.clone());
+                current_prev = Some(int_id.clone());
+                last_id = Some(int_id.clone());
                 last_interaction = Some(interaction);
 
                 self.ack_and_persist(&batch_id, piece_index, &int_id).await;
-
-                piece_index += 1;
             }
         }
 
-        let _client_node = self
-            .complete_batch_and_persist(&batch_id)
-            .await
+        // Finalize
+        if stream {
+            let final_id = final_stream_id
+                .ok_or_else(|| AppError::Internal("no final interaction id".to_string()))?;
+
+            let translated = Self::capture_and_translate_sse(
+                sse_buffer.unwrap(),
+                &all_int_ids,
+                &final_id,
+                ingress,
+                model,
+            )
             .map_err(|e| {
                 guard.abort_internal(
                     start.elapsed().as_millis() as u64,
                     ingress_body.len(),
                     upstream_label,
                     direction,
-                    stream,
+                    true,
                     e,
                 )
             })?;
 
-        // Update session with final interaction_id
-        {
-            let mut store = self.v2_store.write().await;
-            let now = crate::session::unix_now();
-            if let Some(ref final_id) = last_id {
+            let _node = self
+                .complete_batch_and_persist(&batch_id)
+                .await
+                .map_err(|e| {
+                    guard.abort_internal(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        e,
+                    )
+                })?;
+
+            // Update session with final interaction_id
+            {
+                let mut store = self.v2_store.write().await;
+                let now = crate::session::unix_now();
                 store
                     .sessions
                     .entry(session_id.to_string())
@@ -2918,61 +2285,32 @@ impl InteractionsHandler {
                         last_seen_utc: now,
                         expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
                     });
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save after streaming split-send");
+                }
             }
-            if let Err(e) = store.save_to_disk(&self.v2_path).await {
-                tracing::warn!(error = %e, "v2 store save failed after system-instruction split");
-            }
-        }
 
-        if stream {
-            if let Some(ref inter) = last_interaction {
-                let resp = interactions_lib::build_response_from_interaction(inter, model, ingress)
-                    .map_err(|e| {
-                        guard.abort_internal(
-                            start.elapsed().as_millis() as u64,
-                            ingress_body.len(),
-                            upstream_label,
-                            direction,
-                            true,
-                            e,
-                        )
-                    })?;
-                let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
-                guard.ingress_response_dump(
-                    crate::diagnostics::dump_body_from_bytes(&resp_bytes),
-                    200,
-                );
-                guard.finish(
-                    200,
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
-                    Some(total_response_bytes),
-                    upstream_label,
-                    direction,
-                    true,
-                );
-                return Self::streaming_response_from_interaction(
-                    ingress, session_id, model, inter,
-                );
-            }
-        }
+            guard.finish(
+                200,
+                start.elapsed().as_millis() as u64,
+                ingress_body.len(),
+                Some(total_response_bytes),
+                upstream_label,
+                direction,
+                true,
+            );
 
-        // Translate last response to ingress protocol
-        let resp = if let Some(ref inter) = last_interaction {
-            interactions_lib::build_response_from_interaction(inter, model, ingress).map_err(
-                |e| {
-                    guard.abort_internal(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        false,
-                        e,
-                    )
-                },
-            )?
+            let content_type = "text/event-stream";
+            Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(Self::session_header_name(ingress), session_id)
+                .body(Body::from(translated))
+                .map_err(|err| AppError::Internal(err.to_string()))
         } else {
-            build_fallback_response(last_interaction.as_ref(), last_id.clone(), model, ingress)
+            let _client_node = self
+                .complete_batch_and_persist(&batch_id)
+                .await
                 .map_err(|e| {
                     guard.abort_internal(
                         start.elapsed().as_millis() as u64,
@@ -2982,20 +2320,263 @@ impl InteractionsHandler {
                         false,
                         e,
                     )
-                })?
+                })?;
+
+            // Update session with final interaction_id
+            {
+                let mut store = self.v2_store.write().await;
+                let now = crate::session::unix_now();
+                if let Some(ref final_id) = last_id {
+                    store
+                        .sessions
+                        .entry(session_id.to_string())
+                        .and_modify(|s| {
+                            s.last_interaction_id = Some(final_id.clone());
+                            s.last_seen_utc = now;
+                        })
+                        .or_insert_with(|| crate::session::SessionInfo {
+                            client_session_id: session_id.to_string(),
+                            last_interaction_id: Some(final_id.clone()),
+                            last_seen_utc: now,
+                            expires_at_utc: now + crate::session::DEFAULT_SESSION_TTL_SECS,
+                        });
+                }
+                if let Err(e) = store.save_to_disk(&self.v2_path).await {
+                    tracing::warn!(error = %e, "v2 store save failed after system-instruction split");
+                }
+            }
+
+            // Translate last response to ingress protocol
+            let resp = if let Some(ref inter) = last_interaction {
+                interactions_lib::build_response_from_interaction(inter, model, ingress).map_err(
+                    |e| {
+                        guard.abort_internal(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            false,
+                            e,
+                        )
+                    },
+                )?
+            } else {
+                build_fallback_response(last_interaction.as_ref(), last_id.clone(), model, ingress)
+                    .map_err(|e| {
+                        guard.abort_internal(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            false,
+                            e,
+                        )
+                    })?
+            };
+            let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
+            guard.ingress_response_dump(crate::diagnostics::dump_body_from_bytes(&resp_bytes), 200);
+            guard.finish(
+                200,
+                start.elapsed().as_millis() as u64,
+                ingress_body.len(),
+                Some(total_response_bytes),
+                upstream_label,
+                direction,
+                false,
+            );
+            Ok(Self::ok_with_session_header(ingress, session_id, resp))
+        }
+    }
+
+    /// Read SSE stream from a chunk response, buffering into `sse_buffer` and
+    /// extracting the interaction.id from `interaction.created` event.
+    async fn read_streaming_chunk_response(
+        &self,
+        upstream: reqwest::Response,
+        total_response_bytes: &mut usize,
+        sse_buffer: &mut sse::MemSseBuffer,
+        piece_index: usize,
+        batch_id: &str,
+        route: &RouteTarget,
+        guard: &crate::diagnostics::RequestDiagnostics,
+        start: std::time::Instant,
+        ingress_body: &[u8],
+        upstream_label: &str,
+        direction: &str,
+    ) -> Result<String, AppError> {
+        let mut byte_stream = upstream.bytes_stream();
+        let mut buffer = String::new();
+        let mut chunk_int_id: Option<String> = None;
+        while let Some(chunk_result) = byte_stream.next().await {
+            match chunk_result {
+                Ok(chunk_bytes) => {
+                    *total_response_bytes += chunk_bytes.len();
+                    if let Err(e) = sse_buffer.push(piece_index, &chunk_bytes) {
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                batch_id,
+                                format!("SSE buffer overflow: {e:?}"),
+                                route,
+                            )
+                            .await;
+                        return Err(guard.abort_upstream(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            true,
+                            format!("SSE buffer overflow: {:?}", e),
+                        ));
+                    }
+                    if std::str::from_utf8(&chunk_bytes).is_err() {
+                        continue;
+                    }
+                    buffer.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
+                    if let Some(id) = Self::parse_sse_for_interaction_id(&mut buffer) {
+                        chunk_int_id = Some(id);
+                    }
+                    if buffer.len() > MAX_SSE_BUFFER_BYTES {
+                        let _ = self
+                            .fail_batch_and_cancel(
+                                batch_id,
+                                "SSE buffer exceeded max line length".to_string(),
+                                route,
+                            )
+                            .await;
+                        return Err(guard.abort_upstream(
+                            start.elapsed().as_millis() as u64,
+                            ingress_body.len(),
+                            upstream_label,
+                            direction,
+                            true,
+                            "SSE buffer exceeded max line length",
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let _ = self
+                        .fail_batch_and_cancel(
+                            batch_id,
+                            format!("chunk {piece_index} stream error: {e}"),
+                            route,
+                        )
+                        .await;
+                    return Err(guard.abort_upstream(
+                        start.elapsed().as_millis() as u64,
+                        ingress_body.len(),
+                        upstream_label,
+                        direction,
+                        true,
+                        e,
+                    ));
+                }
+            }
+        }
+
+        match chunk_int_id {
+            Some(id) => Ok(id),
+            None => {
+                let _ = self
+                    .fail_batch_and_cancel(
+                        batch_id,
+                        "no interaction.created event in streaming chunk response".to_string(),
+                        route,
+                    )
+                    .await;
+                Err(guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    true,
+                    "no interaction.created event in streaming chunk response",
+                ))
+            }
+        }
+    }
+
+    /// Read a non-streaming chunk response: bytes → validate → deserialize Interaction.
+    async fn read_non_streaming_chunk_response(
+        &self,
+        upstream: reqwest::Response,
+        response_headers: Vec<(String, String)>,
+        total_response_bytes: &mut usize,
+        piece_index: usize,
+        batch_id: &str,
+        route: &RouteTarget,
+        guard: &crate::diagnostics::RequestDiagnostics,
+        start: std::time::Instant,
+        ingress_body: &[u8],
+        upstream_label: &str,
+        direction: &str,
+    ) -> Result<Interaction, AppError> {
+        let response_bytes = match upstream.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = self
+                    .fail_batch_and_cancel(
+                        batch_id,
+                        format!("chunk {piece_index} body read error: {e}"),
+                        route,
+                    )
+                    .await;
+                return Err(guard.abort_upstream(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    false,
+                    e,
+                ));
+            }
         };
-        let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
-        guard.ingress_response_dump(crate::diagnostics::dump_body_from_bytes(&resp_bytes), 200);
-        guard.finish(
-            200,
-            start.elapsed().as_millis() as u64,
-            ingress_body.len(),
-            Some(total_response_bytes),
-            upstream_label,
-            direction,
-            false,
-        );
-        Ok(Self::ok_with_session_header(ingress, session_id, resp))
+        *total_response_bytes += response_bytes.len();
+
+        let validated = match crate::validate_upstream_body(response_bytes, guard.request_id()) {
+            Ok(v) => v,
+            Err((e, dump)) => {
+                guard.response_dump(dump, 502, true, response_headers.clone());
+                let _ = self
+                    .fail_batch_and_cancel(
+                        batch_id,
+                        format!("chunk {piece_index} validation error: {e}"),
+                        route,
+                    )
+                    .await;
+                return Err(guard.abort_upstream(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    false,
+                    e,
+                ));
+            }
+        };
+        guard.response_dump(validated.dump, 200, false, response_headers.clone());
+
+        let interaction: Interaction = match serde_json::from_str(&validated.text) {
+            Ok(inter) => inter,
+            Err(e) => {
+                let _ = self
+                    .fail_batch_and_cancel(
+                        batch_id,
+                        format!("chunk {piece_index} parse error: {e}"),
+                        route,
+                    )
+                    .await;
+                return Err(guard.abort_internal(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    false,
+                    e,
+                ));
+            }
+        };
+
+        Ok(interaction)
     }
 
     /// Cancel an interaction upstream.
@@ -3548,251 +3129,6 @@ impl InteractionsHandler {
         }
         None
     }
-
-    fn streaming_response_from_interaction(
-        ingress: Protocol,
-        session_id: &str,
-        model: &str,
-        interaction: &Interaction,
-    ) -> Result<Response, AppError> {
-        let resp = interactions_lib::build_response_from_interaction(interaction, model, ingress)
-            .map_err(AppError::Internal)?;
-
-        match ingress {
-            Protocol::Anthropic => {
-                let events = synthesize_anthropic_events(model, &resp);
-                let body = sse::format_sse_events(&events);
-                let hdr_name = Self::session_header_name(ingress);
-                let hdr_value =
-                    HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(HeaderName::from_static(hdr_name), hdr_value)
-                    .body(Body::from(body))
-                    .map_err(|err| AppError::Internal(err.to_string()))
-            }
-            Protocol::OpenAi => {
-                let chunks = synthesize_openai_chunks(model, &resp);
-                let body = chunks.join("");
-                let hdr_name = Self::session_header_name(ingress);
-                let hdr_value =
-                    HeaderValue::from_str(session_id).unwrap_or(HeaderValue::from_static(""));
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(HeaderName::from_static(hdr_name), hdr_value)
-                    .body(Body::from(body))
-                    .map_err(|err| AppError::Internal(err.to_string()))
-            }
-        }
-    }
-}
-
-/// Synthesize Anthropic SSE events from a translated interaction response.
-fn synthesize_anthropic_events(
-    model: &str,
-    resp: &serde_json::Value,
-) -> Vec<anyllm_translate::anthropic::StreamEvent> {
-    use anyllm_translate::anthropic::StreamEvent;
-
-    let msg_id = resp.get("id").and_then(|v| v.as_str()).unwrap_or("msg_1");
-    let content = resp.get("content").and_then(|v| v.as_array());
-    let stop_reason = resp
-        .get("stop_reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("end_turn");
-    let input_tokens = resp
-        .get("usage")
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = resp
-        .get("usage")
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    let mut events: Vec<StreamEvent> = Vec::new();
-
-    events.push(stream_event_message_start(
-        msg_id,
-        model,
-        input_tokens,
-        output_tokens,
-    ));
-
-    if let Some(blocks) = content {
-        for (idx, block) in blocks.iter().enumerate() {
-            let idx_u32 = idx as u32;
-            let block_type = block.get("type").and_then(|v| v.as_str());
-
-            match block_type {
-                Some("text") => {
-                    let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    events.push(stream_event_content_block_start_text(idx_u32));
-                    events.push(stream_event_content_block_delta_text(idx_u32, text));
-                }
-                Some("tool_use") => {
-                    let tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let tool_input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
-                    let partial_json = serde_json::to_string(&tool_input).unwrap_or_default();
-
-                    events.push(stream_event_content_block_start_tool_use(
-                        idx_u32, tool_id, tool_name,
-                    ));
-                    events.push(stream_event_content_block_delta_json(
-                        idx_u32,
-                        &partial_json,
-                    ));
-                }
-                _ => {}
-            }
-
-            events.push(StreamEvent::ContentBlockStop { index: idx_u32 });
-        }
-    }
-
-    events.push(stream_event_message_delta(
-        stop_reason,
-        input_tokens,
-        output_tokens,
-    ));
-    events.push(StreamEvent::MessageStop {});
-
-    events
-}
-
-// ── OpenAI SSE chunk constructors ────────────────────────────────────
-//
-// These helpers build OpenAI-compatible ChatCompletionChunk SSE lines.
-// They use serde_json::json!({...}) because ChatCompletionChunk's inner
-// types are not publicly exported by anyllm_translate. The functions
-// return pre-formatted "data: {...}\n\n" strings ready for the SSE stream.
-
-fn openai_sse_chunk(
-    msg_id: &str,
-    model: &str,
-    index: u32,
-    delta: serde_json::Value,
-    finish_reason: Option<&str>,
-) -> String {
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let chunk = serde_json::json!({
-        "id": msg_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": index,
-            "delta": delta,
-            "finish_reason": finish_reason
-        }]
-    });
-    format!(
-        "data: {}\n\n",
-        serde_json::to_string(&chunk).unwrap_or_default()
-    )
-}
-
-fn openai_sse_role_chunk(msg_id: &str, model: &str, index: u32) -> String {
-    openai_sse_chunk(
-        msg_id,
-        model,
-        index,
-        serde_json::json!({"role": "assistant"}),
-        None,
-    )
-}
-
-fn openai_sse_content_chunk(msg_id: &str, model: &str, index: u32, content: &str) -> String {
-    openai_sse_chunk(
-        msg_id,
-        model,
-        index,
-        serde_json::json!({"content": content}),
-        None,
-    )
-}
-
-fn openai_sse_tool_calls_chunk(
-    msg_id: &str,
-    model: &str,
-    index: u32,
-    tool_calls: &[serde_json::Value],
-) -> String {
-    openai_sse_chunk(
-        msg_id,
-        model,
-        index,
-        serde_json::json!({"tool_calls": tool_calls}),
-        None,
-    )
-}
-
-fn openai_sse_finish_chunk(msg_id: &str, model: &str, index: u32, finish_reason: &str) -> String {
-    openai_sse_chunk(
-        msg_id,
-        model,
-        index,
-        serde_json::json!({}),
-        Some(finish_reason),
-    )
-}
-
-/// Synthesize OpenAI SSE chunks from a translated interaction response.
-fn synthesize_openai_chunks(model: &str, resp: &serde_json::Value) -> Vec<String> {
-    let msg_id = resp
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("chatcmpl-1");
-    let choices = resp.get("choices").and_then(|v| v.as_array());
-
-    let mut chunks = Vec::new();
-
-    if let Some(choices) = choices {
-        for choice in choices {
-            let index = choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let finish_reason = choice
-                .get("finish_reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stop");
-            let delta_content = choice
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let tool_calls = choice
-                .get("message")
-                .and_then(|m| m.get("tool_calls"))
-                .and_then(|v| v.as_array());
-
-            chunks.push(openai_sse_role_chunk(msg_id, model, index));
-
-            if let Some(tc_arr) = tool_calls {
-                if !tc_arr.is_empty() {
-                    chunks.push(openai_sse_tool_calls_chunk(msg_id, model, index, tc_arr));
-                }
-            } else if !delta_content.is_empty() {
-                chunks.push(openai_sse_content_chunk(
-                    msg_id,
-                    model,
-                    index,
-                    delta_content,
-                ));
-            }
-
-            chunks.push(openai_sse_finish_chunk(msg_id, model, index, finish_reason));
-        }
-    }
-
-    chunks.push("data: [DONE]\n\n".to_string());
-
-    chunks
 }
 
 /// Build a protocol-appropriate response body from the last interaction
@@ -3977,6 +3313,60 @@ fn build_interaction_url(route: &RouteTarget, suffix: &str) -> String {
         Some(q) if !q.is_empty() => format!("{base}{suffix}?{q}"),
         _ => format!("{base}{suffix}"),
     }
+}
+
+/// A planned piece in a split system-instruction send sequence.
+/// Captures the per-piece decisions (input, system fragment, tools/config)
+/// shared between streaming and non-streaming paths.
+#[derive(Debug, Clone)]
+struct SplitPiecePlan {
+    /// Content input for this piece (empty vec for system-instruction-only pieces).
+    input: Vec<crate::interactions_types::Content>,
+    /// System instruction fragment for this piece (None for content-only pieces).
+    system_instruction: Option<String>,
+    /// Whether tools and generation_config should be included on this piece.
+    include_tools_config: bool,
+}
+
+/// Build ordered plan for a split system-instruction send.
+///
+/// Ordering: system-instruction fragments first; final system piece carries the
+/// first content chunk when present; remaining content chunks follow. Only the
+/// first planned piece gets `include_tools_config: true`.
+fn build_split_plans(
+    sys_parts: &[String],
+    chunks: &[Vec<crate::interactions_types::Content>],
+) -> Vec<SplitPiecePlan> {
+    let mut plans: Vec<SplitPiecePlan> = Vec::new();
+    let sys_count = sys_parts.len();
+    let has_content = !chunks.is_empty();
+
+    for (i, part) in sys_parts.iter().enumerate() {
+        let is_last_sys = i == sys_count - 1;
+        let input = if is_last_sys && has_content {
+            chunks[0].clone()
+        } else {
+            vec![]
+        };
+        plans.push(SplitPiecePlan {
+            input,
+            system_instruction: Some(part.clone()),
+            include_tools_config: i == 0,
+        });
+    }
+
+    // Remaining content chunks (skip first, already packed into last sys piece)
+    if chunks.len() > 1 && has_content {
+        for chunk in chunks.iter().skip(1) {
+            plans.push(SplitPiecePlan {
+                input: chunk.clone(),
+                system_instruction: None,
+                include_tools_config: false,
+            });
+        }
+    }
+
+    plans
 }
 
 /// Derive system_instruction_hash from normalized system instruction.
@@ -5470,63 +4860,6 @@ If you don't know the answer, say so honestly.";
         }
     }
 
-    // --- synthesize_openai_chunks tests ---
-
-    #[test]
-    fn synthesize_openai_chunks_with_tool_calls() {
-        let resp = serde_json::json!({
-            "id": "chatcmpl-1",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": "call-1",
-                        "type": "function",
-                        "function": {"name": "get_weather", "arguments": "{\"location\":\"Boston\"}"}
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }]
-        });
-        let chunks = synthesize_openai_chunks("test-model", &resp);
-        let joined = chunks.join("");
-        assert!(
-            joined.contains("tool_calls"),
-            "must contain tool_calls delta chunk"
-        );
-        assert!(
-            joined.contains("get_weather"),
-            "must contain tool call name"
-        );
-        assert!(
-            joined.contains("tool_calls"),
-            "finish reason must be tool_calls"
-        );
-    }
-
-    #[test]
-    fn synthesize_openai_chunks_text_only_unchanged() {
-        let resp = serde_json::json!({
-            "id": "chatcmpl-1",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "hello"},
-                "finish_reason": "stop"
-            }]
-        });
-        let chunks = synthesize_openai_chunks("test-model", &resp);
-        let joined = chunks.join("");
-        assert!(
-            joined.contains("\"content\":\"hello\""),
-            "must contain text content"
-        );
-        assert!(
-            !joined.contains("tool_calls"),
-            "must NOT contain tool_calls for text-only response"
-        );
-    }
-
     // --- translate_buffered_sse_to_client tests ---
 
     fn make_interactions_sse_bytes(events: &[&str]) -> Vec<u8> {
@@ -6719,5 +6052,171 @@ If you don't know the answer, say so honestly.";
 
         // Cleanup
         remove_if_exists(&v2_path);
+    }
+
+    // ── SplitPiecePlan ordering tests ──
+
+    fn plans_input_json(plan: &super::SplitPiecePlan) -> serde_json::Value {
+        serde_json::to_value(&plan.input).unwrap()
+    }
+
+    /// 1.1: SplitPiecePlan ordering — sys fragments first,
+    /// final sys piece carries first content chunk, remaining content follow.
+    #[test]
+    fn split_piece_plan_ordering_sys_first_then_content() {
+        // 3 sys parts, 2 content chunks
+        let sys_parts: Vec<String> = vec!["sys-a".into(), "sys-b".into(), "sys-c".into()];
+        let c1: Vec<Content> = vec![Content::TextContent(TextContent {
+            text: "msg-1".into(),
+            ..Default::default()
+        })];
+        let c2: Vec<Content> = vec![Content::TextContent(TextContent {
+            text: "msg-2".into(),
+            ..Default::default()
+        })];
+        let chunks = vec![c1.clone(), c2.clone()];
+        let c1_json = serde_json::to_value(&c1).unwrap();
+        let c2_json = serde_json::to_value(&c2).unwrap();
+
+        let plans = super::build_split_plans(&sys_parts, &chunks);
+
+        // Expected: [sys-a, no input], [sys-b, no input], [sys-c + c1], [c2]
+        assert_eq!(plans.len(), 4, "3 sys parts + 1 extra content = 4 plans");
+
+        // Plan 0: sys-a, no input, tools_config
+        assert_eq!(plans[0].system_instruction.as_deref(), Some("sys-a"));
+        assert!(plans[0].input.is_empty());
+        assert!(plans[0].include_tools_config);
+
+        // Plan 1: sys-b, no input, no tools_config
+        assert_eq!(plans[1].system_instruction.as_deref(), Some("sys-b"));
+        assert!(plans[1].input.is_empty());
+        assert!(!plans[1].include_tools_config);
+
+        // Plan 2: sys-c + c1, tools_config = false
+        assert_eq!(plans[2].system_instruction.as_deref(), Some("sys-c"));
+        assert_eq!(plans_input_json(&plans[2]), c1_json);
+        assert!(!plans[2].include_tools_config);
+
+        // Plan 3: c2 only, no sys, no tools_config
+        assert_eq!(plans[3].system_instruction, None);
+        assert_eq!(plans_input_json(&plans[3]), c2_json);
+        assert!(!plans[3].include_tools_config);
+    }
+
+    #[test]
+    fn split_piece_plan_no_content_chunks_only_sys() {
+        let sys_parts: Vec<String> = vec!["sys-a".into(), "sys-b".into()];
+        let plans = super::build_split_plans(&sys_parts, &[]);
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].system_instruction.as_deref(), Some("sys-a"));
+        assert!(plans[0].input.is_empty());
+        assert!(plans[0].include_tools_config);
+
+        assert_eq!(plans[1].system_instruction.as_deref(), Some("sys-b"));
+        assert!(plans[1].input.is_empty());
+        assert!(!plans[1].include_tools_config);
+    }
+
+    #[test]
+    fn split_piece_plan_single_sys_with_content() {
+        let sys_parts: Vec<String> = vec!["sys-only".into()];
+        let c1: Vec<Content> = vec![Content::TextContent(TextContent {
+            text: "msg-1".into(),
+            ..Default::default()
+        })];
+        let c2: Vec<Content> = vec![Content::TextContent(TextContent {
+            text: "msg-2".into(),
+            ..Default::default()
+        })];
+        let chunks = vec![c1.clone(), c2.clone()];
+
+        let plans = super::build_split_plans(&sys_parts, &chunks);
+
+        // Single sys piece carries first content, then remaining content
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].system_instruction.as_deref(), Some("sys-only"));
+        assert_eq!(
+            plans_input_json(&plans[0]),
+            serde_json::to_value(&c1).unwrap()
+        );
+        assert!(plans[0].include_tools_config);
+
+        assert_eq!(plans[1].system_instruction, None);
+        assert_eq!(
+            plans_input_json(&plans[1]),
+            serde_json::to_value(&c2).unwrap()
+        );
+        assert!(!plans[1].include_tools_config);
+    }
+
+    /// 1.2: Only first planned piece includes tools/generation config.
+    #[test]
+    fn split_piece_plan_only_first_has_tools_config() {
+        let sys_parts: Vec<String> = vec!["sys-a".into(), "sys-b".into(), "sys-c".into()];
+        let c1: Vec<Content> = vec![Content::TextContent(TextContent {
+            text: "msg".into(),
+            ..Default::default()
+        })];
+        let chunks = vec![c1];
+
+        let plans = super::build_split_plans(&sys_parts, &chunks);
+
+        assert_eq!(
+            plans.len(),
+            3,
+            "3 sys parts, 1 content chunk packed in last"
+        );
+        assert!(
+            plans[0].include_tools_config,
+            "first plan must have tools/generation_config"
+        );
+        for (i, plan) in plans.iter().enumerate().skip(1) {
+            assert!(
+                !plan.include_tools_config,
+                "plan {i} must NOT have tools/generation_config"
+            );
+        }
+    }
+
+    /// 1.3: build_split_plans is stream-agnostic — identical plans
+    /// produced regardless of stream path since helper takes no stream flag.
+    #[test]
+    fn build_split_plans_is_stream_agnostic() {
+        // build_split_plans takes no stream flag — plans
+        // are inherently agnostic to stream vs non-stream.
+        let sys_parts: Vec<String> = vec!["sys-a".into(), "sys-b".into()];
+        let c1: Vec<Content> = vec![Content::TextContent(TextContent {
+            text: "msg-1".into(),
+            ..Default::default()
+        })];
+        let c2: Vec<Content> = vec![Content::TextContent(TextContent {
+            text: "msg-2".into(),
+            ..Default::default()
+        })];
+        let chunks = vec![c1, c2];
+
+        let plans = super::build_split_plans(&sys_parts, &chunks);
+
+        assert_eq!(plans.len(), 3, "2 sys + 1 extra content = 3 pieces");
+
+        for (i, plan) in plans.iter().enumerate() {
+            match i {
+                0 => {
+                    assert!(plan.system_instruction.is_some());
+                    assert!(plan.include_tools_config);
+                }
+                1 => {
+                    assert!(plan.system_instruction.is_some());
+                    assert!(!plan.include_tools_config);
+                }
+                2 => {
+                    assert!(plan.system_instruction.is_none());
+                    assert!(!plan.include_tools_config);
+                }
+                _ => panic!("unexpected plan index {i}"),
+            }
+        }
     }
 }

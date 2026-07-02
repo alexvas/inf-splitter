@@ -64,6 +64,13 @@ pub struct InteractionsHandler {
     error_translation: Arc<[crate::config::ErrorTranslationRule]>,
 }
 
+/// Outcome of sending a single chunk: either the upstream response on success,
+/// or a complete HTTP/send error response that the caller must return immediately.
+enum SendChunkOutcome {
+    Success(reqwest::Response, Vec<(String, String)>),
+    Return(Result<axum::response::Response, AppError>),
+}
+
 impl InteractionsHandler {
     pub fn new(
         config: &Config,
@@ -1642,68 +1649,28 @@ impl InteractionsHandler {
 
             guard.egress_dump(&chunk_body, &egress_headers);
 
-            let builder = build_interactions_headers(
-                self.get_client(route.proxy.as_deref())
-                    .post(url)
-                    .header(header::CONTENT_TYPE, "application/json"),
-                route.api_key.as_deref(),
-                request_headers,
-            );
-            let upstream = match builder.body(chunk_body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            format!("chunk {i} send error: {e}"),
-                            route,
-                        )
-                        .await;
-                    return Err(guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    ));
-                }
-            };
-            if !upstream.status().is_success() {
-                let status = upstream.status();
-                let response_headers = response_headers_to_pairs(upstream.headers());
-                let error_body = upstream.text().await.unwrap_or_default();
-
-                // Fail the batch: cancel ACKed pieces
-                let _ = self
-                    .fail_batch_and_cancel(
-                        &batch_id,
-                        format!("chunk {i} HTTP {}", status.as_u16()),
-                        route,
-                    )
-                    .await;
-
-                guard.finish_with_upstream_error(
-                    status.as_u16(),
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
+            let (upstream, response_headers) = match self
+                .send_chunk(
+                    chunk_body,
+                    url,
+                    route,
+                    &batch_id,
+                    session_id,
+                    ingress,
+                    i,
+                    request_headers,
+                    &guard,
+                    start,
+                    ingress_body,
                     upstream_label,
                     direction,
                     stream,
-                    error_body.clone(),
-                    response_headers,
-                );
-                let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
-                let body = crate::apply_error_translation(sc, body, &self.error_translation);
-                return Response::builder()
-                    .status(sc)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(Self::session_header_name(ingress), session_id)
-                    .body(Body::from(body))
-                    .map_err(|err| AppError::Internal(err.to_string()));
-            }
-            let response_headers = response_headers_to_pairs(upstream.headers());
+                )
+                .await
+            {
+                SendChunkOutcome::Success(u, h) => (u, h),
+                SendChunkOutcome::Return(r) => return r,
+            };
 
             let interaction_id;
             if stream {
@@ -2163,67 +2130,28 @@ impl InteractionsHandler {
             self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
                 .await;
 
-            let builder = build_interactions_headers(
-                self.get_client(route.proxy.as_deref())
-                    .post(url)
-                    .header(header::CONTENT_TYPE, "application/json"),
-                route.api_key.as_deref(),
-                request_headers,
-            );
-            let upstream = match builder.body(chunk_body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            format!("chunk {piece_index} send error: {e}"),
-                            route,
-                        )
-                        .await;
-                    return Err(guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        true,
-                        e,
-                    ));
-                }
-            };
-            if !upstream.status().is_success() {
-                let status = upstream.status();
-                let response_headers = response_headers_to_pairs(upstream.headers());
-                let error_body = upstream.text().await.unwrap_or_default();
-
-                // Fail batch, cancel acked pieces
-                let _ = self
-                    .fail_batch_and_cancel(
-                        &batch_id,
-                        format!("chunk {piece_index} HTTP {}", status.as_u16()),
-                        route,
-                    )
-                    .await;
-
-                guard.finish_with_upstream_error(
-                    status.as_u16(),
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
+            let upstream = match self
+                .send_chunk(
+                    chunk_body,
+                    url,
+                    route,
+                    &batch_id,
+                    session_id,
+                    ingress,
+                    piece_index,
+                    request_headers,
+                    &guard,
+                    start,
+                    ingress_body,
                     upstream_label,
                     direction,
                     true,
-                    error_body.clone(),
-                    response_headers,
-                );
-                let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
-                let body = crate::apply_error_translation(sc, body, &self.error_translation);
-                return Response::builder()
-                    .status(sc)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(Self::session_header_name(ingress), session_id)
-                    .body(Body::from(body))
-                    .map_err(|err| AppError::Internal(err.to_string()));
-            }
+                )
+                .await
+            {
+                SendChunkOutcome::Success(u, _) => u,
+                SendChunkOutcome::Return(r) => return r,
+            };
 
             // Read SSE stream from this chunk, buffer in MemSseBuffer
             let mut byte_stream = upstream.bytes_stream();
@@ -2365,69 +2293,28 @@ impl InteractionsHandler {
                 self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
                     .await;
 
-                let builder = build_interactions_headers(
-                    self.get_client(route.proxy.as_deref())
-                        .post(url)
-                        .header(header::CONTENT_TYPE, "application/json"),
-                    route.api_key.as_deref(),
-                    request_headers,
-                );
-                let upstream = match builder.body(chunk_body).send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = self
-                            .fail_batch_and_cancel(
-                                &batch_id,
-                                format!("chunk {piece_index} send error: {e}"),
-                                route,
-                            )
-                            .await;
-                        return Err(guard.abort_upstream(
-                            start.elapsed().as_millis() as u64,
-                            ingress_body.len(),
-                            upstream_label,
-                            direction,
-                            true,
-                            e,
-                        ));
-                    }
-                };
-                if !upstream.status().is_success() {
-                    let status = upstream.status();
-                    let response_headers = response_headers_to_pairs(upstream.headers());
-                    let error_body = upstream.text().await.unwrap_or_default();
-
-                    // Fail batch, cancel acked pieces
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            format!("chunk {piece_index} HTTP {}", status.as_u16()),
-                            route,
-                        )
-                        .await;
-
-                    guard.finish_with_upstream_error(
-                        status.as_u16(),
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
+                let upstream = match self
+                    .send_chunk(
+                        chunk_body,
+                        url,
+                        route,
+                        &batch_id,
+                        session_id,
+                        ingress,
+                        piece_index,
+                        request_headers,
+                        &guard,
+                        start,
+                        ingress_body,
                         upstream_label,
                         direction,
                         true,
-                        error_body.clone(),
-                        response_headers,
-                    );
-                    let sc =
-                        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                    let body =
-                        crate::translate_interactions_error_to_protocol(&error_body, ingress);
-                    let body = crate::apply_error_translation(sc, body, &self.error_translation);
-                    return Response::builder()
-                        .status(sc)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header(Self::session_header_name(ingress), session_id)
-                        .body(Body::from(body))
-                        .map_err(|err| AppError::Internal(err.to_string()));
-                }
+                    )
+                    .await
+                {
+                    SendChunkOutcome::Success(u, _) => u,
+                    SendChunkOutcome::Return(r) => return r,
+                };
 
                 let mut byte_stream = upstream.bytes_stream();
                 let mut buffer = String::new();
@@ -2764,68 +2651,28 @@ impl InteractionsHandler {
             self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
                 .await;
 
-            let builder = build_interactions_headers(
-                self.get_client(route.proxy.as_deref())
-                    .post(url)
-                    .header(header::CONTENT_TYPE, "application/json"),
-                route.api_key.as_deref(),
-                request_headers,
-            );
-            let upstream = match builder.body(chunk_body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            format!("chunk {piece_index} send error: {e}"),
-                            route,
-                        )
-                        .await;
-                    return Err(guard.abort_upstream(
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
-                        upstream_label,
-                        direction,
-                        stream,
-                        e,
-                    ));
-                }
-            };
-            let upstream_status = upstream.status();
-            let response_headers = response_headers_to_pairs(upstream.headers());
-            if !upstream_status.is_success() {
-                let error_body = upstream.text().await.unwrap_or_default();
-
-                // Fail batch, cancel acked pieces
-                let _ = self
-                    .fail_batch_and_cancel(
-                        &batch_id,
-                        format!("chunk {piece_index} HTTP {}", upstream_status.as_u16()),
-                        route,
-                    )
-                    .await;
-
-                guard.finish_with_upstream_error(
-                    upstream_status.as_u16(),
-                    start.elapsed().as_millis() as u64,
-                    ingress_body.len(),
+            let (upstream, response_headers) = match self
+                .send_chunk(
+                    chunk_body,
+                    url,
+                    route,
+                    &batch_id,
+                    session_id,
+                    ingress,
+                    piece_index,
+                    request_headers,
+                    &guard,
+                    start,
+                    ingress_body,
                     upstream_label,
                     direction,
-                    false,
-                    error_body.clone(),
-                    response_headers,
-                );
-                let sc = StatusCode::from_u16(upstream_status.as_u16())
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
-                let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
-                let body = crate::apply_error_translation(sc, body, &self.error_translation);
-                return Response::builder()
-                    .status(sc)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(Self::session_header_name(ingress), session_id)
-                    .body(Body::from(body))
-                    .map_err(|err| AppError::Internal(err.to_string()));
-            }
+                    stream,
+                )
+                .await
+            {
+                SendChunkOutcome::Success(u, h) => (u, h),
+                SendChunkOutcome::Return(r) => return r,
+            };
             let response_bytes = match upstream.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -2940,69 +2787,28 @@ impl InteractionsHandler {
                 self.mark_started_and_persist(&batch_id, piece_index, &chunk_body)
                     .await;
 
-                let builder = build_interactions_headers(
-                    self.get_client(route.proxy.as_deref())
-                        .post(url)
-                        .header(header::CONTENT_TYPE, "application/json"),
-                    route.api_key.as_deref(),
-                    request_headers,
-                );
-                let upstream = match builder.body(chunk_body).send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = self
-                            .fail_batch_and_cancel(
-                                &batch_id,
-                                format!("chunk {piece_index} send error: {e}"),
-                                route,
-                            )
-                            .await;
-                        return Err(guard.abort_upstream(
-                            start.elapsed().as_millis() as u64,
-                            ingress_body.len(),
-                            upstream_label,
-                            direction,
-                            stream,
-                            e,
-                        ));
-                    }
-                };
-                let upstream_status = upstream.status();
-                let response_headers = response_headers_to_pairs(upstream.headers());
-                if !upstream_status.is_success() {
-                    let error_body = upstream.text().await.unwrap_or_default();
-
-                    // Fail batch, cancel acked pieces
-                    let _ = self
-                        .fail_batch_and_cancel(
-                            &batch_id,
-                            format!("chunk {piece_index} HTTP {}", upstream_status.as_u16()),
-                            route,
-                        )
-                        .await;
-
-                    guard.finish_with_upstream_error(
-                        upstream_status.as_u16(),
-                        start.elapsed().as_millis() as u64,
-                        ingress_body.len(),
+                let (upstream, response_headers) = match self
+                    .send_chunk(
+                        chunk_body,
+                        url,
+                        route,
+                        &batch_id,
+                        session_id,
+                        ingress,
+                        piece_index,
+                        request_headers,
+                        &guard,
+                        start,
+                        ingress_body,
                         upstream_label,
                         direction,
-                        false,
-                        error_body.clone(),
-                        response_headers,
-                    );
-                    let sc = StatusCode::from_u16(upstream_status.as_u16())
-                        .unwrap_or(StatusCode::BAD_GATEWAY);
-                    let body =
-                        crate::translate_interactions_error_to_protocol(&error_body, ingress);
-                    let body = crate::apply_error_translation(sc, body, &self.error_translation);
-                    return Response::builder()
-                        .status(sc)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header(Self::session_header_name(ingress), session_id)
-                        .body(Body::from(body))
-                        .map_err(|err| AppError::Internal(err.to_string()));
-                }
+                        stream,
+                    )
+                    .await
+                {
+                    SendChunkOutcome::Success(u, h) => (u, h),
+                    SendChunkOutcome::Return(r) => return r,
+                };
                 let response_bytes = match upstream.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
@@ -3635,6 +3441,85 @@ impl InteractionsHandler {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Build request headers, send chunk body to upstream, handle send and HTTP errors.
+    /// On success returns the upstream response and parsed response headers.
+    /// On any error returns a complete response/error that the caller must return.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_chunk(
+        &self,
+        chunk_body: Vec<u8>,
+        url: &str,
+        route: &RouteTarget,
+        batch_id: &str,
+        session_id: &str,
+        ingress: Protocol,
+        idx: usize,
+        request_headers: &HeaderMap,
+        guard: &crate::diagnostics::RequestDiagnostics,
+        start: std::time::Instant,
+        ingress_body: &[u8],
+        upstream_label: &str,
+        direction: &str,
+        stream: bool,
+    ) -> SendChunkOutcome {
+        let builder = build_interactions_headers(
+            self.get_client(route.proxy.as_deref())
+                .post(url)
+                .header(header::CONTENT_TYPE, "application/json"),
+            route.api_key.as_deref(),
+            request_headers,
+        );
+        let upstream = match builder.body(chunk_body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self
+                    .fail_batch_and_cancel(batch_id, format!("chunk {idx} send error: {e}"), route)
+                    .await;
+                return SendChunkOutcome::Return(Err(guard.abort_upstream(
+                    start.elapsed().as_millis() as u64,
+                    ingress_body.len(),
+                    upstream_label,
+                    direction,
+                    stream,
+                    e,
+                )));
+            }
+        };
+        let status = upstream.status();
+        let response_headers = response_headers_to_pairs(upstream.headers());
+        if !status.is_success() {
+            let error_body = upstream.text().await.unwrap_or_default();
+            let _ = self
+                .fail_batch_and_cancel(
+                    batch_id,
+                    format!("chunk {idx} HTTP {}", status.as_u16()),
+                    route,
+                )
+                .await;
+            guard.finish_with_upstream_error(
+                status.as_u16(),
+                start.elapsed().as_millis() as u64,
+                ingress_body.len(),
+                upstream_label,
+                direction,
+                stream,
+                error_body.clone(),
+                response_headers,
+            );
+            let sc = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = crate::translate_interactions_error_to_protocol(&error_body, ingress);
+            let body = crate::apply_error_translation(sc, body, &self.error_translation);
+            let resp = Response::builder()
+                .status(sc)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(Self::session_header_name(ingress), session_id)
+                .body(Body::from(body))
+                .map_err(|err| AppError::Internal(err.to_string()));
+            return SendChunkOutcome::Return(resp);
+        }
+        SendChunkOutcome::Success(upstream, response_headers)
     }
 
     /// Parse SSE data buffer for interaction.created event, drain matched events.

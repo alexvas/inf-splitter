@@ -1737,26 +1737,8 @@ impl InteractionsHandler {
                                 continue;
                             }
                             line_buf.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
-                            while let Some(pos) = line_buf.find("\n\n") {
-                                let event_str = line_buf[..pos].to_string();
-                                line_buf = line_buf[pos + 2..].to_string();
-                                for line in event_str.lines() {
-                                    let data = line
-                                        .strip_prefix("data: ")
-                                        .or_else(|| line.strip_prefix("data:"));
-                                    let data = match data {
-                                        Some(d) => d.trim(),
-                                        None => continue,
-                                    };
-                                    if data.is_empty() || data == "[DONE]" {
-                                        continue;
-                                    }
-                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
-                                        serde_json::from_str::<InteractionSseEvent>(data)
-                                    {
-                                        chunk_int_id = Some(ev.interaction.id.clone());
-                                    }
-                                }
+                            if let Some(id) = Self::parse_sse_for_interaction_id(&mut line_buf) {
+                                chunk_int_id = Some(id);
                             }
                             if line_buf.len() > MAX_SSE_BUFFER_BYTES {
                                 let _ = self
@@ -2274,26 +2256,8 @@ impl InteractionsHandler {
                             continue;
                         }
                         buffer.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event_str = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
-                            for line in event_str.lines() {
-                                let data = line
-                                    .strip_prefix("data: ")
-                                    .or_else(|| line.strip_prefix("data:"));
-                                let data = match data {
-                                    Some(d) => d.trim(),
-                                    None => continue,
-                                };
-                                if data.is_empty() || data == "[DONE]" {
-                                    continue;
-                                }
-                                if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
-                                    serde_json::from_str::<InteractionSseEvent>(data)
-                                {
-                                    chunk_int_id = Some(ev.interaction.id.clone());
-                                }
-                            }
+                        if let Some(id) = Self::parse_sse_for_interaction_id(&mut buffer) {
+                            chunk_int_id = Some(id);
                         }
                         if buffer.len() > MAX_SSE_BUFFER_BYTES {
                             let _ = self
@@ -2493,26 +2457,8 @@ impl InteractionsHandler {
                                 continue;
                             }
                             buffer.push_str(std::str::from_utf8(&chunk_bytes).unwrap());
-                            while let Some(pos) = buffer.find("\n\n") {
-                                let event_str = buffer[..pos].to_string();
-                                buffer = buffer[pos + 2..].to_string();
-                                for line in event_str.lines() {
-                                    let data = line
-                                        .strip_prefix("data: ")
-                                        .or_else(|| line.strip_prefix("data:"));
-                                    let data = match data {
-                                        Some(d) => d.trim(),
-                                        None => continue,
-                                    };
-                                    if data.is_empty() || data == "[DONE]" {
-                                        continue;
-                                    }
-                                    if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
-                                        serde_json::from_str::<InteractionSseEvent>(data)
-                                    {
-                                        chunk_int_id = Some(ev.interaction.id.clone());
-                                    }
-                                }
+                            if let Some(id) = Self::parse_sse_for_interaction_id(&mut buffer) {
+                                chunk_int_id = Some(id);
                             }
                             if buffer.len() > MAX_SSE_BUFFER_BYTES {
                                 let _ = self
@@ -3689,6 +3635,33 @@ impl InteractionsHandler {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Parse SSE data buffer for interaction.created event, drain matched events.
+    /// Returns the interaction ID if found, None otherwise.
+    fn parse_sse_for_interaction_id(line_buf: &mut String) -> Option<String> {
+        while let Some(pos) = line_buf.find("\n\n") {
+            let event_str = line_buf[..pos].to_string();
+            *line_buf = line_buf[pos + 2..].to_string();
+            for line in event_str.lines() {
+                let data = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"));
+                let data = match data {
+                    Some(d) => d.trim(),
+                    None => continue,
+                };
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                if let Ok(InteractionSseEvent::InteractionCreatedEvent(ev)) =
+                    serde_json::from_str::<InteractionSseEvent>(data)
+                {
+                    return Some(ev.interaction.id.clone());
+                }
+            }
+        }
+        None
     }
 
     fn streaming_response_from_interaction(
